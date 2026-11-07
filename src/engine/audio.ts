@@ -1,5 +1,5 @@
 // PRESERVE AUDIO — Real-time synthesis via Web Audio API. Zero external assets.
-import type { ThemeKind } from './blocks';
+type ThemeKind = 'meadow' | 'desert' | 'tundra' | 'ember' | 'astral' | 'abyss';
 
 export class AudioEngine {
   private ctx: AudioContext | null = null;
