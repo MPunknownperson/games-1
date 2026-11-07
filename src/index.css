@@ -18,6 +18,23 @@ button, canvas, svg {
   -webkit-tap-highlight-color: transparent;
 }
 
+html {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Consistent interactive feedback for all buttons */
+button {
+  transition: filter 0.12s ease;
+}
+button:hover:not(:disabled) {
+  filter: brightness(1.12);
+}
+button:focus-visible {
+  outline: 2px solid #fbbf24;
+  outline-offset: 2px;
+}
+
 /* Custom scrollbar for modal content */
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-track { background: #0a0f1a; }
@@ -49,4 +66,108 @@ input[type="range"]::-moz-range-thumb {
   border: 2px solid #78350f;
   border-radius: 50%;
   cursor: pointer;
+}
+
+/* The title has no backdrop or media panel: the live world is the entire scene. */
+.title-scene { position: absolute; inset: 0; z-index: 20; pointer-events: none; }
+.title-content { position: absolute; left: clamp(24px, 6vw, 100px); top: 50%; transform: translateY(-50%); width: min(490px, 43vw); pointer-events: auto; animation: title-enter .65s ease-out both; }
+.title-wordmark { display: flex; flex-direction: column; color: #f4ead1; font-family: var(--font-display), serif; font-size: clamp(44px, 5vw, 78px); line-height: .98; letter-spacing: -.04em; text-shadow: 0 3px 2px #071016, 0 7px 20px #071016, 0 0 32px #071016; }
+.title-wordmark span:last-child { color: #e9c277; }
+.title-period { color: #f4ead1; }
+.title-subtitle { margin: 24px 0 34px; color: #f8f5ea; font: 500 clamp(16px, 1.45vw, 20px)/1.35 var(--font-body), sans-serif; text-shadow: 0 2px 3px #071016, 0 5px 15px #071016; max-width: 370px; }
+.title-actions { display: flex; flex-direction: column; align-items: flex-start; gap: 12px; }
+.title-start { min-width: 246px; min-height: 54px; padding: 0 20px; border: 1px solid #e1bf78; border-radius: 3px; background: #e8c17d; color: #171b1b; font: 700 19px var(--font-display), sans-serif; text-align: left; box-shadow: 0 4px 0 #5f4625, 0 7px 22px #07101680; cursor: pointer; display: flex; justify-content: space-between; align-items: center; gap: 35px; transition: transform .12s, background .12s; }
+.title-start:hover { background: #f3d49a; transform: translateY(-2px); }
+.title-continue { border: 0; background: transparent; padding: 4px 0; color: #f4ead1; font: 600 15px var(--font-body), sans-serif; text-shadow: 0 2px 5px #071016; cursor: pointer; }
+.title-continue span { margin-left: 8px; }
+.title-nav { display: flex; gap: 25px; margin-top: 42px; }
+.title-nav button, .title-utility button { border: 0; border-bottom: 1px solid transparent; background: none; padding: 3px 0; color: #f4ead1; font: 600 14px var(--font-body), sans-serif; text-shadow: 0 2px 5px #071016; cursor: pointer; }
+.title-nav button:hover, .title-utility button:hover { border-bottom-color: currentColor; }
+.title-utility { position: absolute; bottom: 24px; left: clamp(24px, 6vw, 100px); right: clamp(24px, 6vw, 100px); display: flex; justify-content: space-between; gap: 20px; align-items: end; color: #f4ead1; font: 500 12px var(--font-body), sans-serif; text-shadow: 0 2px 5px #071016; pointer-events: auto; }
+.title-utility div { display: flex; gap: 18px; }
+@keyframes title-enter { from { opacity: 0; transform: translate(-15px, calc(-50% + 8px)); } to { opacity: 1; transform: translate(0, -50%); } }
+
+/* A stable HUD edge, not three floating application panels. */
+.battle-hud { position: absolute; top: 0; left: 0; right: 0; z-index: 15; min-height: 74px; padding: 12px clamp(16px, 2.5vw, 36px); display: grid; grid-template-columns: 1fr auto 1fr; align-items: start; gap: 18px; color: #f8f2e2; background: linear-gradient(180deg, #101820ed 0%, #101820ad 64%, transparent 100%); pointer-events: none; font-family: var(--font-body), sans-serif; text-shadow: 0 1px 2px #050a0f; }
+.battle-hud button { pointer-events: auto; }
+.battle-hud__left { display: flex; align-items: center; gap: 18px; min-width: 0; }
+.battle-hud__center { display: flex; flex-direction: column; align-items: center; gap: 2px; min-width: 170px; text-align: center; }
+.battle-hud__right { display: flex; justify-content: flex-end; gap: 8px; align-items: center; }
+.citadel-health { width: 148px; flex: none; }
+.citadel-health__label { display: flex; justify-content: space-between; gap: 6px; align-items: baseline; font-size: 12px; font-weight: 600; }
+.citadel-health__label strong { font-size: 15px; font-variant-numeric: tabular-nums; }
+.citadel-health__label small { color: #b9c4b9; font-size: 11px; }
+.citadel-health__track { height: 6px; margin-top: 6px; overflow: hidden; background: #314044; border: 1px solid #65807a; border-radius: 4px; }
+.citadel-health__track i { display: block; height: 100%; transition: width .25s ease; }
+.hud-resource { display: flex; align-items: center; gap: 5px; white-space: nowrap; }
+.hud-resource strong { font-size: 17px; font-variant-numeric: tabular-nums; }
+.hud-loot { display: flex; gap: 4px; border-left: 1px solid #8e9b9880; padding-left: 13px; align-items: center; }
+.hud-loot button { display: grid; place-items: center; width: 30px; height: 32px; border: 0; background: transparent; cursor: pointer; }
+.realm-name { color: var(--realm-accent); font: 700 18px var(--font-display), sans-serif; white-space: nowrap; }
+.realm-progress { color: #e4e9e1; font-size: 12px; white-space: nowrap; }
+.realm-progress b { padding: 0 3px; }
+.realm-combo { color: #f5d181; font-size: 12px; font-weight: 700; }
+.speed-select { display: flex; align-items: center; border: 1px solid #77878388; border-radius: 4px; overflow: hidden; height: 32px; }
+.speed-select button, .hud-control { min-width: 32px; height: 32px; border: 0; background: #122125b8; color: #e4e9e1; font: 700 13px var(--font-body), sans-serif; cursor: pointer; }
+.speed-select button[aria-pressed="true"] { background: #d8bc80; color: #18211e; }
+.hud-control { border: 1px solid #77878388; border-radius: 4px; display: grid; place-items: center; }
+.hud-control:hover, .speed-select button:hover:not([aria-pressed="true"]) { background: #334943; }
+
+/* One attached equipment rail, not five separate floating cards. */
+.build-area { position: absolute; left: 0; right: 0; bottom: 0; z-index: 15; display: flex; flex-direction: column; align-items: center; pointer-events: none; }
+.build-hint { margin-bottom: 10px; padding: 8px 15px; display: flex; gap: 14px; align-items: center; flex-wrap: wrap; color: #f0eee2; font: 500 12px var(--font-body), sans-serif; background: #101b1cea; border-left: 2px solid #d7be87; box-shadow: 0 4px 18px #060c10aa; }
+.build-hint strong { font: 700 15px var(--font-display), sans-serif; }
+.build-rail { width: min(100%, 760px); display: flex; align-items: stretch; min-height: 92px; padding: 8px 12px 12px; gap: 10px; background: linear-gradient(180deg, #1d2e2df5, #101e1dfb); border-top: 2px solid #a49773; box-shadow: 0 -8px 22px #08100b70, inset 0 1px 0 #e9d6ad45; pointer-events: auto; }
+.build-rail__label { align-self: center; font: 700 11px var(--font-body), sans-serif; color: #b4c3b7; writing-mode: vertical-rl; transform: rotate(180deg); letter-spacing: .08em; }
+.build-rail__tools { display: flex; flex: 1; gap: 4px; min-width: 0; }
+.build-tool { position: relative; flex: 1; min-width: 65px; max-width: 96px; height: 72px; display: grid; grid-template-rows: 34px 17px 16px; align-items: center; justify-items: center; padding: 1px 4px; border: 1px solid transparent; border-bottom: 3px solid #697a6e; background: #253835; color: #f4f1e6; cursor: pointer; transition: transform .13s, background .13s, border-color .13s; }
+.build-tool:hover:not(:disabled), .build-tool[data-selected="true"] { transform: translateY(-5px); border-color: var(--tool-color); background: #344842; }
+.build-tool[data-selected="true"] { box-shadow: 0 0 0 1px var(--tool-color), 0 4px 15px #060c0b; }
+.build-tool:disabled { opacity: .42; cursor: not-allowed; }
+.build-tool__key { position: absolute; left: 4px; top: 2px; color: #d0dbce; font-size: 10px; }
+.build-tool__name { font: 700 13px var(--font-display), sans-serif; }
+.build-tool__cost { font: 600 11px var(--font-body), sans-serif; color: #e9cb86; }
+.send-wave { flex: none; width: 140px; height: 72px; border: 1px solid #e6c88c; border-bottom: 4px solid #6b512d; background: #d8bc80; color: #17211e; display: flex; gap: 9px; align-items: center; justify-content: center; padding: 0 10px; font: 700 15px/1.15 var(--font-display), sans-serif; cursor: pointer; text-align: left; }
+.send-wave:hover:not(:disabled) { background: #efd39b; }
+.send-wave:disabled { background: #53645b; border-color: #647971; color: #e2e6dd; cursor: default; }
+.send-wave__icon { display: grid; place-items: center; }
+.placement-note { position: absolute; left: 50%; bottom: 112px; transform: translateX(-50%); z-index: 18; display: flex; align-items: center; gap: 10px; padding: 7px 14px; background: #101e1de8; border-bottom: 2px solid #a49773; color: #f4f1e6; font: 500 13px var(--font-body), sans-serif; white-space: nowrap; pointer-events: auto; box-shadow: 0 5px 18px #07120e99; }
+.placement-note strong { color: #e9cb86; font: 700 15px var(--font-display), sans-serif; }
+.placement-note button { border: 0; background: none; color: #c4d0c5; text-decoration: underline; cursor: pointer; }
+.tower-inspector-position { position: absolute; right: 18px; bottom: 115px; z-index: 20; animation: popIn .18s ease-out; }
+.game-toast { position: absolute; top: 85px; left: 50%; transform: translateX(-50%); z-index: 30; color: #f4ead1; background: #101b1cdb; padding: 7px 16px; border-bottom: 2px solid #d7be87; font: 700 15px var(--font-display), sans-serif; text-shadow: 0 2px 2px #060c0b; pointer-events: none; }
+
+@media (max-width: 950px) {
+  .battle-hud { grid-template-columns: 1fr auto; gap: 5px; min-height: 90px; }
+  .battle-hud__center { grid-column: 1 / -1; grid-row: 2; align-items: flex-start; text-align: left; }
+  .battle-hud__right { grid-column: 2; grid-row: 1; }
+  .title-content { width: min(480px, 65vw); }
+}
+@media (max-width: 600px) {
+  .title-content { top: 25%; transform: none; width: calc(100% - 48px); animation: none; }
+  .title-wordmark { font-size: clamp(39px, 10vw, 56px); }
+  .title-subtitle { margin: 14px 0 22px; font-size: 15px; }
+  .title-nav { margin-top: 22px; gap: 18px; }
+  .title-utility { bottom: 12px; flex-wrap: wrap; font-size: 10px; }
+  .battle-hud { padding: 8px 12px; }
+  .battle-hud__left { gap: 10px; }
+  .citadel-health { width: 106px; }
+  .citadel-health__label span { display: none; }
+  .hud-resource strong { font-size: 14px; }
+  .hud-resource svg { width: 15px; height: 15px; }
+  .hud-loot { max-width: 72px; overflow: hidden; padding-left: 5px; }
+  .battle-hud__right { gap: 4px; }
+  .speed-select button { min-width: 27px; }
+  .build-area { align-items: stretch; }
+  .build-hint { font-size: 11px; }
+  .build-rail { gap: 5px; padding: 6px 6px 10px; min-height: 76px; }
+  .build-rail__label { display: none; }
+  .build-tool { min-width: 50px; height: 61px; grid-template-rows: 27px 16px 14px; }
+  .build-tool svg { width: 28px; height: 28px; }
+  .build-tool__name { font-size: 11px; }
+  .send-wave { width: 88px; height: 61px; gap: 3px; font-size: 12px; }
+  .send-wave__icon { display: none; }
+  .placement-note { bottom: 78px; font-size: 11px; max-width: calc(100% - 16px); white-space: normal; }
+  .tower-inspector-position { right: 8px; bottom: 81px; max-height: calc(100vh - 185px); overflow: auto; }
+  .game-toast { top: 105px; }
 }

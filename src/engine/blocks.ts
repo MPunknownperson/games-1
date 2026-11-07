@@ -21,6 +21,11 @@ export interface TowerBlock {
   splash?: number;
   slow?: number;
   chain?: number;
+  // AI targeting priority: 'first' = closest to the citadel (default),
+  // 'last' = furthest from the citadel, 'strongest' = most HP.
+  targeting?: 'first' | 'last' | 'strongest';
+  /** Per-shot chance to deal 1.5x damage with a crit popup. */
+  critChance?: number;
   // 2.5D visual "block": stack of primitives
   render: TowerRenderer;
 }
@@ -162,11 +167,11 @@ const towerStorm: TowerRenderer = (ctx, cam, x, z, angle, level, color, accent) 
 };
 
 export const TOWERS: Record<TowerKind, TowerBlock> = {
-  archer: { id: 'archer', name: 'ARCHER', cost: 50, damage: 18, range: 3.4, fireRate: 1.6, projectileSpeed: 12, color: '#4ade80', accent: '#a7f3d0', desc: 'RAPID SINGLE TARGET', render: towerArcher },
-  mortar: { id: 'mortar', name: 'MORTAR', cost: 120, damage: 45, range: 3.0, fireRate: 0.6, projectileSpeed: 8, color: '#f87171', accent: '#fecaca', desc: 'SPLASH DAMAGE', splash: 1.3, render: towerMortar },
-  chill: { id: 'chill', name: 'CHILL', cost: 90, damage: 8, range: 2.6, fireRate: 1.2, projectileSpeed: 10, color: '#38bdf8', accent: '#bae6fd', desc: 'SLOWS ENEMIES', slow: 0.5, render: towerChill },
-  prism: { id: 'prism', name: 'PRISM', cost: 180, damage: 32, range: 3.8, fireRate: 1.4, projectileSpeed: 14, color: '#a78bfa', accent: '#ddd6fe', desc: 'CHAINS BETWEEN FOES', chain: 3, render: towerPrism },
-  storm: { id: 'storm', name: 'STORM', cost: 250, damage: 70, range: 4.4, fireRate: 0.8, projectileSpeed: 20, color: '#fbbf24', accent: '#fef3c7', desc: 'MASSIVE PIERCING BOLT', chain: 4, render: towerStorm },
+  archer: { id: 'archer', name: 'Archer', cost: 50, damage: 18, range: 3.4, fireRate: 1.6, projectileSpeed: 12, color: '#4ade80', accent: '#a7f3d0', desc: 'Rapid Single Target', critChance: 0.1, render: towerArcher },
+  mortar: { id: 'mortar', name: 'Mortar', cost: 120, damage: 45, range: 3.0, fireRate: 0.6, projectileSpeed: 8, color: '#f87171', accent: '#fecaca', desc: 'Splash Damage', splash: 1.3, critChance: 0.08, render: towerMortar },
+  chill: { id: 'chill', name: 'Chill', cost: 90, damage: 8, range: 2.6, fireRate: 1.2, projectileSpeed: 10, color: '#38bdf8', accent: '#bae6fd', desc: 'Slows the Strongest Foe', slow: 0.5, targeting: 'strongest', critChance: 0.05, render: towerChill },
+  prism: { id: 'prism', name: 'Prism', cost: 180, damage: 32, range: 3.8, fireRate: 1.4, projectileSpeed: 14, color: '#a78bfa', accent: '#ddd6fe', desc: 'Chains from the Tankiest Foe', chain: 3, targeting: 'strongest', critChance: 0.12, render: towerPrism },
+  storm: { id: 'storm', name: 'Storm', cost: 250, damage: 70, range: 4.4, fireRate: 0.8, projectileSpeed: 20, color: '#fbbf24', accent: '#fef3c7', desc: 'Massive Piercing Bolt', chain: 4, critChance: 0.14, render: towerStorm },
 };
 
 // ---------------- Enemy Blocks ----------------
@@ -192,6 +197,14 @@ export interface EnemyBlock {
   size: number;
   chestChance: number;
   cardChance: number;
+  // AI role & special behaviours (declarative metadata; logic lives in game.ts)
+  role?: 'swarm' | 'skirmisher' | 'tank' | 'support' | 'boss';
+  /** Regenerating shield that absorbs damage before HP. */
+  shield?: number;
+  /** Periodically mends the most injured ally in range. */
+  heal?: { amount: number; radius: number; interval: number };
+  /** Speed aura applied to nearby enemies. */
+  aura?: { speedMult: number; radius: number };
   render: EnemyRenderer;
 }
 
@@ -307,12 +320,12 @@ const enemyBehemoth: EnemyRenderer = (ctx, cam, x, z, t, color, accent) => {
 };
 
 export const ENEMIES: Record<EnemyKind, EnemyBlock> = {
-  slime:    { id: 'slime',    name: 'SLIME',    hp: 55,  speed: 1.1, bounty: 8,  color: '#4ade80', accent: '#dcfce7', size: 0.35, chestChance: 0.03, cardChance: 0.02, render: enemySlime },
-  brute:    { id: 'brute',    name: 'BRUTE',    hp: 140, speed: 0.8, bounty: 16, color: '#65a30d', accent: '#bef264', size: 0.42, chestChance: 0.05, cardChance: 0.03, render: enemyBrute },
-  wisp:     { id: 'wisp',     name: 'WISP',     hp: 80,  speed: 1.7, bounty: 20, color: '#a78bfa', accent: '#ede9fe', size: 0.28, chestChance: 0.06, cardChance: 0.05, render: enemyWisp },
-  golem:    { id: 'golem',    name: 'GOLEM',    hp: 420, speed: 0.55, bounty: 40, color: '#78716c', accent: '#fbbf24', size: 0.55, chestChance: 0.12, cardChance: 0.06, render: enemyGolem },
-  runner:   { id: 'runner',   name: 'RUNNER',   hp: 180, speed: 2.2, bounty: 35, color: '#f97316', accent: '#fed7aa', size: 0.3, chestChance: 0.08, cardChance: 0.06, render: enemyRunner },
-  behemoth: { id: 'behemoth', name: 'BEHEMOTH', hp: 900, speed: 0.7, bounty: 100, color: '#7f1d1d', accent: '#fca5a5', size: 0.8, chestChance: 0.35, cardChance: 0.15, render: enemyBehemoth },
+  slime:    { id: 'slime',    name: 'Slime',    hp: 55,  speed: 1.1, bounty: 8,  color: '#4ade80', accent: '#dcfce7', size: 0.35, chestChance: 0.03, cardChance: 0.02, role: 'swarm', render: enemySlime },
+  brute:    { id: 'brute',    name: 'Brute',    hp: 140, speed: 0.8, bounty: 16, color: '#65a30d', accent: '#bef264', size: 0.42, chestChance: 0.05, cardChance: 0.03, role: 'tank', render: enemyBrute },
+  wisp:     { id: 'wisp',     name: 'Wisp',     hp: 80,  speed: 1.7, bounty: 20, color: '#a78bfa', accent: '#ede9fe', size: 0.28, chestChance: 0.06, cardChance: 0.05, role: 'support', heal: { amount: 16, radius: 2.4, interval: 1.6 }, render: enemyWisp },
+  golem:    { id: 'golem',    name: 'Golem',    hp: 420, speed: 0.55, bounty: 40, color: '#78716c', accent: '#fbbf24', size: 0.55, chestChance: 0.12, cardChance: 0.06, role: 'tank', shield: 180, render: enemyGolem },
+  runner:   { id: 'runner',   name: 'Runner',   hp: 180, speed: 2.2, bounty: 35, color: '#f97316', accent: '#fed7aa', size: 0.3, chestChance: 0.08, cardChance: 0.06, role: 'skirmisher', render: enemyRunner },
+  behemoth: { id: 'behemoth', name: 'Behemoth', hp: 900, speed: 0.7, bounty: 100, color: '#7f1d1d', accent: '#fca5a5', size: 0.8, chestChance: 0.35, cardChance: 0.15, role: 'boss', aura: { speedMult: 1.25, radius: 3.2 }, render: enemyBehemoth },
 };
 
 // ---------------- Theme Blocks ----------------
@@ -327,6 +340,11 @@ export interface ThemeBlock {
   path: string;
   pathBorder: string;
   accent: string;
+  // Atmosphere: how this realm's sky and light behave (consumed by render.ts).
+  sun?: { x: number; y: number; r: number; color: string; glow: string };
+  stars?: number;
+  haze?: string;
+  vignette?: [string, string];
   decor: (ctx: CanvasRenderingContext2D, cam: Camera, x: number, z: number, seed: number) => void;
 }
 
@@ -364,12 +382,18 @@ const decorSpire = (ctx: CanvasRenderingContext2D, cam: Camera, x: number, z: nu
 };
 
 export const THEMES: Record<ThemeKind, ThemeBlock> = {
-  meadow: { id: 'meadow', name: 'FIRST MEADOW',    sky: ['#7dd3fc', '#0369a1'], ground: '#4ade80', groundTile: '#22c55e', path: '#a16207', pathBorder: '#78350f', accent: '#facc15', decor: decorTree },
-  desert: { id: 'desert', name: 'BONE DUNES',      sky: ['#fbbf24', '#c2410c'], ground: '#f59e0b', groundTile: '#d97706', path: '#78350f', pathBorder: '#451a03', accent: '#fef3c7', decor: decorCactus },
-  tundra: { id: 'tundra', name: 'WHITEHOLD',       sky: ['#e0f2fe', '#0369a1'], ground: '#e0f2fe', groundTile: '#bae6fd', path: '#64748b', pathBorder: '#334155', accent: '#7dd3fc', decor: decorIce },
-  ember:  { id: 'ember',  name: 'EMBER HOLLOW',    sky: ['#fca5a5', '#7f1d1d'], ground: '#7f1d1d', groundTile: '#991b1b', path: '#f97316', pathBorder: '#c2410c', accent: '#fbbf24', decor: decorRock },
-  astral: { id: 'astral', name: 'ASTRAL REACH',    sky: ['#312e81', '#0c0a2e'], ground: '#4338ca', groundTile: '#3730a3', path: '#c4b5fd', pathBorder: '#7c3aed', accent: '#a78bfa', decor: decorCrystal },
-  abyss:  { id: 'abyss',  name: 'THE LONG QUIET',  sky: ['#0f172a', '#000000'], ground: '#1e293b', groundTile: '#0f172a', path: '#475569', pathBorder: '#1e293b', accent: '#38bdf8', decor: decorSpire },
+  meadow: { id: 'meadow', name: 'First Meadow', sky: ['#7dd3fc', '#0369a1'], ground: '#4ade80', groundTile: '#22c55e', path: '#a16207', pathBorder: '#78350f', accent: '#facc15',
+    sun: { x: 0.2, y: 0.16, r: 54, color: '#fef9c3', glow: 'rgba(250,204,21,0.4)' }, stars: 0, haze: 'rgba(125,211,252,0.24)', vignette: ['#0b2a45', '#04121f'], decor: decorTree },
+  desert: { id: 'desert', name: 'Bone Dunes', sky: ['#fbbf24', '#c2410c'], ground: '#f59e0b', groundTile: '#d97706', path: '#78350f', pathBorder: '#451a03', accent: '#fef3c7',
+    sun: { x: 0.72, y: 0.24, r: 68, color: '#fde68a', glow: 'rgba(249,115,22,0.42)' }, stars: 0, haze: 'rgba(251,191,36,0.26)', vignette: ['#5a2c06', '#1a0d02'], decor: decorCactus },
+  tundra: { id: 'tundra', name: 'Whitehold', sky: ['#e0f2fe', '#0369a1'], ground: '#e0f2fe', groundTile: '#bae6fd', path: '#64748b', pathBorder: '#334155', accent: '#7dd3fc',
+    sun: { x: 0.3, y: 0.12, r: 44, color: '#f8fafc', glow: 'rgba(224,242,254,0.5)' }, stars: 0, haze: 'rgba(224,242,254,0.34)', vignette: ['#1c3b52', '#0a1826'], decor: decorIce },
+  ember:  { id: 'ember', name: 'Ember Hollow', sky: ['#fca5a5', '#7f1d1d'], ground: '#7f1d1d', groundTile: '#991b1b', path: '#f97316', pathBorder: '#c2410c', accent: '#fbbf24',
+    sun: { x: 0.5, y: 0.3, r: 60, color: '#fca5a5', glow: 'rgba(239,68,68,0.4)' }, stars: 24, haze: 'rgba(239,68,68,0.22)', vignette: ['#4a0f0f', '#150404'], decor: decorRock },
+  astral: { id: 'astral', name: 'Astral Reach', sky: ['#312e81', '#0c0a2e'], ground: '#4338ca', groundTile: '#3730a3', path: '#c4b5fd', pathBorder: '#7c3aed', accent: '#a78bfa',
+    sun: undefined, stars: 120, haze: 'rgba(129,140,248,0.2)', vignette: ['#1c1a4a', '#060518'], decor: decorCrystal },
+  abyss:  { id: 'abyss', name: 'The Long Quiet', sky: ['#0f172a', '#000000'], ground: '#1e293b', groundTile: '#0f172a', path: '#475569', pathBorder: '#1e293b', accent: '#38bdf8',
+    sun: undefined, stars: 60, haze: 'rgba(56,189,248,0.14)', vignette: ['#0b1626', '#000306'], decor: decorSpire },
 };
 
 export const THEME_ORDER: ThemeKind[] = ['meadow', 'desert', 'tundra', 'ember', 'astral', 'abyss'];

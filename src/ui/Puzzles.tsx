@@ -1,31 +1,47 @@
-// PUZZLES — 7 types of mini-games. All visuals code-generated (SVG/CSS).
+// PUZZLES — 7 mini-games to earn Citadel Keys.
+// Supports both click-to-place and drag-and-drop, with crisp SVG vector art
+// and PreserveDisplay / PreserveSans typography.
+
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { PuzzleKind } from '../engine/game';
 import { audio } from '../engine/audio';
 import { Btn, Panel, TOKENS } from './Blocks';
+import { useUiTheme } from './theme';
 import { GlyphText } from './GlyphText';
 
 interface Props { kind: PuzzleKind; onSolve: () => void; onFail: () => void; onClose: () => void; }
 
 const TITLES: Record<PuzzleKind, string> = {
-  sigil: 'ALIGN THE SIGIL',
-  oracle: 'READ THE ORACLE',
-  riddle: 'ANSWER THE VERSE',
-  echo: 'RECALL THE ECHO',
-  pulse: 'CATCH THE PULSE',
-  shift: 'SHIFT THE TILES',
-  gear: 'TURN THE GEAR',
+  sigil: 'Align the Sigil',
+  oracle: 'Read the Oracle',
+  riddle: 'Answer the Verse',
+  echo: 'Recall the Echo',
+  pulse: 'Catch the Pulse',
+  shift: 'Shift the Tiles',
+  gear: 'Turn the Gear',
 };
 
 export function PuzzleModal({ kind, onSolve, onFail, onClose }: Props) {
+  const t = useUiTheme();
   return (
-    <Panel color={TOKENS.color.panel} padding={20} radius={18} style={{ maxWidth: 560, width: '100%' }} glow={TOKENS.color.prism}>
-      <div style={{ textAlign: 'center', marginBottom: 12 }}>
-        <GlyphText size={26} color={TOKENS.color.accent} outline={TOKENS.color.outline} outlineWidth={4}>
+    <Panel color={TOKENS.color.prism} padding={22} radius={18} style={{ maxWidth: 540, width: '100%' }} glow={TOKENS.color.prism}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
+        <GlyphText size={24} color={t.accent}>
           {TITLES[kind]}
         </GlyphText>
+        <Btn variant="ghost" size="sm" onClick={onClose}>Close</Btn>
       </div>
-      <div style={{ minHeight: 260, display: 'flex', alignItems: 'center', justifyContent: 'center', background: TOKENS.color.panelDark, borderRadius: 12, padding: 16, border: `2px solid ${TOKENS.color.outline}` }}>
+      <div style={{
+        minHeight: 260,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        background: `linear-gradient(180deg, ${t.panelDeepTop}, ${t.panelDeepBottom})`,
+        borderRadius: 12,
+        padding: 20,
+        border: `1.5px solid ${t.frame}`,
+        boxShadow: 'inset 0 2px 8px rgba(0,0,0,0.45)',
+      }}>
         {kind === 'sigil' && <Sigil onSolve={onSolve} onFail={onFail} />}
         {kind === 'oracle' && <Oracle onSolve={onSolve} onFail={onFail} />}
         {kind === 'riddle' && <Riddle onSolve={onSolve} onFail={onFail} />}
@@ -35,59 +51,92 @@ export function PuzzleModal({ kind, onSolve, onFail, onClose }: Props) {
         {kind === 'gear' && <Gear onSolve={onSolve} onFail={onFail} />}
       </div>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 12 }}>
-        <GlyphText size={11} color={TOKENS.color.inkMuted}>SOLVE TO EARN A KEY</GlyphText>
-        <Btn variant="ghost" size="sm" onClick={onClose}>CLOSE</Btn>
+        <GlyphText size={13} color={t.inkMuted} variant="body">
+          Complete the trial to forge a Citadel Key
+        </GlyphText>
+        <GlyphText size={12} color={t.accent}>+1 Key Reward</GlyphText>
       </div>
     </Panel>
   );
 }
 
-// 1. SIGIL — align 3 rune shapes with their outlines by drag
+// 1. SIGIL — align 3 rune shapes with their outlines (click or drag)
 function Sigil({ onSolve }: { onSolve: () => void; onFail: () => void }) {
+  const t = useUiTheme();
   const shapes = useMemo(() => ['triangle', 'square', 'pent'] as const, []);
+  const colors: Record<string, string> = { triangle: '#4ade80', square: '#f87171', pent: '#a78bfa' };
   const [placed, setPlaced] = useState<Record<string, string | null>>({ triangle: null, square: null, pent: null });
-  const [drag, setDrag] = useState<string | null>(null);
+  const [selected, setSelected] = useState<string | null>(null);
 
-  function drop(slot: string) {
-    if (!drag) return;
+  function placeInto(slot: string, shapeName?: string | null) {
+    const piece = shapeName ?? selected;
+    if (!piece) return;
     const np: Record<string, string | null> = { ...placed };
-    for (const k of Object.keys(np)) if (np[k] === drag) np[k] = null;
-    np[slot] = drag;
+    for (const k of Object.keys(np)) if (np[k] === piece) np[k] = null;
+    np[slot] = piece;
     setPlaced(np);
-    setDrag(null);
+    setSelected(null);
     audio.tick();
-    if (Object.keys(np).every((k) => np[k] === k)) { audio.success(); setTimeout(onSolve, 500); }
+    if (Object.keys(np).every((k) => np[k] === k)) {
+      audio.success();
+      setTimeout(onSolve, 450);
+    }
   }
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 16, alignItems: 'center' }}>
-      <GlyphText size={13} color={TOKENS.color.ink}>DRAG EACH SHAPE TO ITS OUTLINE</GlyphText>
-      <div style={{ display: 'flex', gap: 16 }}>
-        {shapes.map((s) => (
-          <div
-            key={s}
-            onDragOver={(e) => e.preventDefault()}
-            onDrop={() => drop(s)}
-            onTouchEnd={() => { if (drag) drop(s); }}
-            style={{ width: 80, height: 80, border: '2px dashed #64748b', borderRadius: 12, display: 'flex', alignItems: 'center', justifyContent: 'center', background: placed[s] === s ? 'rgba(74,222,128,0.15)' : 'transparent' }}
-          >
-            <ShapeSvg name={s} size={54} filled={placed[s] === s} />
-          </div>
-        ))}
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 18, alignItems: 'center' }}>
+      <GlyphText size={14} color={t.ink} variant="body">
+        Drag or click each rune shape into its matching socket
+      </GlyphText>
+      <div style={{ display: 'flex', gap: 18 }}>
+        {shapes.map((s) => {
+          const matched = placed[s] === s;
+          return (
+            <button
+              key={s}
+              type="button"
+              onClick={() => placeInto(s)}
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={() => placeInto(s)}
+              style={{
+                width: 84, height: 84,
+                border: `2px dashed ${matched ? '#4ade80' : selected ? t.accent : '#64748b'}`,
+                borderRadius: 14,
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                background: matched ? 'rgba(74,222,128,0.16)' : 'rgba(255,255,255,0.03)',
+                cursor: selected ? 'pointer' : 'default',
+                transition: 'border-color 0.15s, background 0.15s',
+              }}
+            >
+              <ShapeSvg name={s} size={54} filled={matched} color={matched ? colors[s] : '#94a3b8'} />
+            </button>
+          );
+        })}
       </div>
-      <div style={{ display: 'flex', gap: 16, marginTop: 12 }}>
+      <div style={{ display: 'flex', gap: 18, marginTop: 4 }}>
         {shapes.map((s) => {
           const isPlaced = Object.values(placed).includes(s);
+          const isSel = selected === s;
           return (
-            <div
+            <button
               key={s}
+              type="button"
+              disabled={isPlaced}
               draggable={!isPlaced}
-              onDragStart={() => setDrag(s)}
-              onTouchStart={() => setDrag(s)}
-              style={{ opacity: isPlaced ? 0.25 : 1, cursor: isPlaced ? 'default' : 'grab', touchAction: 'none' }}
+              onClick={() => { audio.tick(); setSelected(isSel ? null : s); }}
+              onDragStart={() => setSelected(s)}
+              style={{
+                width: 72, height: 72, borderRadius: 12,
+                background: isSel ? 'rgba(251,191,36,0.16)' : `linear-gradient(180deg, ${t.panelTop}, ${t.panelBottom})`,
+                border: `2px solid ${isSel ? t.accent : t.frame}`,
+                opacity: isPlaced ? 0.25 : 1,
+                cursor: isPlaced ? 'default' : 'grab',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                boxShadow: isSel ? `0 0 14px ${t.accent}55` : '0 3px 0 rgba(0,0,0,0.4)',
+              }}
             >
-              <ShapeSvg name={s} size={54} filled color={['#4ade80', '#f87171', '#a78bfa'][shapes.indexOf(s)]} />
-            </div>
+              <ShapeSvg name={s} size={48} filled color={colors[s]} />
+            </button>
           );
         })}
       </div>
@@ -101,13 +150,13 @@ function ShapeSvg({ name, size, filled, color }: { name: 'triangle' | 'square' |
   return (
     <svg width={size} height={size} viewBox="0 0 60 60">
       {name === 'triangle' && (
-        <path d="M30 5 L55 50 L5 50 Z" fill={filled ? c : 'none'} stroke={filled ? stroke : c} strokeWidth={filled ? 2 : 3} strokeLinejoin="round" />
+        <path d="M30 7 L53 49 L7 49 Z" fill={filled ? c : 'none'} stroke={filled ? stroke : c} strokeWidth={filled ? 2.5 : 3} strokeLinejoin="round" />
       )}
       {name === 'square' && (
-        <rect x="8" y="8" width="44" height="44" rx="4" fill={filled ? c : 'none'} stroke={filled ? stroke : c} strokeWidth={filled ? 2 : 3} />
+        <rect x="9" y="9" width="42" height="42" rx="5" fill={filled ? c : 'none'} stroke={filled ? stroke : c} strokeWidth={filled ? 2.5 : 3} />
       )}
       {name === 'pent' && (
-        <path d="M30 5 L55 25 L45 55 L15 55 L5 25 Z" fill={filled ? c : 'none'} stroke={filled ? stroke : c} strokeWidth={filled ? 2 : 3} strokeLinejoin="round" />
+        <path d="M30 6 L54 24 L45 52 L15 52 L6 24 Z" fill={filled ? c : 'none'} stroke={filled ? stroke : c} strokeWidth={filled ? 2.5 : 3} strokeLinejoin="round" />
       )}
     </svg>
   );
@@ -115,12 +164,13 @@ function ShapeSvg({ name, size, filled, color }: { name: 'triangle' | 'square' |
 
 // 2. ORACLE — pick the symbol matching the prophecy
 function Oracle({ onSolve, onFail }: { onSolve: () => void; onFail: () => void }) {
+  const t = useUiTheme();
   const options = useMemo(() => {
     const all = [
-      { sym: 'sun', name: 'DAWN', meaning: 'A NEW BEGINNING RISES' },
-      { sym: 'moon', name: 'DUSK', meaning: 'REFLECT AND RENEW' },
-      { sym: 'star', name: 'FATE', meaning: 'PATHS ALIGN IN SILENCE' },
-      { sym: 'flame', name: 'PYRE', meaning: 'CHANGE FORGED IN FIRE' },
+      { sym: 'sun', name: 'Dawn', meaning: 'A new beginning rises' },
+      { sym: 'moon', name: 'Dusk', meaning: 'Reflect and renew' },
+      { sym: 'star', name: 'Fate', meaning: 'Paths align in silence' },
+      { sym: 'flame', name: 'Pyre', meaning: 'Change forged in fire' },
     ] as const;
     const shuffled = [...all].sort(() => Math.random() - 0.5);
     return { all, target: shuffled[0] };
@@ -129,42 +179,46 @@ function Oracle({ onSolve, onFail }: { onSolve: () => void; onFail: () => void }
 
   function pick(i: number) {
     setPicked(i);
-    if (options.all[i].name === options.target.name) { audio.success(); setTimeout(onSolve, 500); }
-    else { audio.err(); setTimeout(onFail, 800); }
+    if (options.all[i].name === options.target.name) { audio.success(); setTimeout(onSolve, 450); }
+    else { audio.err(); setTimeout(onFail, 750); }
   }
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 14, alignItems: 'center' }}>
-      <GlyphText size={13} color={TOKENS.color.inkMuted}>THE ORACLE SPEAKS</GlyphText>
-      <GlyphText size={16} color={TOKENS.color.accent} outline={TOKENS.color.outline} outlineWidth={3}>
+      <GlyphText size={13} color={t.inkMuted} variant="body">The Oracle speaks:</GlyphText>
+      <GlyphText size={19} color={t.accent}>
         {`"${options.target.meaning}"`}
       </GlyphText>
-      <GlyphText size={12} color={TOKENS.color.ink}>WHICH SYMBOL?</GlyphText>
-      <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', justifyContent: 'center' }}>
+      <GlyphText size={13} color={t.ink} variant="body">Choose the matching sigil:</GlyphText>
+      <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', justifyContent: 'center', marginTop: 4 }}>
         {options.all.map((c, i) => (
           <button
             key={i}
             onClick={() => pick(i)}
             disabled={picked !== null}
             style={{
-              width: 74, height: 92, borderRadius: 10, padding: 6,
-              background: picked === i ? (c.name === options.target.name ? '#166534' : '#7f1d1d') : '#0a0f1a',
-              border: `2px solid ${picked === i ? (c.name === options.target.name ? '#4ade80' : '#ef4444') : '#334155'}`,
+              width: 84, height: 100, borderRadius: 12, padding: 8,
+              background: picked === i
+                ? (c.name === options.target.name ? 'rgba(74,222,128,0.28)' : 'rgba(239,68,68,0.28)')
+                : `linear-gradient(180deg, ${t.panelTop}, ${t.panelBottom})`,
+              border: `2px solid ${picked === i ? (c.name === options.target.name ? t.good : t.bad) : t.frame}`,
               cursor: picked === null ? 'pointer' : 'default',
-              display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4,
+              display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'space-between',
+              boxShadow: '0 3px 0 rgba(0,0,0,0.4)',
             }}
           >
             <OracleSym s={c.sym} />
-            <GlyphText size={10} color="#cbd5e1">{c.name}</GlyphText>
+            <GlyphText size={13} color={t.ink}>{c.name}</GlyphText>
           </button>
         ))}
       </div>
     </div>
   );
 }
+
 function OracleSym({ s }: { s: 'sun' | 'moon' | 'star' | 'flame' }) {
   return (
-    <svg width="40" height="40" viewBox="0 0 40 40">
+    <svg width="44" height="44" viewBox="0 0 40 40">
       {s === 'sun' && (
         <>
           <circle cx="20" cy="20" r="8" fill="#fbbf24" stroke="#78350f" strokeWidth="1.5" />
@@ -189,13 +243,14 @@ function OracleSym({ s }: { s: 'sun' | 'moon' | 'star' | 'flame' }) {
 
 // 3. RIDDLE
 function Riddle({ onSolve, onFail }: { onSolve: () => void; onFail: () => void }) {
+  const t = useUiTheme();
   const q = useMemo(() => {
     const qs = [
-      { text: 'I HAVE NO VOICE BUT TELL ALL TALES; I HAVE NO LEGS BUT NEVER FAIL. WHAT AM I?', answers: ['A MAP', 'A SWORD', 'A FIRE', 'A KEY'], correct: 0 },
-      { text: 'I AM EARNED BY COURAGE, SPENT BY WAR. YOU GAIN ME FROM THE ONES YOU FLOOR. WHAT AM I?', answers: ['WOOD', 'GOLD', 'IRON', 'BLOOD'], correct: 1 },
-      { text: 'I GUARD THE PATH BUT NEVER MARCH; I STRIKE FROM FAR WITH SILENT ART. WHAT AM I?', answers: ['A KNIGHT', 'A TOWER', 'A DRAGON', 'A WALL'], correct: 1 },
-      { text: 'THREE TEETH I HAVE, YET NEVER BITE; I TURN THE LOCK THAT HIDES THE LIGHT. WHAT AM I?', answers: ['A COMB', 'A KEY', 'A NAIL', 'A COIN'], correct: 1 },
-      { text: 'BORN OF STORM, I LEAP FROM CLOUD; I STRIKE ONCE THEN AM NEVER LOUD. WHAT AM I?', answers: ['RAIN', 'LIGHTNING', 'THUNDER', 'WIND'], correct: 1 },
+      { text: 'I have no voice, yet tell all tales; I have no legs, yet chart the trails. What am I?', answers: ['A Map', 'A Sword', 'A Torch', 'A Key'], correct: 0 },
+      { text: 'Earned by valor, spent on towers and walls; gained from every foe that falls. What am I?', answers: ['Timber', 'Gold', 'Iron', 'Honor'], correct: 1 },
+      { text: 'I guard the path, yet never march; I strike from afar through stone and arch. What am I?', answers: ['A Knight', 'A Tower', 'A Dragon', 'A Rampart'], correct: 1 },
+      { text: 'Three teeth I bear, yet never bite; I turn the lock that frees the light. What am I?', answers: ['A Comb', 'A Key', 'A Chisel', 'A Coin'], correct: 1 },
+      { text: 'Born of storm, I arc from cloud; I strike with flash, fierce and loud. What am I?', answers: ['Rain', 'Lightning', 'Thunder', 'Gale'], correct: 1 },
     ];
     return qs[Math.floor(Math.random() * qs.length)];
   }, []);
@@ -203,22 +258,22 @@ function Riddle({ onSolve, onFail }: { onSolve: () => void; onFail: () => void }
 
   function pick(i: number) {
     setPicked(i);
-    if (i === q.correct) { audio.success(); setTimeout(onSolve, 500); }
-    else { audio.err(); setTimeout(onFail, 800); }
+    if (i === q.correct) { audio.success(); setTimeout(onSolve, 450); }
+    else { audio.err(); setTimeout(onFail, 750); }
   }
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 12, alignItems: 'center', maxWidth: 400 }}>
-      <GlyphText size={14} color={TOKENS.color.ink} outline={TOKENS.color.outline} outlineWidth={2} letterSpacing={1}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 14, alignItems: 'center', maxWidth: 420 }}>
+      <GlyphText size={15} color={t.ink} variant="body" style={{ textAlign: 'center' }}>
         {q.text}
       </GlyphText>
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, width: '100%', marginTop: 8 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, width: '100%', marginTop: 6 }}>
         {q.answers.map((a, i) => (
           <Btn
             key={i}
             onClick={() => pick(i)}
             disabled={picked !== null}
             variant={picked === i ? (i === q.correct ? 'good' : 'bad') : 'secondary'}
-            size="sm"
+            size="md"
             block
           >
             {a}
@@ -229,8 +284,9 @@ function Riddle({ onSolve, onFail }: { onSolve: () => void; onFail: () => void }
   );
 }
 
-// 4. ECHO — Simon-like sequence memory
+// 4. ECHO — sequence memory
 function Echo({ onSolve, onFail }: { onSolve: () => void; onFail: () => void }) {
+  const t = useUiTheme();
   const pads = useMemo(() => [
     { color: '#ef4444', id: 0 }, { color: '#3b82f6', id: 1 }, { color: '#22c55e', id: 2 }, { color: '#eab308', id: 3 },
   ], []);
@@ -246,26 +302,28 @@ function Echo({ onSolve, onFail }: { onSolve: () => void; onFail: () => void }) 
       if (i >= sequence.length) { setPhase('input'); return; }
       setFlashId(sequence[i]);
       audio.tick();
-      setTimeout(() => { setFlashId(null); i++; setTimeout(step, 200); }, 500);
+      setTimeout(() => { setFlashId(null); i++; setTimeout(step, 200); }, 480);
     };
-    const t = setTimeout(step, 500);
-    return () => clearTimeout(t);
+    const timer = setTimeout(step, 450);
+    return () => clearTimeout(timer);
   }, [phase, sequence]);
 
   function press(id: number) {
     if (phase !== 'input') return;
     setFlashId(id);
     audio.tick();
-    setTimeout(() => setFlashId(null), 200);
+    setTimeout(() => setFlashId(null), 180);
     if (sequence[inputIdx] !== id) { audio.err(); setPhase('done'); setTimeout(onFail, 500); return; }
-    if (inputIdx + 1 >= sequence.length) { setPhase('done'); audio.success(); setTimeout(onSolve, 500); }
+    if (inputIdx + 1 >= sequence.length) { setPhase('done'); audio.success(); setTimeout(onSolve, 450); }
     else setInputIdx(inputIdx + 1);
   }
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 12, alignItems: 'center' }}>
-      <GlyphText size={13} color={TOKENS.color.ink}>{phase === 'show' ? 'WATCH...' : phase === 'input' ? 'REPEAT!' : '...'}</GlyphText>
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 14, alignItems: 'center' }}>
+      <GlyphText size={14} color={phase === 'input' ? t.accent : t.inkMuted} variant="body">
+        {phase === 'show' ? 'Watch the sequence carefully...' : phase === 'input' ? `Repeat the pattern (${inputIdx + 1} of ${sequence.length})` : 'Complete!'}
+      </GlyphText>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
         {pads.map((p) => (
           <button
             key={p.id}
@@ -273,10 +331,10 @@ function Echo({ onSolve, onFail }: { onSolve: () => void; onFail: () => void }) 
             onTouchStart={(e) => { e.preventDefault(); press(p.id); }}
             disabled={phase !== 'input'}
             style={{
-              width: 96, height: 96, borderRadius: 14, border: `3px solid ${p.color}`,
-              background: flashId === p.id ? p.color : `${p.color}33`,
-              boxShadow: flashId === p.id ? `0 0 40px ${p.color}` : 'none',
-              opacity: phase === 'input' ? 1 : 0.7,
+              width: 94, height: 94, borderRadius: 14, border: `3px solid ${p.color}`,
+              background: flashId === p.id ? p.color : `${p.color}2e`,
+              boxShadow: flashId === p.id ? `0 0 32px ${p.color}` : 'inset 0 2px 6px rgba(0,0,0,0.4)',
+              opacity: phase === 'input' ? 1 : 0.72,
               cursor: phase === 'input' ? 'pointer' : 'default',
               transition: 'all 0.1s',
             }}
@@ -289,17 +347,18 @@ function Echo({ onSolve, onFail }: { onSolve: () => void; onFail: () => void }) 
 
 // 5. PULSE — timing bar
 function Pulse({ onSolve, onFail }: { onSolve: () => void; onFail: () => void }) {
+  const t = useUiTheme();
   const [pos, setPos] = useState(0);
   const dirRef = useRef(1);
   const [done, setDone] = useState(false);
-  const attRef = useRef(2);
+  const [attempts, setAttempts] = useState(2);
 
   useEffect(() => {
     let raf = 0; let last = performance.now();
-    const loop = (t: number) => {
-      const dt = (t - last) / 1000; last = t;
+    const loop = (now: number) => {
+      const dt = (now - last) / 1000; last = now;
       setPos((p) => {
-        let np = p + dirRef.current * 0.9 * dt;
+        let np = p + dirRef.current * 0.85 * dt;
         if (np > 1) { np = 1; dirRef.current = -1; }
         if (np < 0) { np = 0; dirRef.current = 1; }
         return np;
@@ -312,34 +371,37 @@ function Pulse({ onSolve, onFail }: { onSolve: () => void; onFail: () => void })
 
   function hit() {
     if (done) return;
-    const good = pos > 0.45 && pos < 0.55;
-    if (good) { setDone(true); audio.success(); setTimeout(onSolve, 500); }
+    const good = pos >= 0.44 && pos <= 0.56;
+    if (good) { setDone(true); audio.success(); setTimeout(onSolve, 450); }
     else {
-      attRef.current--; audio.err();
-      if (attRef.current <= 0) { setDone(true); setTimeout(onFail, 500); }
+      const rem = attempts - 1;
+      setAttempts(rem);
+      audio.err();
+      if (rem <= 0) { setDone(true); setTimeout(onFail, 500); }
     }
   }
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 12, alignItems: 'center', width: '100%' }}>
-      <GlyphText size={13} color={TOKENS.color.ink}>STRIKE ON THE GREEN LINE</GlyphText>
-      <div style={{ position: 'relative', width: 320, height: 40, background: '#0a0f1a', border: `3px solid ${TOKENS.color.outline}`, borderRadius: 8 }}>
-        <div style={{ position: 'absolute', top: 0, bottom: 0, left: '45%', width: '10%', background: 'linear-gradient(180deg, rgba(74,222,128,0.4), rgba(74,222,128,0.2))', borderLeft: '2px solid #4ade80', borderRight: '2px solid #4ade80' }} />
-        <div style={{ position: 'absolute', top: 0, bottom: 0, left: `${pos * 100}%`, width: 6, background: '#fbbf24', transform: 'translateX(-50%)', boxShadow: '0 0 12px #fbbf24' }} />
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 14, alignItems: 'center', width: '100%' }}>
+      <GlyphText size={14} color={t.ink} variant="body">Strike when the marker enters the green zone</GlyphText>
+      <div style={{ position: 'relative', width: 320, maxWidth: '100%', height: 42, background: t.panelDeepBottom, border: `2px solid ${t.frame}`, borderRadius: 10, boxShadow: 'inset 0 2px 6px rgba(0,0,0,0.5)' }}>
+        <div style={{ position: 'absolute', top: 0, bottom: 0, left: '44%', width: '12%', background: 'rgba(74,222,128,0.3)', borderLeft: '2px solid #4ade80', borderRight: '2px solid #4ade80' }} />
+        <div style={{ position: 'absolute', top: 0, bottom: 0, left: `${pos * 100}%`, width: 6, background: '#fbbf24', transform: 'translateX(-50%)', boxShadow: '0 0 12px #fbbf24', borderRadius: 3 }} />
       </div>
-      <Btn variant="primary" size="lg" onClick={hit} disabled={done}>STRIKE</Btn>
-      <GlyphText size={11} color={TOKENS.color.inkMuted}>{`ATTEMPTS: ${attRef.current}`}</GlyphText>
+      <Btn variant="primary" size="lg" onClick={hit} disabled={done}>Strike</Btn>
+      <GlyphText size={13} color={t.inkMuted} variant="body">{`Attempts remaining: ${attempts}`}</GlyphText>
     </div>
   );
 }
 
 // 6. SHIFT — 3x3 sliding puzzle
 function Shift({ onSolve, onFail }: { onSolve: () => void; onFail: () => void }) {
+  const t = useUiTheme();
   const size = 3;
   const [tiles, setTiles] = useState<number[]>(() => {
-    const t: number[] = Array.from({ length: size * size }, (_, i) => i);
+    const arr: number[] = Array.from({ length: size * size }, (_, i) => i);
     let blank = size * size - 1;
-    for (let i = 0; i < 30; i++) {
+    for (let i = 0; i < 24; i++) {
       const neighbors: number[] = [];
       const r = Math.floor(blank / size), c = blank % size;
       if (r > 0) neighbors.push(blank - size);
@@ -347,10 +409,10 @@ function Shift({ onSolve, onFail }: { onSolve: () => void; onFail: () => void })
       if (c > 0) neighbors.push(blank - 1);
       if (c < size - 1) neighbors.push(blank + 1);
       const n = neighbors[Math.floor(Math.random() * neighbors.length)];
-      [t[blank], t[n]] = [t[n], t[blank]];
+      [arr[blank], arr[n]] = [arr[n], arr[blank]];
       blank = n;
     }
-    return t;
+    return arr;
   });
   const [moves, setMoves] = useState(0);
   const blankIdx = tiles.indexOf(size * size - 1);
@@ -366,35 +428,41 @@ function Shift({ onSolve, onFail }: { onSolve: () => void; onFail: () => void })
   }
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 10, alignItems: 'center' }}>
-      <GlyphText size={12} color={TOKENS.color.ink}>{`RESTORE THE ATLAS. MOVES: ${moves}`}</GlyphText>
-      <div style={{ display: 'grid', gridTemplateColumns: `repeat(${size}, 1fr)`, gap: 4, background: '#0a0f1a', padding: 6, borderRadius: 8, border: `2px solid ${TOKENS.color.outline}` }}>
-        {tiles.map((v, i) => (
-          <button
-            key={i}
-            onClick={() => click(i)}
-            style={{
-              width: 64, height: 64, borderRadius: 6,
-              background: v === size * size - 1 ? 'transparent' : 'linear-gradient(180deg, #475569, #334155)',
-              border: v === size * size - 1 ? 'none' : `2px solid #0d1220`,
-              cursor: v === size * size - 1 ? 'default' : 'pointer',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              boxShadow: v === size * size - 1 ? 'none' : 'inset 0 -2px 0 rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.15)',
-            }}
-          >
-            {v !== size * size - 1 && <GlyphText size={24} color="#fef3c7" outline="#0d1220" outlineWidth={3}>{String(v + 1)}</GlyphText>}
-          </button>
-        ))}
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12, alignItems: 'center' }}>
+      <GlyphText size={14} color={t.ink} variant="body">{`Order the numbered tiles 1 to 8 (Moves: ${moves})`}</GlyphText>
+      <div style={{ display: 'grid', gridTemplateColumns: `repeat(${size}, 1fr)`, gap: 6, background: t.panelDeepBottom, padding: 8, borderRadius: 10, border: `1.5px solid ${t.frame}` }}>
+        {tiles.map((v, i) => {
+          const isBlank = v === size * size - 1;
+          const inPlace = v === i;
+          return (
+            <button
+              key={i}
+              onClick={() => click(i)}
+              disabled={isBlank}
+              style={{
+                width: 64, height: 64, borderRadius: 8,
+                background: isBlank ? 'transparent' : `linear-gradient(180deg, ${t.panelTop}, ${t.panelBottom})`,
+                border: isBlank ? 'none' : `2px solid ${inPlace ? '#4ade80' : t.frame}`,
+                cursor: isBlank ? 'default' : 'pointer',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                boxShadow: isBlank ? 'none' : '0 3px 0 rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.12)',
+              }}
+            >
+              {!isBlank && <GlyphText size={24} color={inPlace ? '#86efac' : '#fef3c7'} raw>{String(v + 1)}</GlyphText>}
+            </button>
+          );
+        })}
       </div>
-      <Btn variant="ghost" size="sm" onClick={onFail}>GIVE UP</Btn>
+      <Btn variant="ghost" size="sm" onClick={onFail}>Forfeit Trial</Btn>
     </div>
   );
 }
 
 // 7. GEAR — turn dial to align with target notch
 function Gear({ onSolve, onFail }: { onSolve: () => void; onFail: () => void }) {
+  const t = useUiTheme();
   const target = useMemo(() => Math.floor(Math.random() * 12), []);
-  const [angle, setAngle] = useState(Math.floor(Math.random() * 12));
+  const [angle, setAngle] = useState(() => (target + 3 + Math.floor(Math.random() * 6)) % 12);
   const [attempts, setAttempts] = useState(3);
   function turn(d: number) { setAngle((a) => (a + d + 12) % 12); audio.tick(); }
   function confirm() {
@@ -405,33 +473,33 @@ function Gear({ onSolve, onFail }: { onSolve: () => void; onFail: () => void }) 
     }
   }
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 14, alignItems: 'center' }}>
-      <GlyphText size={13} color={TOKENS.color.ink}>ALIGN THE POINTER TO THE MARK</GlyphText>
-      <svg width="180" height="180" viewBox="0 0 200 200">
-        <circle cx="100" cy="100" r="90" fill="#0a0f1a" stroke={TOKENS.color.outline} strokeWidth="3" />
-        <circle cx="100" cy="100" r="82" fill="none" stroke="#334155" strokeWidth="2" />
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12, alignItems: 'center' }}>
+      <GlyphText size={14} color={t.ink} variant="body">Rotate the dial to align with the golden notch</GlyphText>
+      <svg width="176" height="176" viewBox="0 0 200 200">
+        <circle cx="100" cy="100" r="90" fill={t.panelDeepBottom} stroke={t.frame} strokeWidth="3" />
+        <circle cx="100" cy="100" r="80" fill="none" stroke={t.edge} strokeWidth="1.5" />
         {Array.from({ length: 12 }).map((_, i) => {
           const a = (i / 12) * Math.PI * 2 - Math.PI / 2;
-          const x = 100 + Math.cos(a) * 74; const y = 100 + Math.sin(a) * 74;
+          const x = 100 + Math.cos(a) * 72; const y = 100 + Math.sin(a) * 72;
           return (
             <g key={i}>
-              <circle cx={x} cy={y} r={i === target ? 8 : 3} fill={i === target ? '#fbbf24' : '#64748b'} stroke={i === target ? '#78350f' : 'none'} strokeWidth="1.5" />
-              {i === target && <path d={`M${x - 3},${y} L${x},${y - 3} L${x + 3},${y} L${x},${y + 3} Z`} fill="#fef3c7" />}
+              <circle cx={x} cy={y} r={i === target ? 9 : 4} fill={i === target ? '#fbbf24' : '#64748b'} stroke={i === target ? '#78350f' : 'none'} strokeWidth="1.5" />
+              {i === target && <path d={`M${x - 4},${y} L${x},${y - 4} L${x + 4},${y} L${x},${y + 4} Z`} fill="#fef3c7" />}
             </g>
           );
         })}
         <g transform={`rotate(${(angle / 12) * 360} 100 100)`}>
-          <line x1="100" y1="100" x2="100" y2="30" stroke="#fbbf24" strokeWidth="6" strokeLinecap="round" />
-          <polygon points="100,25 96,35 104,35" fill="#fef3c7" stroke="#78350f" strokeWidth="1.5" />
+          <line x1="100" y1="100" x2="100" y2="32" stroke="#fbbf24" strokeWidth="6" strokeLinecap="round" />
+          <polygon points="100,24 94,37 106,37" fill="#fef3c7" stroke="#78350f" strokeWidth="1.5" />
         </g>
-        <circle cx="100" cy="100" r="10" fill="#fbbf24" stroke="#78350f" strokeWidth="2" />
+        <circle cx="100" cy="100" r="11" fill="#fbbf24" stroke="#78350f" strokeWidth="2" />
       </svg>
-      <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-        <Btn variant="secondary" size="sm" onClick={() => turn(-1)}>LEFT</Btn>
-        <Btn variant="primary" size="md" onClick={confirm}>UNLOCK</Btn>
-        <Btn variant="secondary" size="sm" onClick={() => turn(1)}>RIGHT</Btn>
+      <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+        <Btn variant="secondary" size="sm" onClick={() => turn(-1)}>Turn Left</Btn>
+        <Btn variant="primary" size="md" onClick={confirm}>Unlock</Btn>
+        <Btn variant="secondary" size="sm" onClick={() => turn(1)}>Turn Right</Btn>
       </div>
-      <GlyphText size={11} color={TOKENS.color.inkMuted}>{`ATTEMPTS: ${attempts}`}</GlyphText>
+      <GlyphText size={13} color={t.inkMuted} variant="body">{`Attempts remaining: ${attempts}`}</GlyphText>
     </div>
   );
 }

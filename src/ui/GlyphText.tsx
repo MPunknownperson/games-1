@@ -1,26 +1,35 @@
-// GlyphText: renders the custom typeface as SVG for React UI.
-import { useMemo } from 'react';
-import { textToSvgPaths } from '../engine/typeface';
+// GlyphText — Primary text component for PRESERVE EVERYTHING.
+//
+// Renders text using the game's custom-designed OpenType typeface family
+// (PreserveDisplay for headings/buttons/badges, PreserveSans for body/stats).
+// Automatically formats copy into natural Title Case or Sentence case (never
+// all-caps), with clean contrast, legible minimum sizing, and tabular numbers.
 
-interface Props {
-  children: string;
+import type { CSSProperties, ReactNode } from 'react';
+import { FONT_DISPLAY, FONT_BODY, formatGameText, installFontLibrary } from './typeface/fontLibrary';
+
+export interface GlyphTextProps {
+  children: ReactNode;
   size?: number;
   color?: string;
-  stroke?: number;
   outline?: string;
   outlineWidth?: number;
   letterSpacing?: number;
   className?: string;
   align?: 'left' | 'center' | 'right';
   shadow?: { color: string; dx: number; dy: number };
-  style?: React.CSSProperties;
+  style?: CSSProperties;
+  raw?: boolean;
+  casing?: 'normal' | 'title' | 'sentence';
+  variant?: 'display' | 'body';
 }
+
+const NUMERIC = /^[\d\s.,%+\-/:×g]+$/;
 
 export function GlyphText({
   children,
-  size = 24,
-  color = '#e2e8f0',
-  stroke,
+  size = 14,
+  color = '#f8fafc',
   outline,
   outlineWidth,
   letterSpacing,
@@ -28,56 +37,55 @@ export function GlyphText({
   align = 'left',
   shadow,
   style,
-}: Props) {
-  const { paths, width, height } = useMemo(() => textToSvgPaths(children, size, letterSpacing), [children, size, letterSpacing]);
-  const sw = stroke ?? Math.max(1.5, size * 0.09);
-  const ow = outlineWidth ?? Math.max(3, size * 0.18);
-  const totalW = width;
-  const pad = ow + 2;
+  raw = false,
+  casing,
+  variant = 'display',
+}: GlyphTextProps) {
+  installFontLibrary();
+
+  const px = Math.max(12, Math.round(size));
+  const family = variant === 'body' ? FONT_BODY : FONT_DISPLAY;
+
+  const textContent = typeof children === 'string' ? children : '';
+  const isNumeric = textContent !== '' && NUMERIC.test(textContent.trim());
+  const formattedText = textContent
+    ? raw || isNumeric
+      ? textContent
+      : formatGameText(textContent, casing)
+    : children;
+
+  const shadows: string[] = [];
+  if (outline && px >= 16) {
+    const w = Math.min(2, Math.max(1, outlineWidth ? Math.round(outlineWidth * 0.35) : 1));
+    shadows.push(`0 ${w}px 0 ${outline}`, `${w}px 0 0 ${outline}`, `-${w}px 0 0 ${outline}`, `0 -${w}px 0 ${outline}`);
+  }
+  if (shadow) {
+    shadows.push(`${shadow.dx}px ${shadow.dy}px 2px ${shadow.color}`);
+  } else if (px >= 16) {
+    shadows.push('0 1px 3px rgba(0,0,0,0.55)');
+  }
+
+  const transform =
+    align === 'center' ? 'translateX(-50%)' : align === 'right' ? 'translateX(-100%)' : undefined;
+
   return (
-    <svg
-      width={Math.ceil(totalW + pad * 2)}
-      height={Math.ceil(height + pad * 2)}
-      viewBox={`${-pad} ${-pad} ${totalW + pad * 2} ${height + pad * 2}`}
-      className={className}
+    <span
+      className={`select-none ${isNumeric ? 'tabular-nums' : ''} ${className ?? ''}`.trim()}
       style={{
         display: 'inline-block',
-        verticalAlign: 'middle',
-        overflow: 'visible',
-        marginLeft: align === 'center' ? -totalW / 2 : align === 'right' ? -totalW : 0,
+        fontFamily: family,
+        fontSize: px,
+        fontWeight: variant === 'body' ? 500 : px >= 18 ? 700 : 600,
+        lineHeight: variant === 'body' ? 1.5 : 1.25,
+        color,
+        letterSpacing: letterSpacing !== undefined ? `${Math.min(1.5, letterSpacing * 0.4)}px` : px >= 22 ? '0.02em' : '0.01em',
+        textShadow: shadows.length > 0 ? shadows.join(', ') : undefined,
+        transform,
+        whiteSpace: variant === 'body' ? 'normal' : undefined,
         ...style,
       }}
-      aria-label={children}
     >
-      {shadow && (
-        <g
-          transform={`translate(${shadow.dx},${shadow.dy})`}
-          fill="none"
-          stroke={shadow.color}
-          strokeWidth={sw * 1.2}
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          dangerouslySetInnerHTML={{ __html: paths }}
-        />
-      )}
-      {outline && (
-        <g
-          fill="none"
-          stroke={outline}
-          strokeWidth={sw + ow}
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          dangerouslySetInnerHTML={{ __html: paths }}
-        />
-      )}
-      <g
-        fill="none"
-        stroke={color}
-        strokeWidth={sw}
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        dangerouslySetInnerHTML={{ __html: paths }}
-      />
-    </svg>
+      {formattedText}
+    </span>
   );
 }

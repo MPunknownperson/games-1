@@ -1,7 +1,7 @@
 // PRESERVE ENGINE — Game logic (world, combat, waves, entities).
 // Uses ISO 2.5D world coords. All rendering done by /render.ts and /blocks.ts.
 import { TOWERS, ENEMIES, THEMES, THEME_ORDER, type TowerKind, type EnemyKind, type ThemeKind } from './blocks';
-import { drawBlock, drawCylinder, drawGroundQuad, drawGroundShadow, drawSphere, drawPanel, shade, withAlpha, worldToScreen, screenToWorldGround, roundedRect, type Camera } from './render';
+import { drawBlock, drawCylinder, drawGroundQuad, drawGroundShadow, drawSphere, drawPanel, shade, withAlpha, worldToScreen, screenToWorldGround, roundedRect, drawSky, drawHaze, drawVignette, type Camera } from './render';
 import { drawText, measureText } from './typeface';
 import { audio } from './audio';
 
@@ -13,10 +13,13 @@ export interface Vec2 { x: number; y: number; }
 export interface Chest { id: string; rarity: ChestRarity; }
 export interface Card { id: string; kind: PuzzleKind; rarity: ChestRarity; }
 
+export type TargetingMode = 'first' | 'strongest' | 'last';
+
 export interface Tower {
   id: number; kind: TowerKind;
   x: number; z: number;
   level: number; cooldown: number; kills: number; angle: number;
+  targeting?: TargetingMode;
 }
 export interface Enemy {
   id: number; kind: EnemyKind;
@@ -25,6 +28,15 @@ export interface Enemy {
   progress: number; // distance along path
   slowTimer: number; slowAmount: number;
   dead: boolean;
+  // AI flavor fields (optional, JSON-serializable)
+  lane?: number;     // perpendicular offset from the path centerline
+  speedVar?: number; // per-enemy speed variance
+  wobble?: number;   // wobble phase
+  // Combat AI state
+  shield?: number;    // current absorbing shield (golems)
+  shieldMax?: number;
+  lastHurt?: number;  // time of last damage, gates shield regeneration
+  healCd?: number;    // cooldown for support enemies
 }
 export interface Projectile {
   id: number; from: Vec2; pos: Vec2;
@@ -33,6 +45,7 @@ export interface Projectile {
   splash?: number; slow?: number; chain?: number;
   life: number; y: number; // world y (for arc)
   arcT?: number;
+  crit?: boolean;
 }
 export interface Particle {
   x: number; y: number; z: number;
@@ -43,6 +56,7 @@ export interface Particle {
 export interface FloatText {
   x: number; z: number; y: number;
   text: string; life: number; color: string; vy: number;
+  size?: number;
 }
 
 // ---------- Path & world generation ----------
@@ -198,12 +212,24 @@ export class Game {
   elapsed = 0;
   paused = false;
   speedMult = 1;
+  god = false; // dev-tools: citadel takes no damage while true
   nextId = 1;
   selectedKind: TowerKind | null = null;
   selectedTowerId: number | null = null;
   hoverX = 0; hoverZ = 0;
   kills = 0; goldEarned = 0; chestsFound = 0; cardsFound = 0;
   mvpId: number | null = null;
+  // Adaptive director state: reacts to how well the player is defending
+  leaks = 0;
+  pressure = 1;
+  waveStart = 0;
+  /** In-flight damage per enemy id, used to avoid overkill targeting. */
+  private incoming = new Map<number, { dmg: number; t: number }>();
+  // Kill-streak combo: consecutive kills build bonus gold
+  streak = 0;
+  streakTimer = 0;
+  // Ambient realm particles (leaves, snow, embers, motes)
+  ambient: AmbientParticle[] = [];
   events: EngineEvents;
   rng!: () => number;
 
@@ -218,6 +244,9 @@ export class Game {
     this.waveIdx = 0; this.waveActive = false; this.spawnQueue = [];
     this.elapsed = 0; this.kills = 0; this.goldEarned = 0; this.chestsFound = 0; this.cardsFound = 0;
     this.mvpId = null;
+    this.leaks = 0; this.pressure = 1; this.waveStart = 0;
+    this.incoming.clear();
+    this.streak = 0; this.streakTimer = 0; this.ambient = [];
     this.inventory = { chests: [...inv.chests], cards: [...inv.cards], keys: inv.keys };
     this.rng = mulberry32(Date.now() & 0xffffffff);
     this.events.onGoldChange(this.gold);
@@ -229,11 +258,15 @@ export class Game {
   startNextWave() {
     if (this.waveActive || this.waveIdx >= this.stage.waves.length) return;
     const w = this.stage.waves[this.waveIdx];
-    const diffMult = 1 + (this.stage.round - 1) * 0.3 + (this.stage.minor - 1) * 0.06;
+    // Adaptive director: pressure rises after clean fast clears, eases after leaks
+    const diffMult = (1 + (this.stage.round - 1) * 0.3 + (this.stage.minor - 1) * 0.06) * this.pressure;
+    this.waveStart = this.elapsed;
     this.spawnQueue = [];
     for (const entry of w.entries) {
+      // Pressure makes waves both tougher and denser
+      const count = Math.max(1, Math.round(entry.count * (0.7 + this.pressure * 0.5)));
       let t = entry.delay;
-      for (let i = 0; i < entry.count; i++) {
+      for (let i = 0; i < count; i++) {
         this.spawnQueue.push({ kind: entry.kind, at: this.elapsed + t, hpMult: diffMult });
         t += entry.interval;
       }
@@ -289,6 +322,17 @@ export class Game {
     this.burst(t.x, 0.5, t.z, '#fbbf24', 16);
     return true;
   }
+
+  cycleTargeting(id: number): TargetingMode | null {
+    const t = this.towers.find((x) => x.id === id);
+    if (!t) return null;
+    const order: TargetingMode[] = ['first', 'strongest', 'last'];
+    const cur: TargetingMode = t.targeting ?? TOWERS[t.kind].targeting ?? 'first';
+    const next = order[(order.indexOf(cur) + 1) % order.length];
+    t.targeting = next;
+    audio.click();
+    return next;
+  }
   sell(id: number): number {
     const i = this.towers.findIndex((x) => x.id === id); if (i < 0) return 0;
     const t = this.towers[i];
@@ -330,44 +374,129 @@ export class Game {
           this.events.onStateChange('victory');
         } else {
           this.events.onStateChange('idle');
+          const clearTime = this.elapsed - this.waveStart;
+          if (this.leaks === 0 && clearTime < 14) this.pressure = Math.min(1.5, this.pressure + 0.07);
+          else if (this.leaks >= 3) this.pressure = Math.max(0.75, this.pressure - 0.1);
+          this.leaks = 0;
           const bonus = 25 + this.stage.round * 3;
           this.gold += bonus; this.goldEarned += bonus;
           this.events.onGoldChange(this.gold);
-          this.floats.push({ x: 0, z: 0, y: 3, text: `WAVE CLEAR +${bonus}`, life: 2, color: '#fbbf24', vy: -0.3 });
+          this.floats.push({ x: 0, z: 0, y: 3, text: `Wave Clear +${bonus}`, life: 2, color: '#fbbf24', vy: -0.3 });
         }
       }
     }
 
+    // Commander auras: bosses spur every enemy inside their radius onward
+    const auraBoost = new Map<number, number>();
+    for (const b of this.enemies) {
+      const aura = ENEMIES[b.kind].aura;
+      if (!aura || b.dead) continue;
+      for (const o of this.enemies) {
+        if (o.dead) continue;
+        if (Math.hypot(o.x - b.x, o.z - b.z) > aura.radius) continue;
+        auraBoost.set(o.id, Math.max(auraBoost.get(o.id) ?? 1, aura.speedMult));
+      }
+    }
+    // Expire stale in-flight damage estimates used by overkill avoidance
+    for (const [id, rec] of this.incoming) if (rec.t <= this.elapsed - 2) this.incoming.delete(id);
+
     // Enemies
     for (const e of this.enemies) {
       if (e.dead) continue;
-      let speed = ENEMIES[e.kind].speed;
+      let speed = ENEMIES[e.kind].speed * (e.speedVar ?? 1);
+      const boost = auraBoost.get(e.id);
+      if (boost !== undefined) speed *= boost;
+      // Runners move in dash bursts instead of a constant pace
+      if (e.kind === 'runner') {
+        const ph = (this.elapsed * 0.4 + (e.wobble ?? 0)) % 1;
+        if (ph < 0.35) speed *= 1.7;
+      }
       if (e.slowTimer > 0) { speed *= 1 - e.slowAmount; e.slowTimer -= dt; }
       e.progress += speed * dt;
       const p = alongPath(this.path, e.progress);
-      e.x = p.x; e.z = p.z;
+      // Lane offset + gentle wobble keep enemies off the exact centerline
+      const nx = -Math.sin(p.angle), nz = Math.cos(p.angle);
+      const lane = (e.lane ?? 0) + Math.sin(this.elapsed * 3 + (e.wobble ?? 0)) * 0.06;
+      e.x = p.x + nx * lane;
+      e.z = p.z + nz * lane;
+
+      // Regenerating shields recover once an enemy has avoided damage briefly
+      if (e.shieldMax !== undefined && e.shield !== undefined && e.shield < e.shieldMax) {
+        if (this.elapsed - (e.lastHurt ?? -99) > 3) {
+          e.shield = Math.min(e.shieldMax, e.shield + 14 * dt);
+        }
+      }
+
+      // Support AI: mend the most injured ally within reach
+      const healDef = ENEMIES[e.kind].heal;
+      if (healDef) {
+        e.healCd = (e.healCd ?? 0) - dt;
+        if (e.healCd <= 0) {
+          let patient: Enemy | null = null;
+          let worst = 0.2;
+          for (const o of this.enemies) {
+            if (o.dead || o.id === e.id) continue;
+            if (Math.hypot(o.x - e.x, o.z - e.z) > healDef.radius) continue;
+            const missing = 1 - o.hp / o.maxHp;
+            if (missing > worst) { worst = missing; patient = o; }
+          }
+          if (patient) {
+            patient.hp = Math.min(patient.maxHp, patient.hp + healDef.amount);
+            e.healCd = healDef.interval;
+            this.particles.push({ x: e.x, y: 0.7, z: e.z, vx: 0, vy: 0.5, vz: 0, life: 0.45, maxLife: 0.45, color: '#a7f3d0', size: 4 });
+            this.floats.push({ x: patient.x, z: patient.z, y: 0.95, text: `+${healDef.amount}`, life: 0.7, color: '#6ee7b7', vy: -0.45 });
+          } else {
+            e.healCd = 0.4;
+          }
+        }
+      }
+
       if (p.done) {
         e.dead = true;
-        const dmg = Math.ceil(5 + ENEMIES[e.kind].hp / 25);
-        this.hp = Math.max(0, this.hp - dmg);
-        this.events.onHpChange(this.hp, this.maxHp);
-        audio.targetHit();
-        this.events.onShake(10);
-        this.burst(p.x, 0.5, p.z, '#ef4444', 20);
-        this.floats.push({ x: p.x, z: p.z, y: 1, text: `-${dmg}`, life: 1, color: '#ef4444', vy: -0.5 });
-        if (this.hp <= 0) this.events.onStateChange('defeat');
+        this.leaks++;
+        if (!this.god) {
+          const dmg = Math.ceil(5 + ENEMIES[e.kind].hp / 25);
+          this.hp = Math.max(0, this.hp - dmg);
+          this.events.onHpChange(this.hp, this.maxHp);
+          audio.targetHit();
+          this.events.onShake(10);
+          this.burst(p.x, 0.5, p.z, '#ef4444', 20);
+          this.floats.push({ x: p.x, z: p.z, y: 1, text: `-${dmg}`, life: 1, color: '#ef4444', vy: -0.5 });
+          if (this.hp <= 0) this.events.onStateChange('defeat');
+        }
+      }
+    }
+    // Separation steering: overlapping enemies push each other apart
+    const alive = this.enemies.filter((e) => !e.dead);
+    for (let i = 0; i < alive.length; i++) {
+      for (let j = i + 1; j < alive.length; j++) {
+        const a = alive[i], b = alive[j];
+        const dx = b.x - a.x, dz = b.z - a.z;
+        const d = Math.hypot(dx, dz);
+        if (d > 0.001 && d < 0.45) {
+          const push = (0.45 - d) / 2;
+          const ux = dx / d, uz = dz / d;
+          a.x -= ux * push; a.z -= uz * push;
+          b.x += ux * push; b.z += uz * push;
+        }
       }
     }
 
-    // Towers
+    // Towers — each kind has a targeting priority (first / last / strongest)
     for (const t of this.towers) {
       t.cooldown -= dt;
       const st = this.towerStats(t);
-      let best: Enemy | null = null; let bp = -1;
+      const mode = t.targeting ?? TOWERS[t.kind].targeting ?? 'first';
+      let best: Enemy | null = null; let key = -Infinity;
       for (const e of this.enemies) {
         if (e.dead) continue;
         const d = Math.hypot(e.x - t.x, e.z - t.z);
-        if (d <= st.range && e.progress > bp) { best = e; bp = e.progress; }
+        if (d > st.range) continue;
+        // Overkill avoidance: skip targets already covered by in-flight shots
+        const eff = this.effectiveHp(e);
+        if (eff <= 0) continue;
+        const k = mode === 'last' ? -e.progress : mode === 'strongest' ? eff : e.progress;
+        if (k > key) { key = k; best = e; }
       }
       if (best) {
         const dz = best.z - t.z, dx = best.x - t.x;
@@ -388,7 +517,7 @@ export class Game {
       const dist = Math.hypot(dx, dz);
       const step = p.speed * dt;
       if (dist <= step + 0.2) {
-        this.hitEnemy(target, p.damage, p.kind);
+        this.hitEnemy(target, p.damage, p.kind, p.crit);
         if (p.splash) {
           for (const e of this.enemies) {
             if (e.dead || e.id === target.id) continue;
@@ -444,18 +573,39 @@ export class Game {
     for (const f of this.floats) { f.life -= dt; f.y += f.vy * dt * 3; f.vy *= 0.98; }
     this.floats = this.floats.filter((f) => f.life > 0);
 
+    // Kill-streak decay
+    if (this.streakTimer > 0) { this.streakTimer -= dt; if (this.streakTimer <= 0) this.streak = 0; }
+    // Ambient realm particles
+    this.updateAmbient(dt);
+
     // BGM tension
     const t = Math.min(1, this.enemies.length / 15) * 0.5 + (this.waveActive ? 0.3 : 0) + (this.hp / this.maxHp < 0.3 ? 0.3 : 0);
     audio.setTension(t);
   }
 
+  /** Remaining HP plus shield, minus damage already in flight. */
+  private effectiveHp(e: Enemy): number {
+    const rec = this.incoming.get(e.id);
+    const pending = rec && rec.t > this.elapsed - 2 ? rec.dmg : 0;
+    return Math.max(0, e.hp + (e.shield ?? 0) - pending);
+  }
+
   private fire(t: Tower, target: Enemy, st: ReturnType<Game['towerStats']>) {
+    // Crit chance: a lucky shot deals bonus damage with a distinct popup
+    const crit = this.rng() < (TOWERS[t.kind].critChance ?? 0.08);
+    const mult = crit ? 1.5 : 1;
+    const dmg = st.damage * mult;
+    // Record the shot so other towers do not pile onto a dying target
+    const rec = this.incoming.get(target.id) ?? { dmg: 0, t: 0 };
+    rec.dmg += dmg;
+    rec.t = this.elapsed;
+    this.incoming.set(target.id, rec);
     this.projectiles.push({
       id: this.nextId++, from: { x: t.x, y: t.z }, pos: { x: t.x, y: t.z },
       targetId: target.id, kind: t.kind,
-      damage: st.damage, speed: st.projectileSpeed,
+      damage: dmg, speed: st.projectileSpeed,
       splash: st.splash, slow: st.slow, chain: st.chain,
-      life: 3, y: 0.7,
+      life: 3, y: 0.7, crit,
     });
     switch (t.kind) {
       case 'archer': audio.laser(); break;
@@ -466,22 +616,76 @@ export class Game {
     }
   }
 
-  private spawn(kind: EnemyKind, hpMult: number) {
+  spawn(kind: EnemyKind, hpMult: number, progress = 0): Enemy {
     const d = ENEMIES[kind];
     const hp = Math.floor(d.hp * hpMult);
-    this.enemies.push({
+    const e: Enemy = {
       id: this.nextId++, kind,
       x: this.path.seg[0].start.x, z: this.path.seg[0].start.y,
-      hp, maxHp: hp, progress: 0, slowTimer: 0, slowAmount: 0, dead: false,
-    });
+      hp, maxHp: hp, progress, slowTimer: 0, slowAmount: 0, dead: false,
+      lane: (this.rng() - 0.5) * 0.5,
+      speedVar: 0.9 + this.rng() * 0.2,
+      wobble: this.rng() * Math.PI * 2,
+      shield: d.shield,
+      shieldMax: d.shield,
+      lastHurt: -99,
+      healCd: this.rng() * 1.5,
+    };
+    this.enemies.push(e);
+    return e;
   }
 
-  private hitEnemy(e: Enemy, dmg: number, _kind: TowerKind) {
+  private updateAmbient(dt: number) {
+    const cfg = AMBIENT[this.stage.theme] ?? AMBIENT.meadow;
+    while (this.ambient.length < cfg.count) this.ambient.push(this.newAmbient(cfg));
+    const spanX = WORLD.xMax - WORLD.xMin, spanZ = WORLD.zMax - WORLD.zMin;
+    for (const a of this.ambient) {
+      if (cfg.kind === 'fall') {
+        a.y -= a.vy * dt;
+        a.x += (a.vx + Math.sin(this.elapsed * 0.8 + a.phase) * 0.3) * dt;
+        if (a.y < 0) { a.y = 3; a.x = WORLD.xMin + this.rng() * spanX; a.z = WORLD.zMin + this.rng() * spanZ; }
+      } else if (cfg.kind === 'rise') {
+        a.y += a.vy * dt;
+        a.x += Math.sin(this.elapsed * 0.6 + a.phase) * 0.2 * dt;
+        if (a.y > 3) { a.y = 0; a.x = WORLD.xMin + this.rng() * spanX; a.z = WORLD.zMin + this.rng() * spanZ; }
+      } else {
+        a.x += a.vx * dt;
+        if (a.x > WORLD.xMax) a.x = WORLD.xMin;
+        else if (a.x < WORLD.xMin) a.x = WORLD.xMax;
+        a.y += Math.sin(this.elapsed + a.phase) * 0.15 * dt;
+      }
+    }
+  }
+
+  private newAmbient(cfg: { kind: 'fall' | 'drift' | 'rise'; colors: string[]; count: number }): AmbientParticle {
+    return {
+      x: WORLD.xMin + this.rng() * (WORLD.xMax - WORLD.xMin),
+      z: WORLD.zMin + this.rng() * (WORLD.zMax - WORLD.zMin),
+      y: this.rng() * 3,
+      vx: (this.rng() - 0.5) * 0.4,
+      vy: 0.3 + this.rng() * 0.5,
+      size: 1 + this.rng() * 2,
+      color: cfg.colors[Math.floor(this.rng() * cfg.colors.length)],
+      phase: this.rng() * Math.PI * 2,
+    };
+  }
+
+  hitEnemy(e: Enemy, dmgIn: number, _kind: TowerKind, crit = false) {
     if (e.dead) return;
+    let dmg = dmgIn;
+    // Shields soak damage first and reset the regeneration delay
+    if (e.shield !== undefined && e.shield > 0) {
+      e.lastHurt = this.elapsed;
+      const absorbed = Math.min(e.shield, dmg);
+      e.shield -= absorbed;
+      dmg -= absorbed;
+      this.burst(e.x, 0.55, e.z, '#93c5fd', 4);
+      if (dmg <= 0) { audio.enemyHit(); return; }
+    }
     e.hp -= dmg;
     audio.enemyHit();
     this.burst(e.x, 0.3, e.z, ENEMIES[e.kind].color, 3);
-    this.floats.push({ x: e.x, z: e.z, y: 0.7, text: `${Math.floor(dmg)}`, life: 0.7, color: '#fef3c7', vy: -0.5 });
+    this.floats.push({ x: e.x, z: e.z, y: 0.7, text: crit ? `${Math.floor(dmg)}!` : `${Math.floor(dmg)}`, life: 0.7, color: crit ? '#ffffff' : '#fef3c7', vy: -0.5, size: crit ? 26 : undefined });
     if (e.hp <= 0) {
       e.dead = true; this.kills++;
       const def = ENEMIES[e.kind];
@@ -490,6 +694,15 @@ export class Game {
       this.events.onLoot('gold', def.bounty);
       this.floats.push({ x: e.x, z: e.z, y: 0.5, text: `+${def.bounty}`, life: 1, color: '#fbbf24', vy: -0.6 });
       this.burst(e.x, 0.3, e.z, '#fbbf24', 8);
+      // Kill-streak: reward aggressive defense with bonus gold + milestone popups
+      this.streak++;
+      this.streakTimer = 2.5;
+      const cap = Math.min(this.streak, 20);
+      const extra = Math.floor(def.bounty * 0.05 * cap);
+      if (extra > 0) { this.gold += extra; this.goldEarned += extra; this.events.onGoldChange(this.gold); }
+      if (this.streak === 3 || this.streak === 5 || this.streak === 8 || this.streak === 12 || this.streak === 20) {
+        this.floats.push({ x: e.x, z: e.z, y: 1.25, text: `Combo x${this.streak}`, life: 1.1, color: '#fff2c2', vy: -0.55, size: 30 });
+      }
       audio.gold();
       if (this.rng() < def.chestChance) {
         const rarities: ChestRarity[] = ['common', 'common', 'rare', 'epic', 'legendary'];
@@ -523,22 +736,39 @@ export class Game {
 // ---------- Rendering ----------
 export function renderWorld(ctx: CanvasRenderingContext2D, game: Game, cam: Camera, time: number) {
   const theme = THEMES[game.stage.theme];
-  // Sky
-  const g = ctx.createLinearGradient(0, 0, 0, cam.screenH);
-  g.addColorStop(0, theme.sky[0]);
-  g.addColorStop(1, theme.sky[1]);
-  ctx.fillStyle = g;
-  ctx.fillRect(0, 0, cam.screenW, cam.screenH);
-
-  // Distant hills (parallax silhouette)
+  // Sky: realm gradient plus celestial body, star field and horizon haze
+  drawSky(ctx, cam, theme, time);
   drawSkyline(ctx, cam, theme);
+  if (theme.haze) drawHaze(ctx, cam, theme.haze);
 
-  // Ground grid
+  // 3D raised island plinth beneath the terrain so the board reads as a solid 2.5D diorama
+  drawIslandPlinth(ctx, cam, theme.groundTile, theme.pathBorder);
+
+  // Ground grid — per-tile brightness variation, subtle seams & placement feedback
   const step = 1;
+  const seam = withAlpha('#0d1220', 0.14);
   for (let z = WORLD.zMin; z <= WORLD.zMax; z += step) {
     for (let x = WORLD.xMin; x <= WORLD.xMax; x += step) {
-      const c = ((Math.floor(x) + Math.floor(z)) % 2 === 0) ? theme.ground : theme.groundTile;
-      drawGroundQuad(ctx, cam, x, z, step, step, c);
+      const checker = ((Math.floor(x) + Math.floor(z)) % 2 === 0);
+      const base = checker ? theme.ground : theme.groundTile;
+      const c = shade(base, (tileHash(x, z) - 0.5) * 0.18);
+      drawGroundQuad(ctx, cam, x, z, step, step, c, seam);
+      if (tileHash(x + 0.5, z + 0.5) > 0.8) drawGroundDetail(ctx, cam, x, z, base);
+    }
+  }
+
+  // Subtle buildable-tile highlight near cursor while placing a tower
+  if (game.selectedKind) {
+    for (let z = WORLD.zMin; z <= WORLD.zMax; z += step) {
+      for (let x = WORLD.xMin; x <= WORLD.xMax; x += step) {
+        const cx = x + 0.5, cz = z + 0.5;
+        if (Math.hypot(cx - game.hoverX, cz - game.hoverZ) <= 2.4) {
+          const ok = game.canPlaceAt(cx, cz);
+          drawGroundQuad(ctx, cam, x + 0.06, z + 0.06, 0.88, 0.88,
+            ok ? 'rgba(74,222,128,0.18)' : 'rgba(239,68,68,0.14)',
+            ok ? 'rgba(74,222,128,0.45)' : 'rgba(239,68,68,0.3)');
+        }
+      }
     }
   }
 
@@ -585,11 +815,18 @@ export function renderWorld(ctx: CanvasRenderingContext2D, game: Game, cam: Came
       depth: e.x + e.z,
       draw: () => {
         const def = ENEMIES[e.kind];
+        if (def.aura) drawAuraRing(ctx, cam, e.x, e.z, def.aura.radius, time, def.accent);
         def.render(ctx, cam, e.x, e.z, time, def.color, def.accent);
-        // HP bar
+        if (e.shield !== undefined && e.shield > 0) {
+          drawShieldArc(ctx, cam, e.x, e.z, def.size, e.shield / (e.shieldMax ?? 1));
+        }
+        // Health bar sized to the enemy, with a shield segment layered above
         const p = worldToScreen(cam, e.x, def.size * 2.2 + 0.4, e.z);
-        const w = def.size * 60 * cam.zoom * 0.02;
-        drawHpBar(ctx, p.x, p.y, Math.max(20, w * 20), 4, e.hp / e.maxHp);
+        const barW = Math.max(26, def.size * 64);
+        drawHpBar(ctx, p.x, p.y, barW, 5, e.hp / e.maxHp);
+        if (e.shield !== undefined && e.shield > 0) {
+          drawHpBar(ctx, p.x, p.y - 8, barW, 3, e.shield / (e.shieldMax ?? 1), '#7dd3fc');
+        }
       },
     });
   }
@@ -632,14 +869,27 @@ export function renderWorld(ctx: CanvasRenderingContext2D, game: Game, cam: Came
   }
   ctx.globalAlpha = 1;
 
+  // Ambient realm particles
+  for (const a of game.ambient) {
+    const p = worldToScreen(cam, a.x, a.y, a.z);
+    const r = (a.size * 0.5) * cam.zoom * 0.02 + 1;
+    ctx.globalAlpha = 0.55;
+    ctx.fillStyle = a.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
   // Float text
   for (const f of game.floats) {
     const p = worldToScreen(cam, f.x, f.y, f.z);
     ctx.globalAlpha = Math.max(0, Math.min(1, f.life));
-    const size = 22;
+    const size = f.size ?? 22;
     drawText(ctx, f.text, { x: p.x, y: p.y, size, color: f.color, align: 'center', outline: '#0d1220', outlineWidth: 4, strokeWidth: 3 });
   }
   ctx.globalAlpha = 1;
+
+  // Realm vignette frames the field and ties the HUD to the scene
+  if (theme.vignette) drawVignette(ctx, cam, theme.vignette);
 }
 
 function drawSkyline(ctx: CanvasRenderingContext2D, cam: Camera, theme: any) {
@@ -667,37 +917,93 @@ function drawSkyline(ctx: CanvasRenderingContext2D, cam: Camera, theme: any) {
   ctx.closePath(); ctx.fill();
 }
 
+function drawIslandPlinth(ctx: CanvasRenderingContext2D, cam: Camera, topColor: string, rimColor: string) {
+  const x0 = WORLD.xMin, x1 = WORLD.xMax + 1;
+  const z0 = WORLD.zMin, z1 = WORLD.zMax + 1;
+  const depth = 0.62;
+
+  const t01 = worldToScreen(cam, x0, 0, z1);
+  const t11 = worldToScreen(cam, x1, 0, z1);
+  const t10 = worldToScreen(cam, x1, 0, z0);
+
+  const b01 = worldToScreen(cam, x0, -depth, z1);
+  const b11 = worldToScreen(cam, x1, -depth, z1);
+  const b10 = worldToScreen(cam, x1, -depth, z0);
+
+  // Front-left cliff wall (along z = z1)
+  ctx.fillStyle = shade(rimColor, -0.25);
+  ctx.beginPath();
+  ctx.moveTo(t01.x, t01.y); ctx.lineTo(t11.x, t11.y);
+  ctx.lineTo(b11.x, b11.y); ctx.lineTo(b01.x, b01.y);
+  ctx.closePath();
+  ctx.fill();
+  ctx.strokeStyle = '#0d1220'; ctx.lineWidth = 2; ctx.stroke();
+
+  // Front-right cliff wall (along x = x1)
+  ctx.fillStyle = shade(rimColor, -0.42);
+  ctx.beginPath();
+  ctx.moveTo(t11.x, t11.y); ctx.lineTo(t10.x, t10.y);
+  ctx.lineTo(b10.x, b10.y); ctx.lineTo(b11.x, b11.y);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+
+  // Subtle top lip highlight
+  ctx.strokeStyle = shade(topColor, 0.2);
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(t01.x, t01.y); ctx.lineTo(t11.x, t11.y); ctx.lineTo(t10.x, t10.y);
+  ctx.stroke();
+}
+
 function drawPathRibbon(ctx: CanvasRenderingContext2D, cam: Camera, path: Vec2[], color: string, border: string) {
-  const width = 0.7;
-  // Draw as connected quads
+  const width = 0.68;
+  const curbWidth = 0.8;
+
+  const drawLayer = (w: number, fill: string) => {
+    ctx.fillStyle = fill;
+    for (let i = 0; i < path.length - 1; i++) {
+      const a = path[i], b = path[i + 1];
+      const dx = b.x - a.x, dz = b.y - a.y;
+      const len = Math.hypot(dx, dz);
+      if (len === 0) continue;
+      const nx = -dz / len, nz = dx / len;
+      const q0 = worldToScreen(cam, a.x + nx * w, 0.02, a.y + nz * w);
+      const q1 = worldToScreen(cam, a.x - nx * w, 0.02, a.y - nz * w);
+      const q2 = worldToScreen(cam, b.x - nx * w, 0.02, b.y - nz * w);
+      const q3 = worldToScreen(cam, b.x + nx * w, 0.02, b.y + nz * w);
+      ctx.beginPath();
+      ctx.moveTo(q0.x, q0.y); ctx.lineTo(q3.x, q3.y); ctx.lineTo(q2.x, q2.y); ctx.lineTo(q1.x, q1.y);
+      ctx.closePath();
+      ctx.fill();
+    }
+    // Rounded joints at waypoints so corners never gap
+    for (const pt of path) {
+      const p = worldToScreen(cam, pt.x, 0.02, pt.y);
+      ctx.beginPath();
+      ctx.ellipse(p.x, p.y, w * cam.zoom * 0.96, w * cam.zoom * 0.52, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  };
+
+  drawLayer(curbWidth, border);
+  drawLayer(width, color);
+
+  // Paving stones & centerline
   for (let i = 0; i < path.length - 1; i++) {
     const a = path[i], b = path[i + 1];
-    const dx = b.x - a.x, dz = b.y - a.y;
-    const len = Math.hypot(dx, dz);
-    if (len === 0) continue;
-    // Perpendicular in world XZ plane
-    const nx = -dz / len, nz = dx / len;
-    const q0 = worldToScreen(cam, a.x + nx * width, 0.02, a.y + nz * width);
-    const q1 = worldToScreen(cam, a.x - nx * width, 0.02, a.y - nz * width);
-    const q2 = worldToScreen(cam, b.x - nx * width, 0.02, b.y - nz * width);
-    const q3 = worldToScreen(cam, b.x + nx * width, 0.02, b.y + nz * width);
-    // Border
-    ctx.fillStyle = border;
-    ctx.beginPath();
-    const pad = 4;
-    ctx.moveTo(q0.x - pad, q0.y - pad); ctx.lineTo(q3.x + pad, q3.y - pad);
-    ctx.lineTo(q2.x + pad, q2.y + pad); ctx.lineTo(q1.x - pad, q1.y + pad); ctx.closePath();
-    ctx.fill();
-    // Main
-    ctx.fillStyle = color;
-    ctx.beginPath();
-    ctx.moveTo(q0.x, q0.y); ctx.lineTo(q3.x, q3.y); ctx.lineTo(q2.x, q2.y); ctx.lineTo(q1.x, q1.y); ctx.closePath();
-    ctx.fill();
-    // Dashed centerline
+    ctx.fillStyle = shade(color, -0.18);
+    for (let k = 0; k < 4; k++) {
+      const tt = (k + 0.5) / 4;
+      const mx = a.x + (b.x - a.x) * tt + (tileHash(k, i) - 0.5) * width * 1.1;
+      const mz = a.y + (b.y - a.y) * tt + (tileHash(i, k) - 0.5) * width * 1.1;
+      const mp = worldToScreen(cam, mx, 0.03, mz);
+      ctx.beginPath(); ctx.ellipse(mp.x, mp.y, Math.max(1.5, cam.zoom * 0.05), Math.max(1, cam.zoom * 0.03), 0, 0, Math.PI * 2); ctx.fill();
+    }
     const mid0 = worldToScreen(cam, a.x, 0.03, a.y);
     const mid1 = worldToScreen(cam, b.x, 0.03, b.y);
-    ctx.strokeStyle = shade(color, 0.2);
-    ctx.setLineDash([8, 10]);
+    ctx.strokeStyle = shade(color, 0.22);
+    ctx.setLineDash([7, 11]);
     ctx.lineWidth = 2;
     ctx.beginPath(); ctx.moveTo(mid0.x, mid0.y); ctx.lineTo(mid1.x, mid1.y); ctx.stroke();
     ctx.setLineDash([]);
@@ -785,13 +1091,52 @@ function drawProjectile(ctx: CanvasRenderingContext2D, cam: Camera, p: Projectil
   ctx.beginPath(); ctx.arc(pos.x, pos.y, r, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
 }
 
-function drawHpBar(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, pct: number) {
-  ctx.fillStyle = '#0d1220';
+function drawHpBar(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, pct: number, color?: string) {
+  ctx.fillStyle = 'rgba(6,11,22,0.82)';
   roundedRect(ctx, x - w / 2 - 2, y - h / 2 - 2, w + 4, h + 4, 3); ctx.fill();
-  ctx.fillStyle = '#334155';
+  ctx.fillStyle = 'rgba(148,163,184,0.35)';
   roundedRect(ctx, x - w / 2, y - h / 2, w, h, 2); ctx.fill();
-  ctx.fillStyle = pct > 0.5 ? '#4ade80' : pct > 0.25 ? '#fbbf24' : '#ef4444';
+  ctx.fillStyle = color ?? (pct > 0.5 ? '#4ade80' : pct > 0.25 ? '#fbbf24' : '#ef4444');
   roundedRect(ctx, x - w / 2, y - h / 2, w * pct, h, 2); ctx.fill();
+}
+
+// Pulsing ground ring that telegraphs a commander's speed aura
+function drawAuraRing(ctx: CanvasRenderingContext2D, cam: Camera, x: number, z: number, radius: number, time: number, accent: string) {
+  const pulse = 0.5 + 0.5 * Math.sin(time * 2.2);
+  ctx.save();
+  ctx.globalAlpha = 0.14 + pulse * 0.12;
+  ctx.strokeStyle = accent;
+  ctx.lineWidth = 2;
+  const segs = 40;
+  ctx.beginPath();
+  for (let i = 0; i <= segs; i++) {
+    const a = (i / segs) * Math.PI * 2;
+    const p = worldToScreen(cam, x + Math.cos(a) * radius, 0.04, z + Math.sin(a) * radius);
+    if (i === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+  }
+  ctx.closePath();
+  ctx.stroke();
+  ctx.restore();
+}
+
+// Arc of light showing remaining shield charge above an enemy
+function drawShieldArc(ctx: CanvasRenderingContext2D, cam: Camera, x: number, z: number, size: number, pct: number) {
+  const p = worldToScreen(cam, x, size * 1.5 + 0.5, z);
+  const r = Math.max(10, size * cam.zoom * 0.55);
+  ctx.save();
+  ctx.strokeStyle = 'rgba(125,211,252,0.8)';
+  ctx.lineWidth = 2.5;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, r, -Math.PI * 0.85, -Math.PI * 0.15);
+  ctx.stroke();
+  ctx.globalAlpha = 0.55;
+  ctx.strokeStyle = '#e0f2fe';
+  ctx.lineWidth = 1.2;
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, r + 3, -Math.PI * 0.85, -Math.PI * 0.85 + Math.PI * 0.7 * pct);
+  ctx.stroke();
+  ctx.restore();
 }
 
 // Convert screen (mouse) to world XZ using camera
@@ -825,4 +1170,65 @@ export function drawTitledPanel(ctx: CanvasRenderingContext2D, x: number, y: num
   }
 }
 
+/** Creates a scenic 2.5D showcase world for the Title Screen backdrop. */
+export function createDioramaGame(): Game {
+  const g = new Game({
+    onGoldChange: () => {}, onHpChange: () => {}, onWaveChange: () => {},
+    onLoot: () => {}, onStateChange: () => {}, onShake: () => {},
+  });
+  const stage = generateStage(1, 2, 4042);
+  g.load(stage, { chests: [], cards: [], keys: 0 }, 500);
+  const kinds: TowerKind[] = ['archer', 'prism', 'mortar', 'chill'];
+  let ki = 0;
+  for (let prog = 2.2; prog < g.path.total - 1.8 && ki < kinds.length; prog += 2.6) {
+    const pt = alongPath(g.path, prog);
+    for (const [dx, dz] of [[1.1, 1.1], [-1.1, -1.1], [1.2, -1.1], [-1.2, 1.1]]) {
+      if (g.canPlaceAt(pt.x + dx, pt.z + dz)) {
+        g.gold = 9999;
+        g.place(kinds[ki++], pt.x + dx, pt.z + dz);
+        break;
+      }
+    }
+  }
+  for (let i = 0; i < 90; i++) g.update(1 / 30);
+  return g;
+}
+
 export { WORLD, measureText };
+
+
+// ---------- Texture & ambient helpers ----------
+
+interface AmbientParticle {
+  x: number; z: number; y: number;
+  vx: number; vy: number; size: number;
+  color: string; phase: number;
+}
+
+const AMBIENT: Record<string, { kind: 'fall' | 'drift' | 'rise'; colors: string[]; count: number }> = {
+  meadow: { kind: 'fall', colors: ['#83c24a', '#c9d64a', '#e0b34a'], count: 46 },
+  desert: { kind: 'drift', colors: ['#ecd6a0', '#ddb272', '#f4e2b8'], count: 40 },
+  tundra: { kind: 'fall', colors: ['#ffffff', '#eaf4ff'], count: 66 },
+  ember:  { kind: 'rise', colors: ['#ffb347', '#ff7b3a', '#ffd27f'], count: 44 },
+  astral: { kind: 'drift', colors: ['#c3b4ff', '#8fd0ff', '#ffffff'], count: 74 },
+  abyss:  { kind: 'rise', colors: ['#5cc8f5', '#3a8fb0', '#8fe0ff'], count: 40 },
+};
+
+/** Deterministic 0..1 value from two numbers (stable between frames). */
+function tileHash(x: number, z: number): number {
+  const v = Math.sin(x * 127.1 + z * 311.7) * 43758.5453;
+  return v - Math.floor(v);
+}
+
+/** A few tiny surface details so tiles read as textured ground. */
+function drawGroundDetail(ctx: CanvasRenderingContext2D, cam: Camera, x: number, z: number, base: string) {
+  const c = shade(base, -0.28);
+  ctx.fillStyle = c;
+  for (let i = 0; i < 3; i++) {
+    const rx = x + 0.12 + tileHash(x * 3 + i, z) * 0.7;
+    const rz = z + 0.12 + tileHash(x, z * 3 + i) * 0.7;
+    const p = worldToScreen(cam, rx, 0.01, rz);
+    ctx.beginPath(); ctx.arc(p.x, p.y, Math.max(1, cam.zoom * 0.02), 0, Math.PI * 2); ctx.fill();
+  }
+}
+

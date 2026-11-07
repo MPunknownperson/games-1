@@ -278,7 +278,8 @@ export function drawBlob(
   ctx.fill();
 }
 
-// Draw a shadow ellipse on the ground beneath (cx,cz) with given radius
+// Draw a soft contact shadow beneath (cx,cz). A radial falloff anchors objects
+// to the ground far more convincingly than the previous flat ellipse.
 export function drawGroundShadow(
   ctx: CanvasRenderingContext2D,
   cam: Camera,
@@ -286,10 +287,103 @@ export function drawGroundShadow(
   alpha = 0.35,
 ) {
   const p = worldToScreen(cam, cx, 0, cz);
-  ctx.fillStyle = `rgba(0,0,0,${alpha})`;
+  const rx = Math.max(1, radius * cam.zoom);
+  ctx.save();
+  ctx.translate(p.x, p.y);
+  ctx.scale(1, Math.max(0.05, ISO.ay));
+  const g = ctx.createRadialGradient(0, 0, 0, 0, 0, rx);
+  g.addColorStop(0, `rgba(0,0,0,${alpha})`);
+  g.addColorStop(0.55, `rgba(0,0,0,${alpha * 0.45})`);
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = g;
   ctx.beginPath();
-  ctx.ellipse(p.x, p.y, radius * cam.zoom, radius * cam.zoom * ISO.ay, 0, 0, Math.PI * 2);
+  ctx.arc(0, 0, rx, 0, Math.PI * 2);
   ctx.fill();
+  ctx.restore();
+}
+
+// ---------- Atmosphere ----------
+
+/** Declarative sky description consumed by {@link drawSky}. */
+export interface SkySpec {
+  sky: [string, string];
+  sun?: { x: number; y: number; r: number; color: string; glow: string } | null;
+  stars?: number;
+  haze?: string;
+}
+
+/** Deterministic hash-based 0..1 value, so skies never flicker between frames. */
+function hash01(i: number): number {
+  const x = Math.sin(i * 127.1 + 311.7) * 43758.5453;
+  return x - Math.floor(x);
+}
+
+/** Paint the sky: vertical gradient, optional star field and celestial body. */
+export function drawSky(ctx: CanvasRenderingContext2D, cam: Camera, spec: SkySpec, time: number) {
+  const g = ctx.createLinearGradient(0, 0, 0, cam.screenH * 0.85);
+  g.addColorStop(0, spec.sky[0]);
+  g.addColorStop(1, spec.sky[1]);
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, cam.screenW, cam.screenH);
+
+  if (spec.stars && spec.stars > 0) {
+    for (let i = 0; i < spec.stars; i++) {
+      const x = hash01(i) * cam.screenW;
+      const y = hash01(i + 7919) * cam.screenH * 0.6;
+      const twinkle = 0.35 + 0.65 * Math.abs(Math.sin(time * (0.5 + hash01(i + 31) * 1.5) + i));
+      ctx.globalAlpha = twinkle * 0.9;
+      ctx.fillStyle = '#e8eef8';
+      const r = 0.7 + hash01(i + 17) * 1.3;
+      ctx.fillRect(x, y, r, r);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  if (spec.sun) {
+    const sx = cam.screenW * spec.sun.x;
+    const sy = cam.screenH * spec.sun.y;
+    const r = spec.sun.r;
+    // Soft, restrained halo so the sky reads clean instead of smudged
+    ctx.save();
+    ctx.globalAlpha = 0.55;
+    const halo = ctx.createRadialGradient(sx, sy, r * 0.4, sx, sy, r * 3.4);
+    halo.addColorStop(0, spec.sun.glow);
+    halo.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = halo;
+    ctx.fillRect(sx - r * 3.4, sy - r * 3.4, r * 6.8, r * 6.8);
+    ctx.restore();
+    const core = ctx.createRadialGradient(sx, sy, 0, sx, sy, r * 0.78);
+    core.addColorStop(0, '#ffffff');
+    core.addColorStop(0.55, spec.sun.color);
+    core.addColorStop(1, withAlpha(spec.sun.color, 0));
+    ctx.fillStyle = core;
+    ctx.beginPath();
+    ctx.arc(sx, sy, r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+/** Horizon haze that separates the distant skyline from the play field. */
+export function drawHaze(ctx: CanvasRenderingContext2D, cam: Camera, color: string) {
+  const g = ctx.createLinearGradient(0, cam.screenH * 0.32, 0, cam.screenH * 0.7);
+  g.addColorStop(0, 'rgba(0,0,0,0)');
+  g.addColorStop(0.55, color);
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, cam.screenW, cam.screenH);
+}
+
+/** Screen-space vignette that frames the field and deepens the realm mood. */
+export function drawVignette(ctx: CanvasRenderingContext2D, cam: Camera, v: [string, string]) {
+  const g = ctx.createRadialGradient(
+    cam.screenW / 2, cam.screenH * 0.46, Math.min(cam.screenW, cam.screenH) * 0.32,
+    cam.screenW / 2, cam.screenH * 0.5, Math.max(cam.screenW, cam.screenH) * 0.8,
+  );
+  g.addColorStop(0, 'rgba(0,0,0,0)');
+  g.addColorStop(0.6, withAlpha(v[0], 0.16));
+  g.addColorStop(1, withAlpha(v[1], 0.52));
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, cam.screenW, cam.screenH);
 }
 
 // Draw a beveled panel with rounded corners (for UI in 2.5D style)
