@@ -1,0 +1,2152 @@
+// The authoritative, renderer-independent world. Every prop, person and loose object is an actor
+// with a position and a body, and everything persists exactly where it was left.
+import { repairWorld, verifyWorld, type VerificationIssue } from '../engine/verifier';
+import { ITEMS, type ItemType } from './items';
+import { QUESTS, barkFor, buildOptions, confrontOptions, greetingFor, type StoryOption } from './story';
+import { SPELLS, chooseGoal, makeAttrs, makePersona, makeRoutine, makeSkills, type Attrs, type Goal, type Persona, type Routine, type SkillKind, type Skills, type SpellId, impression } from './vivid';
+
+export type Faction = 'citadel' | 'wild' | 'neutral';
+export type ActorKind =
+  | 'player' | 'villager' | 'foe' | 'tree' | 'ore' | 'item' | 'rune' | 'echo' | 'citadel' | 'house' | 'camp'
+  | 'tower' | 'barricade' | 'well' | 'table' | 'stall' | 'pillar' | 'roof' | 'ruin' | 'post' | 'note' | 'bell';
+export type StructureKind = 'archer' | 'ward' | 'barricade' | 'outpost';
+export type FoeKind = 'slime' | 'brute' | 'wisp' | 'stalker';
+export type WeaponKind = 'fists' | 'club' | 'sword' | 'blade' | 'staff';
+export const WEAPONS: Record<WeaponKind, { name: string; damage: number; reach: number }> = {
+  fists: { name: 'Bare hands', damage: 0, reach: 0 }, club: { name: 'Cudgel', damage: 6, reach: 0.1 },
+  sword: { name: 'Sword', damage: 10, reach: 0.15 }, blade: { name: 'Iron blade', damage: 18, reach: 0.2 }, staff: { name: 'Warden staff', damage: 12, reach: 0.45 },
+};
+export type ActionKind =
+  | 'attack1' | 'attack2' | 'attack3' | 'roll' | 'gather' | 'throw' | 'hurt' | 'pickup' | 'land' | 'windup' | 'strike' | 'cheer';
+
+export interface Point { x: number; z: number }
+export interface Stock { gold: number; wood: number; stone: number; essence: number }
+export interface Memory { opinion: number; conversations: number; witnessedCrime: number; alarmUntil: number; lastGreet: number; rumors: string[] }
+export interface Needs { energy: number; hunger: number; social: number; fun: number }
+
+export interface Actor extends Point {
+  id: string; kind: ActorKind; name: string;
+  y: number; vx: number; vy: number; vz: number;
+  radius: number; height: number; solid: boolean; alive: boolean;
+  hp: number; maxHp: number; faction: Faction; facing: number; variant: number;
+  desc?: string; text?: string;
+  itemType?: ItemType; owner?: string; carriedBy?: string; sleeping?: boolean; thrownBy?: string; thrownAt?: number; restTimer?: number;
+  surface?: number;
+  profession?: string; home?: Point; work?: Point; social?: Point;
+  memory?: Memory; needs?: Needs; activity?: string; goal?: Point; talkingTo?: string; socialUntil?: number; lookAt?: string;
+  decideIn?: number; stuck?: number; detour?: number; detourT?: number; patrol?: Point[]; patrolIndex?: number;
+  foeKind?: FoeKind; intent?: 'forage' | 'return' | 'raid' | 'chase' | 'search' | 'flee'; targetId?: string; lastKnown?: Point; lostFor?: number;
+  carriedWood?: number; carriedStone?: number; attackCooldown?: number; workCooldown?: number; weaponLevel?: number;
+  action?: ActionKind; actionT?: number; actionDur?: number; actionHit?: boolean; gatherTarget?: string; combo?: number;
+  // Vivid AI: temperament, capabilities, routine and the goal currently being pursued.
+  persona?: Persona; attrs?: Attrs; skills?: Skills; routine?: Routine; utility?: Goal;
+  spells?: SpellId[]; focus?: number; maxFocus?: number; armor?: number;
+  crowns?: number; homeFood?: number; wanted?: number; wantedUntil?: number;
+  /** Shared inventory & equipment: the guardian's pack is the player actor's `items`. */
+  items?: Partial<Record<ItemType, number>>; stolen?: Partial<Record<ItemType, number>>;
+  weapon?: WeaponKind;
+  seatTakenBy?: string; sittingOn?: string; sneaking?: boolean; quarryId?: string;
+  locked?: number; loot?: ItemType[]; acc?: number; far?: boolean;
+  structure?: StructureKind; currentRune?: number; targetRune?: number; stockWood?: number; stockStone?: number;
+  shotAt?: number; shotX?: number; shotZ?: number; struckAt?: number;
+}
+
+export const BUILDINGS: Record<StructureKind, { name: string; description: string; wood: number; stone: number; gold: number; radius: number }> = {
+  archer: { name: 'Archer tower', description: 'Looses arrows at foes on the road.', wood: 6, stone: 4, gold: 20, radius: 1.35 },
+  ward: { name: 'Ward stone', description: 'Slowly mends the Citadel and nearby towers.', wood: 8, stone: 5, gold: 35, radius: 1.3 },
+  barricade: { name: 'Barricade', description: 'Stakes that turn a charge.', wood: 4, stone: 2, gold: 10, radius: 1.15 },
+  outpost: { name: 'Field camp', description: 'A tent to rest in and wake at.', wood: 10, stone: 8, gold: 45, radius: 2.2 },
+};
+
+export const RUNE_NAMES = ['dawn', 'leaf', 'star'];
+export const WORLD_LIMIT = 90;
+export const PLAYER_ID = 'guardian';
+const CITADEL_ID = 'citadel';
+const SAVE_VERSION = 2;
+
+export interface QuestState { stage: string; status: 'active' | 'done'; log: string[] }
+export interface WorldSave {
+  version: number; seed: number; actors: Actor[]; stock: Stock; pack: Partial<Record<ItemType, number>>;
+  elapsed: number; level: number; xp: number; weaponLevel: number; flags: Record<string, string | number | boolean>;
+  quests: Record<string, QuestState>; tracked: string; wave: number; waveCleared: number; bounty: number; standing: number;
+  nextId: number; echoProgress: number; echoSolved: boolean; respawn: Point;
+}
+export interface Prompt { name: string; primary?: string; secondary?: string; crime: boolean }
+export interface DialogueView { npcId: string; speaker: string; line: string; options: { id: string; text: string }[]; shop: boolean }
+export interface HudView {
+  hp: number; maxHp: number; stamina: number; maxStamina: number; combat: boolean;
+  prompt: Prompt | null; subtitle: { speaker?: string; text: string } | null; notice: string;
+  target: { name: string; hp: number; maxHp: number } | null; marker: Point | null; citadel: Point; player: Point;
+  wave: number; waveActive: boolean; waveEnemies: number; bounty: number; defeated: boolean;
+  focus: number; maxFocus: number; spellsKnown: number; sneaking: boolean;
+  dialogue: DialogueView | null; time: string; day: number; holding: string | null; placing: StructureKind | null;
+}
+export interface ShopEntry { id: string; name: string; price: number; detail: string }
+export interface SellEntry { id: ItemType | 'timber'; name: string; price: number; count: number }
+
+const FOES: Record<FoeKind, { name: string; hp: number; speed: number; damage: number; bounty: number; radius: number; reach: number; windup: number; courage: number }> = {
+  slime: { name: 'Slime', hp: 55, speed: 2.6, damage: 8, bounty: 6, radius: 0.6, reach: 1.0, windup: 0.5, courage: 1 },
+  brute: { name: 'Brute', hp: 120, speed: 2.3, damage: 16, bounty: 14, radius: 0.7, reach: 1.5, windup: 0.75, courage: 1 },
+  wisp: { name: 'Wisp', hp: 45, speed: 3.0, damage: 6, bounty: 10, radius: 0.5, reach: 1.2, windup: 0.45, courage: 0.3 },
+  stalker: { name: 'Stalker', hp: 70, speed: 3.7, damage: 11, bounty: 12, radius: 0.5, reach: 1.3, windup: 0.4, courage: 0.4 },
+};
+
+const STATIC_DESC: Partial<Record<ActorKind, string>> = {
+  house: 'A timber-framed home. Smoke curls from the chimney.',
+  citadel: 'The Citadel. Its light has burned for three hundred years, and the wilds have hated it for as long.',
+  table: 'A scarred table.',
+  stall: "Tobin's market stall. Everything has a price painted on a scrap of slate.",
+  post: 'The watch post. A crate for supplies sits by the ladder.',
+  ruin: 'What is left of the old mill. The millstone is cracked clean through.',
+  pillar: 'A post holding up the storehouse roof.',
+  tower: 'A tower of fitted stone.',
+  barricade: 'Sharpened stakes, bound tight.',
+};
+
+function random(seed: number) {
+  let n = seed >>> 0;
+  return () => {
+    n = (n + 0x6d2b79f5) | 0;
+    let t = Math.imul(n ^ (n >>> 15), 1 | n);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const distance = (a: Point, b: Point) => Math.hypot(a.x - b.x, a.z - b.z);
+const clamp = (n: number, a: number, b: number) => Math.max(a, Math.min(b, n));
+const angleTo = (a: Point, b: Point) => Math.atan2(b.x - a.x, b.z - a.z);
+function angleDelta(from: number, to: number) {
+  let d = (to - from) % (Math.PI * 2);
+  if (d > Math.PI) d -= Math.PI * 2;
+  if (d < -Math.PI) d += Math.PI * 2;
+  return d;
+}
+
+/** Uniform spatial hash. Rebuilt for loose items each tick, and for static solids only when they change. */
+class Grid {
+  private cells = new Map<number, Actor[]>();
+  constructor(private size = 4) {}
+  clear() { this.cells.clear(); }
+  insert(a: Actor) {
+    const k = (Math.floor(a.x / this.size) + 512) * 4096 + Math.floor(a.z / this.size) + 512;
+    const cell = this.cells.get(k);
+    if (cell) cell.push(a); else this.cells.set(k, [a]);
+  }
+  query(x: number, z: number, r: number, out: Actor[]) {
+    out.length = 0;
+    const s = this.size;
+    for (let cx = Math.floor((x - r) / s); cx <= Math.floor((x + r) / s); cx++) {
+      for (let cz = Math.floor((z - r) / s); cz <= Math.floor((z + r) / s); cz++) {
+        const cell = this.cells.get((cx + 512) * 4096 + cz + 512);
+        if (cell) for (const a of cell) out.push(a);
+      }
+    }
+    return out;
+  }
+}
+
+const INTERACTIVE = new Set<ActorKind>(['item', 'villager', 'tree', 'ore', 'rune', 'echo', 'note', 'camp', 'well', 'house', 'table', 'stall', 'post', 'citadel', 'bell', 'ruin', 'tower', 'barricade']);
+const STATIC_KINDS = new Set<ActorKind>(['tree', 'ore', 'rune', 'echo', 'citadel', 'house', 'camp', 'tower', 'barricade', 'well', 'table', 'stall', 'pillar', 'ruin', 'post', 'note', 'bell']);
+const WORK_ACTIVITY: Record<string, string> = {
+  Keeper: 'Keeping watch', Merchant: 'Minding the stall', Warden: 'Patrolling', Mason: 'Masonry', Woodcutter: 'Chopping',
+  Herbalist: 'Gathering herbs', Farmer: 'Tending fields', Forager: 'Foraging', Apprentice: 'Studying', Smith: 'Smithing',
+  Gardener: 'Gardening', Baker: 'Baking', Scout: 'Scouting',
+};
+
+export class SandboxWorld {
+  seed: number;
+  actors: Actor[] = [];
+  stock: Stock = { gold: 40, wood: 0, stone: 0, essence: 0 };
+  pack: Partial<Record<ItemType, number>> = { draught: 1, apple: 2 };
+  elapsed = 0;
+  level = 1;
+  xp = 0;
+  weaponLevel = 1;
+  flags: Record<string, string | number | boolean> = {};
+  quests: Record<string, QuestState> = {};
+  tracked = 'light';
+  wave = 0;
+  waveActive = false;
+  waveCleared = 0;
+  spawnQueue = 0;
+  bounty = 0;
+  hostileUntil = 0;
+  standing = 0;
+  nextId = 1;
+  echoProgress = 0;
+  echoSolved = false;
+  respawn: Point = { x: 0, z: 11 };
+  input = { x: 0, z: 0, sprint: false };
+  stamina = 100;
+  maxStamina = 100;
+  placing: StructureKind | null = null;
+  dialogue: { npcId: string; line: string; options: StoryOption[]; shop: boolean } | null = null;
+  cameraEvents: { target: Point; duration: number }[] = [];
+  private subtitle: { speaker?: string; text: string; until: number } | null = null;
+  private notice = { text: '', until: 0 };
+  private staminaDelay = 0;
+  private invulnUntil = 0;
+  private combatUntil = 0;
+  private queuedAttack = false;
+  private targetId: string | undefined;
+  private targetUntil = 0;
+  private spawnTimer = 0;
+  private campTimer = 0;
+  private questTimer = 0;
+  private confrontCooldown = 0;
+  private staticDirty = true;
+  private solidGrid = new Grid(4);
+  private itemGrid = new Grid(2);
+  private chars: Actor[] = [];
+  private qa: Actor[] = [];
+  private qb: Actor[] = [];
+  private qc: Actor[] = [];
+  private byIdCache = new Map<string, Actor>();
+  private rng: () => number;
+
+  constructor(seed = 4217, saved?: WorldSave) {
+    this.seed = seed;
+    this.rng = random(seed);
+    this.createWorld();
+    this.quests.light = { stage: 'meet', status: 'active', log: [QUESTS.light.stages.meet.journal(this)] };
+    if (saved && saved.version === SAVE_VERSION && Array.isArray(saved.actors)) this.restore(saved);
+    this.reindex();
+  }
+
+  get player() { return this.byId(PLAYER_ID)!; }
+  get citadel() { return this.byId(CITADEL_ID)!; }
+  get camp() {
+    return this.actors.find((a) => a.kind === 'camp' && a.faction === 'wild' && a.alive) ?? this.actors.find((a) => a.kind === 'camp' && a.faction === 'wild')!;
+  }
+  byId(id: string) {
+    const cached = this.byIdCache.get(id);
+    if (cached && this.actors.includes(cached)) return cached;
+    const found = this.actors.find((a) => a.id === id);
+    if (found) this.byIdCache.set(id, found);
+    return found;
+  }
+  npc(name: string) { return this.actors.find((a) => a.kind === 'villager' && a.name === name); }
+  nearest(kind: ActorKind) {
+    let best: Actor | undefined, bd = Infinity;
+    for (const a of this.actors) if (a.alive && a.kind === kind) { const d = distance(a, this.player); if (d < bd) { bd = d; best = a; } }
+    return best;
+  }
+  hour() { return (8 + this.elapsed / 30) % 24; }
+  wildCampCount() { return this.actors.filter((a) => a.alive && a.kind === 'camp' && a.faction === 'wild').length; }
+  runesSolved() { return this.actors.filter((a) => a.kind === 'rune' && a.currentRune === a.targetRune).length; }
+  questStage(id: string) { const q = this.quests[id]; return q && q.status === 'active' ? q.stage : undefined; }
+
+  private reindex() {
+    this.byIdCache.clear();
+    for (const a of this.actors) this.byIdCache.set(a.id, a);
+    this.staticDirty = true;
+  }
+
+  // ---------------------------------------------------------------- world creation
+  private add(kind: ActorKind, name: string, x: number, z: number, o: Partial<Actor> = {}): Actor {
+    const a: Actor = {
+      id: `a${this.nextId++}`, kind, name, x, z, y: 0, vx: 0, vy: 0, vz: 0, radius: 0.8, height: 3, solid: true, alive: true,
+      hp: 100, maxHp: 100, faction: 'neutral', facing: 0, variant: 0, ...o,
+    };
+    this.actors.push(a);
+    this.byIdCache.set(a.id, a);
+    if (STATIC_KINDS.has(kind)) this.staticDirty = true;
+    return a;
+  }
+
+  spawnItem(type: ItemType, x: number, z: number, y = 0, owner?: string) {
+    const d = ITEMS[type];
+    return this.add('item', d.name, x, z, {
+      itemType: type, y, radius: d.radius, height: d.height, solid: false, hp: 1, maxHp: 1, owner,
+      facing: this.rng() * Math.PI * 2, sleeping: true,
+    });
+  }
+
+  private createWorld() {
+    this.add('player', 'The Guardian', 0, 11, {
+      id: PLAYER_ID, radius: 0.42, height: 1.8, hp: 100, maxHp: 100, faction: 'citadel', facing: Math.PI, solid: false,
+      attrs: { might: 6, agility: 6, will: 6 }, skills: { blade: 0, guard: 0, stealth: 0, lockpick: 0, speech: 5, magic: 0 },
+      spells: [], focus: 66, maxFocus: 66, armor: 0, weapon: 'sword',
+    });
+    this.add('citadel', 'The Citadel', 0, -8, { id: CITADEL_ID, radius: 3.6, height: 12, hp: 500, maxHp: 500, faction: 'citadel', stockWood: 8, stockStone: 8, desc: STATIC_DESC.citadel });
+    this.add('camp', 'Wild camp', 5, 57, { radius: 2.6, height: 4, hp: 320, maxHp: 320, faction: 'wild', stockWood: 0, stockStone: 0, desc: 'Hide tents and a crude totem. It smells of smoke and wet fur.' });
+    this.add('bell', 'Warning bell', 4.6, -3.4, { radius: 0.55, height: 3, desc: 'A bronze bell on a timber frame. Rung only when the village is ready to fight.' });
+    this.add('well', 'Village well', 6, 0, { radius: 1.2, height: 1, desc: 'Cold, clean water.' });
+
+    const houses: [number, number, number][] = [[-13, -5, 0], [13, -6, 1], [-17, 5, 1], [16, 7, 0], [-11, -18, 0], [12, -18, 1], [22, -3, 1], [-23, -12, 0]];
+    houses.forEach(([x, z, variant]) => this.add('house', 'Village home', x, z, { radius: 2.7, height: 6, variant, faction: 'citadel', desc: STATIC_DESC.house }));
+
+    const people: [string, string, Point, Point, Point, number][] = [
+      ['Mara', 'Keeper', { x: -10, z: -2 }, { x: -2.5, z: 5 }, { x: 3, z: 4 }, 0],
+      ['Tobin', 'Merchant', { x: 13, z: -2.4 }, { x: 7.6, z: 6.2 }, { x: 4, z: 3 }, 1],
+      ['Alden', 'Warden', { x: -13, z: -1.6 }, { x: -7, z: 6 }, { x: -4, z: 3 }, 2],
+      ['Iona', 'Mason', { x: 16, z: 10.4 }, { x: 11, z: 1 }, { x: 7, z: 2.5 }, 3],
+      ['Perrin', 'Woodcutter', { x: -17, z: 8.4 }, { x: -12, z: 17 }, { x: -5, z: 1 }, 4],
+      ['Lark', 'Herbalist', { x: 12, z: -14.6 }, { x: 21, z: -14 }, { x: 2, z: 5 }, 5],
+      ['Oren', 'Farmer', { x: -11, z: -14.6 }, { x: -22, z: -2 }, { x: -2, z: 2 }, 6],
+      ['Nell', 'Warden', { x: 22, z: 0.4 }, { x: 4.5, z: 25 }, { x: 6, z: 4 }, 7],
+      ['Ellis', 'Forager', { x: -23, z: -8.6 }, { x: -30, z: 14 }, { x: -7, z: 0 }, 8],
+      ['Rhea', 'Apprentice', { x: 13.6, z: -2.2 }, { x: 3, z: -3.2 }, { x: 8, z: 3 }, 9],
+      ['Sera', 'Smith', { x: 22.6, z: 0.6 }, { x: 19, z: -9 }, { x: 6, z: 1.5 }, 10],
+      ['Tamsin', 'Gardener', { x: -22.4, z: -8.4 }, { x: -19, z: -17 }, { x: -6, z: 2 }, 11],
+      ['Bran', 'Baker', { x: 16.6, z: 10.6 }, { x: 21.4, z: 7.2 }, { x: 3, z: 3 }, 12],
+      ['Vela', 'Scout', { x: 12.6, z: -14.4 }, { x: 10, z: 23 }, { x: 5, z: 5 }, 13],
+    ];
+    for (const [name, profession, home, work, social, variant] of people) {
+      this.add('villager', name, work.x, work.z, {
+        radius: 0.42, height: 1.8, solid: false, hp: 80, maxHp: 80, faction: 'citadel', profession, home, work, social, variant,
+        activity: WORK_ACTIVITY[profession], decideIn: this.rng(),
+        memory: { opinion: 0, conversations: 0, witnessedCrime: 0, alarmUntil: 0, lastGreet: -99, rumors: [] },
+        needs: { energy: 0.8 + this.rng() * 0.2, hunger: this.rng() * 0.4, social: this.rng() * 0.5, fun: this.rng() * 0.4 },
+        persona: makePersona(this.rng, profession), attrs: makeAttrs(this.rng, profession), skills: makeSkills(this.rng, profession),
+        routine: makeRoutine(this.rng, profession, home, social),
+        crowns: profession === 'Merchant' ? 60 : 4 + Math.floor(this.rng() * 20), homeFood: 2,
+        items: this.rng() < 0.5 ? { apple: 1 } : {},
+        weapon: profession === 'Warden' ? 'staff' : profession === 'Smith' || profession === 'Woodcutter' ? 'club' : 'fists',
+        spells: (['Apprentice', 'Herbalist', 'Keeper'] as string[]).includes(profession) ? (['mending', 'bolt'] as SpellId[]) : undefined,
+        focus: 60, maxFocus: 60, armor: profession === 'Warden' ? 0.2 : 0,
+      });
+    }
+    this.npc('Alden')!.patrol = [{ x: -6, z: 8 }, { x: -14, z: -1 }, { x: -5, z: -14 }, { x: 8, z: -12 }, { x: 9, z: 9 }];
+    this.npc('Nell')!.patrol = [{ x: 4.5, z: 25 }, { x: 7, z: 31 }, { x: -1, z: 30 }];
+
+    // Market stall and bakery: owned goods.
+    const stall = this.add('stall', 'Market stall', 9.4, 6.2, { radius: 0.95, height: 0.95, surface: 0.95, desc: STATIC_DESC.stall });
+    [[-0.45, -0.3, 'apple'], [-0.2, -0.35, 'apple'], [0.1, -0.3, 'apple'], [0.4, 0.2, 'jug'], [-0.3, 0.3, 'bread'], [0.05, 0.25, 'cheese'], [0.45, -0.2, 'draught']].forEach(([dx, dz, t]) =>
+      this.spawnItem(t as ItemType, stall.x + (dx as number), stall.z + (dz as number), 0.95, 'Tobin'));
+    const bakery = this.add('table', 'Bakery table', 23, 7.2, { radius: 0.8, height: 0.9, surface: 0.9, desc: 'Flour dusts every board.' });
+    this.spawnItem('bread', bakery.x - 0.3, bakery.z + 0.25, 0.9, 'Bran');
+    this.spawnItem('bread', bakery.x + 0.25, bakery.z + 0.3, 0.9, 'Bran');
+    this.spawnItem('basket', bakery.x + 1.3, bakery.z + 0.6, 0, 'Bran');
+
+    // The storehouse: an open pavilion of shelves and floor clutter.
+    const sx = -31, sz = 8;
+    for (const [dx, dz] of [[-2.6, -2.2], [2.6, -2.2], [-2.6, 2.2], [2.6, 2.2]]) this.add('pillar', 'Roof post', sx + dx, sz + dz, { radius: 0.2, height: 3.3, desc: STATIC_DESC.pillar });
+    this.add('roof', 'Storehouse roof', sx, sz, { solid: false, radius: 3 });
+    const t1 = this.add('table', 'Storehouse shelf', sx - 1.2, sz - 0.8, { radius: 0.8, height: 0.9, surface: 0.9, desc: 'Shelves of village stores.' });
+    const t2 = this.add('table', 'Storehouse shelf', sx + 1.2, sz + 0.9, { radius: 0.8, height: 0.9, surface: 0.9, desc: 'Shelves of village stores.' });
+    ([[t1, -0.35, -0.3, 'pot'], [t1, 0.3, -0.25, 'jug'], [t1, 0.0, 0.3, 'candle'], [t1, -0.4, 0.25, 'book'], [t1, 0.35, 0.3, 'herb'],
+      [t2, -0.3, -0.3, 'pouch'], [t2, 0.3, -0.2, 'hammer'], [t2, -0.2, 0.3, 'candle'], [t2, 0.3, 0.3, 'herb'], [t2, 0.0, 0.0, 'lantern']] as [Actor, number, number, ItemType][])
+      .forEach(([t, dx, dz, type]) => this.spawnItem(type, t.x + dx, t.z + dz, 0.9, 'village'));
+    ([[-2.0, 1.6, 'barrel'], [-1.1, 1.8, 'barrel'], [-2.1, 0.7, 'barrel'], [1.9, -1.6, 'crate'], [1.9, -0.5, 'crate'], [0.6, -1.7, 'bucket'], [-0.2, 1.9, 'basket'], [0.4, 0.1, 'pot']] as [number, number, ItemType][])
+      .forEach(([dx, dz, type]) => this.spawnItem(type, sx + dx, sz + dz, 0, 'village'));
+    this.add('note', 'Slate by the door', sx + 2.6, sz + 3.2, { radius: 0.3, height: 1.2, text: 'Village stores. Take what the watch needs; tell Mara what you took.' });
+    const box1 = this.spawnItem('strongbox', sx + 0.9, sz - 1.7, 0, 'village');
+    box1.locked = 18; box1.loot = ['pouch', 'draught'];
+    this.spawnItem('tomeMend', sx - 2.2, sz + 2.6, 0);
+
+    // The old mill ruin, where the ledger lies.
+    const mx = -44, mz = 36;
+    ([[-2.2, -1.8, 1.2, 0], [2.0, -1.5, 1.0, 1], [-2.4, 2.0, 1.1, 2], [2.4, 2.4, 0.9, 1]] as [number, number, number, number][])
+      .forEach(([dx, dz, r, v]) => this.add('ruin', 'Mill wall', mx + dx, mz + dz, { radius: r, height: 2.2, variant: v, desc: STATIC_DESC.ruin }));
+    this.spawnItem('ledger', mx + 0.3, mz + 0.2, 0, 'Tobin');
+    const box2 = this.spawnItem('strongbox', mx - 1.4, mz - 0.8, 0);
+    box2.locked = 30; box2.loot = ['pouch', 'pouch', 'tomeBolt'];
+    this.spawnItem('pot', mx - 0.9, mz + 0.8, 0);
+    this.spawnItem('stoneChunk', mx + 1.2, mz - 0.4, 0);
+    this.add('note', 'Torn page', mx + 1.1, mz + 1.4, { radius: 0.3, height: 1.2, text: '...left it by the millstone, I am sure of it. Must come back before Vela goes poking about. T.' });
+
+    // Watch post, standing stones, echo stones.
+    this.add('post', 'Watch post', 3, 28, { radius: 0.9, height: 4.5, desc: STATIC_DESC.post });
+    this.spawnItem('crate', 4.6, 29.4, 0, 'village');
+    ([[-11, 3, 1, 0], [-11, 7, 2, 1], [-11, 11, 0, 2]] as [number, number, number, number][])
+      .forEach(([x, z, targetRune, currentRune], i) => this.add('rune', 'Standing stone', x, z, { radius: 0.75, height: 2.8, targetRune, currentRune, variant: i }));
+    this.add('note', 'Chalked slate', -13.2, 7, { radius: 0.3, height: 1.2, text: 'Faces above, signs below. The stones forget; we remember. O.' });
+    for (let i = 0; i < 3; i++) this.add('echo', 'Echo stone', 24 + i * 3.2, -19, { radius: 0.7, height: 2.6, variant: i, currentRune: i, targetRune: i });
+
+    // Clutter that makes the village feel used.
+    ([[4, 9.4, 'crate'], [18, -1, 'crate'], [-15.5, -2, 'barrel'], [14.8, -2.6, 'barrel'], [-19.6, 3.4, 'barrel'], [18.8, 9.8, 'barrel'],
+      [21.6, -0.9, 'barrel'], [7.9, 1.5, 'stool'], [4.1, 1.7, 'stool'], [6.3, -1.9, 'stool'], [5, -1.3, 'bucket'], [-9.4, -3.6, 'pot'],
+      [14, 9.6, 'basket'], [-2.6, -2.6, 'lantern'], [-14.2, 12.2, 'log'], [-14.8, 12.6, 'log'], [-14.4, 13.1, 'log'], [-13.7, 12.7, 'log'],
+      [-16.2, 1.2, 'pot'], [12.2, -9.8, 'bucket'], [10.6, -10.4, 'barrel'], [-9.8, -15, 'crate'], [9.6, -14.6, 'basket'], [20.4, -7.6, 'stoneChunk'],
+      [19.6, -8.3, 'hammer'], [-20.4, -3.2, 'bucket'], [-21.2, -16.4, 'herb'], [-18.6, -17.6, 'herb']] as [number, number, ItemType][])
+      .forEach(([x, z, type]) => this.spawnItem(type, x, z, 0));
+
+    // Trees and stone near the village, then the forest that fills the rest of the valley.
+    ([['tree', -6, 15, 0], ['tree', -10, 19, 1], ['tree', 8, 18, 2], ['tree', 15, 18, 1], ['ore', 6, 13.5, 0], ['ore', 11, 15, 1], ['ore', -8, 22, 1],
+      ['tree', -3, 46, 1], ['tree', -8, 53, 0], ['tree', 12, 48, 2], ['tree', 16, 55, 1], ['ore', 1, 49, 0], ['ore', 11, 52, 1], ['ore', -5, 60, 0], ['ore', 16, 62, 1]] as ['tree' | 'ore', number, number, number][])
+      .forEach(([kind, x, z, v]) => this.addNode(kind, x, z, v));
+    const clear = [{ x: 0, z: 0, r: 26 }, { x: sx, z: sz, r: 7 }, { x: mx, z: mz, r: 7 }, { x: 3, z: 28, r: 5 }, { x: 27, z: -19, r: 6 }, { x: 5, z: 57, r: 12 }];
+    for (let i = 0; i < 190; i++) {
+      const x = (this.rng() - 0.5) * 172, z = (this.rng() - 0.5) * 172;
+      if (clear.some((c) => Math.hypot(x - c.x, z - c.z) < c.r) || (Math.abs(x - 1) < 5 && z > 12 && z < 66)) continue;
+      if (this.actors.some((a) => a.solid && distance(a, { x, z }) < a.radius + 2.2)) continue;
+      this.addNode(i % 6 === 0 ? 'ore' : 'tree', x, z, i % 3);
+    }
+
+    ([[7, 54, 'crate'], [2, 61, 'crate'], [9, 56, 'barrel'], [0, 55, 'barrel']] as [number, number, ItemType][]).forEach(([x, z, t]) => this.spawnItem(t, x, z, 0));
+    ([['slime', 0, 51], ['brute', 10, 53], ['wisp', -2, 57], ['stalker', 12, 60], ['slime', -4, 52], ['brute', 15, 58], ['stalker', -7, 60], ['wisp', 8, 64]] as [FoeKind, number, number][])
+      .forEach(([k, x, z]) => this.spawnFoe(k, x, z));
+  }
+
+  private addNode(kind: 'tree' | 'ore', x: number, z: number, variant = 0) {
+    this.add(kind, kind === 'tree' ? 'Old-growth tree' : 'Stone outcrop', x, z, {
+      radius: kind === 'tree' ? 0.7 : 1, height: kind === 'tree' ? 6 : 1.3, hp: 3, maxHp: 3, variant,
+      desc: kind === 'tree' ? 'An old tree, thick enough to give good timber.' : 'Grey stone, easy to split along the seams.',
+    });
+  }
+
+  private spawnFoe(kind: FoeKind, x: number, z: number, raid = false) {
+    const def = FOES[kind];
+    return this.add('foe', def.name, x, z, {
+      foeKind: kind, faction: 'wild', radius: def.radius, height: 1.8, solid: false, hp: def.hp + this.wave * 8, maxHp: def.hp + this.wave * 8,
+      intent: raid ? 'raid' : 'forage', carriedWood: 0, carriedStone: 0, attackCooldown: 0, workCooldown: 0, weaponLevel: 1,
+      facing: this.rng() * Math.PI * 2,
+    });
+  }
+
+  // ---------------------------------------------------------------- messages
+  say(text: string, speaker?: string, seconds = 4.5) { this.subtitle = { text, speaker, until: this.elapsed + seconds }; }
+  notify(text: string) { this.notice = { text, until: this.elapsed + 5 }; }
+  private bark(n: Actor, text: string) { if (distance(n, this.player) < 7 && !this.dialogue) this.say(text, n.name, 2.6); }
+
+  // ---------------------------------------------------------------- quests
+  startQuest(id: string, stage: string) {
+    if (this.quests[id]) return;
+    const def = QUESTS[id];
+    this.quests[id] = { stage, status: 'active', log: [def.stages[stage].journal(this)] };
+    this.tracked = id;
+    this.notify(`New in your journal: ${def.title}`);
+  }
+  setStage(id: string, stage: string) {
+    const q = this.quests[id];
+    const def = QUESTS[id];
+    if (!q || !def) return;
+    q.stage = stage;
+    if (stage === 'done') {
+      q.status = 'done';
+      this.notify(`${def.title} — completed`);
+      if (this.tracked === id) this.tracked = Object.keys(this.quests).find((k) => this.quests[k].status === 'active') ?? id;
+      return;
+    }
+    q.log.push(def.stages[stage].journal(this));
+    this.notify(`Journal updated: ${def.title}`);
+  }
+  journalText(id: string) {
+    const q = this.quests[id];
+    if (!q) return '';
+    if (q.status === 'done') return q.log[q.log.length - 1];
+    return QUESTS[id].stages[q.stage].journal(this);
+  }
+  questTarget(): Point | null {
+    const q = this.quests[this.tracked];
+    if (!q || q.status !== 'active') return null;
+    return QUESTS[this.tracked].stages[q.stage].target?.(this) ?? null;
+  }
+  private updateQuests() {
+    for (const [id, q] of Object.entries(this.quests)) {
+      if (q.status !== 'active') continue;
+      const next = QUESTS[id].stages[q.stage]?.update?.(this);
+      if (next) this.setStage(id, next);
+    }
+  }
+
+  // ---------------------------------------------------------------- people
+  adjustOpinion(n: Actor, delta: number) { if (n.memory) n.memory.opinion = clamp(n.memory.opinion + delta, -100, 100); }
+  addRumor(n: Actor, rumor: string) { if (n.memory && !n.memory.rumors.includes(rumor)) n.memory.rumors.push(rumor); }
+
+  awardExperience(amount: number) {
+    this.xp += amount;
+    while (this.xp >= this.level * 75) {
+      this.xp -= this.level * 75;
+      this.level++;
+      this.player.maxHp += 15;
+      this.player.hp = this.player.maxHp;
+      this.notify(`You feel stronger. (Level ${this.level})`);
+    }
+  }
+
+  // ---------------------------------------------------------------- pack
+  addToPack(type: ItemType, n = 1) { this.pack[type] = (this.pack[type] ?? 0) + n; }
+  /** Any actor's inventory: the guardian uses the world pack, everyone else carries their own. */
+  bag(a: Actor): Partial<Record<ItemType, number>> {
+    if (a.kind === 'player') return this.pack;
+    if (!a.items) a.items = {};
+    return a.items;
+  }
+  give(a: Actor, type: ItemType, n = 1, stolen = false) {
+    const b = this.bag(a);
+    b[type] = (b[type] ?? 0) + n;
+    if (stolen && a.kind !== 'player') { a.stolen = a.stolen ?? {}; a.stolen[type] = (a.stolen[type] ?? 0) + n; }
+  }
+  take(a: Actor, type: ItemType, n = 1): boolean {
+    const b = this.bag(a);
+    if ((b[type] ?? 0) < n) return false;
+    if (b[type] === n) delete b[type]; else b[type] = b[type]! - n;
+    return true;
+  }
+  firstFood(a: Actor): ItemType | undefined {
+    const b = this.bag(a);
+    return (['bread', 'cheese', 'apple', 'herb'] as ItemType[]).find((t) => (b[t] ?? 0) > 0);
+  }
+  /** Melee damage from the same formula for everyone: body, skill and what is in the hand. */
+  meleeDamage(a: Actor): number {
+    const w = WEAPONS[a.weapon ?? 'fists'];
+    return (6 + (a.attrs?.might ?? 5) * 1.3 + w.damage) * (1 + (a.skills?.blade ?? 0) / 110);
+  }
+  takeFromPack(type: ItemType, n = 1) {
+    const have = this.pack[type] ?? 0;
+    if (have < n) return false;
+    if (have === n) delete this.pack[type]; else this.pack[type] = have - n;
+    return true;
+  }
+  usePack(type: ItemType): string {
+    const def = ITEMS[type];
+    if (!this.pack[type]) return '';
+    if (def.read) {
+      if (type === 'ledger') this.flags.ledgerRead = true;
+      if (type === 'tomeBolt' || type === 'tomeMend') {
+        const spell: SpellId = type === 'tomeBolt' ? 'bolt' : 'mending';
+        if (!this.player.spells!.includes(spell)) { this.player.spells!.push(spell); this.skillXp('magic', 10); }
+      }
+      return def.read;
+    }
+    if (def.heal) {
+      const p = this.player;
+      if (p.hp >= p.maxHp) return 'You are not hurt.';
+      this.takeFromPack(type);
+      p.hp = Math.min(p.maxHp, p.hp + def.heal);
+      return `You eat the ${def.name.toLowerCase()}.`;
+    }
+    return `You turn the ${def.name.toLowerCase()} over in your hands.`;
+  }
+  dropFromPack(type: ItemType) {
+    if (!this.takeFromPack(type)) return;
+    const p = this.player;
+    const it = this.spawnItem(type, p.x + Math.sin(p.facing) * 0.8, p.z + Math.cos(p.facing) * 0.8, 1.0);
+    it.sleeping = false;
+  }
+
+  // ---------------------------------------------------------------- crime
+  private witnesses(at: Point, exclude?: string) {
+    const sneaking = this.player.sneaking;
+    return this.actors.filter((n) => {
+      if (n.kind !== 'villager' || !n.alive || n.id === exclude || n.activity === 'Sleeping') return false;
+      const d = distance(n, at);
+      if (d > (sneaking ? 6 : 13)) return false;
+      return d < (sneaking ? 2 : 4) || Math.abs(angleDelta(n.facing, angleTo(n, at))) < (sneaking ? 1.1 : 2.0);
+    });
+  }
+  private commitCrime(kind: 'theft' | 'assault', value: number, victim?: Actor) {
+    const seen = this.witnesses(this.player, undefined);
+    if (victim && victim.kind === 'villager' && !seen.includes(victim)) seen.push(victim);
+    if (!seen.length) return false;
+    this.bounty += kind === 'theft' ? value * 2 + 5 : 25;
+    this.standing = Math.max(-100, this.standing - 4);
+    for (const w of seen) {
+      w.memory!.witnessedCrime++;
+      w.memory!.alarmUntil = this.elapsed + (kind === 'assault' ? 45 : 20);
+      this.adjustOpinion(w, kind === 'assault' ? -25 : -12);
+      this.addRumor(w, 'crime');
+    }
+    const shout = seen.find((w) => w.profession !== 'Warden') ?? seen[0];
+    this.say(kind === 'theft' ? 'Thief! Somebody fetch the wardens!' : 'Help! Wardens!', shout.name, 3);
+    return true;
+  }
+
+  // ---------------------------------------------------------------- update
+  update(dtIn: number) {
+    const dt = clamp(dtIn, 0, 0.05);
+    this.elapsed += dt;
+    if (this.staticDirty) {
+      this.solidGrid.clear();
+      for (const a of this.actors) if (a.alive && a.solid && STATIC_KINDS.has(a.kind)) this.solidGrid.insert(a);
+      this.staticDirty = false;
+    }
+    this.itemGrid.clear();
+    this.chars.length = 0;
+    for (const a of this.actors) {
+      if (!a.alive) continue;
+      if (a.kind === 'item' && !a.carriedBy) this.itemGrid.insert(a);
+      else if (a.kind === 'player' || a.kind === 'villager' || a.kind === 'foe') this.chars.push(a);
+    }
+
+    this.updatePlayer(dt);
+    const pp = this.player;
+    for (const a of this.actors) {
+      if (!a.alive) continue;
+      // Tiered simulation: nearby minds run every tick, distant ones think and move in longer strides.
+      if (a.kind === 'villager' || a.kind === 'foe') {
+        const d2 = (a.x - pp.x) ** 2 + (a.z - pp.z) ** 2;
+        a.far = d2 > 55 * 55;
+        a.acc = (a.acc ?? 0) + dt;
+        const step = a.far ? 0.25 : d2 > 30 * 30 ? 0.12 : 0;
+        if (step > 0 && a.acc < step) continue;
+        const useDt = a.acc;
+        a.acc = 0;
+        if (a.kind === 'villager') this.updateVillager(a, useDt); else this.updateFoe(a, useDt);
+        continue;
+      }
+      if (a.kind === 'tower') this.updateTower(a, dt);
+      else if (a.kind === 'item') this.updateItem(a, dt);
+    }
+    this.separateCharacters();
+
+    if (this.waveActive && this.spawnQueue > 0) {
+      this.spawnTimer -= dt;
+      if (this.spawnTimer <= 0) {
+        this.spawnTimer = 1.3;
+        const kinds: FoeKind[] = ['slime', 'slime', 'brute', 'stalker', 'wisp'];
+        const camp = this.camp;
+        this.spawnFoe(kinds[(this.wave + this.spawnQueue) % kinds.length], camp.x + (this.rng() - 0.5) * 4, camp.z - 3.5, true);
+        this.spawnQueue--;
+      }
+    }
+    if (this.waveActive && this.spawnQueue === 0 && !this.actors.some((a) => a.alive && a.kind === 'foe' && a.intent === 'raid')) {
+      this.waveActive = false;
+      this.waveCleared = this.wave;
+      this.stock.gold += 30 + this.wave * 5;
+      this.say('That is the last of them. The Citadel stands.', 'Alden', 4);
+    }
+    this.campTimer += dt;
+    if (this.campTimer >= 5) { this.campTimer = 0; this.updateCamps(); }
+    this.questTimer += dt;
+    if (this.questTimer >= 0.5) { this.questTimer = 0; this.updateQuests(); }
+    this.confrontCooldown = Math.max(0, this.confrontCooldown - dt);
+    if (this.subtitle && this.subtitle.until < this.elapsed) this.subtitle = null;
+  }
+
+  // ---------------------------------------------------------------- movement & physics
+  private moveCharacter(a: Actor, dx: number, dz: number) {
+    if (!dx && !dz) return;
+    if (a.far && a.kind !== 'player') {
+      a.x = clamp(a.x + dx, -WORLD_LIMIT + a.radius, WORLD_LIMIT - a.radius);
+      a.z = clamp(a.z + dz, -WORLD_LIMIT + a.radius, WORLD_LIMIT - a.radius);
+      return;
+    }
+    let nx = clamp(a.x + dx, -WORLD_LIMIT + a.radius, WORLD_LIMIT - a.radius);
+    let nz = clamp(a.z + dz, -WORLD_LIMIT + a.radius, WORLD_LIMIT - a.radius);
+    const near = this.solidGrid.query(nx, nz, a.radius + 4, this.qa);
+    for (const o of near) {
+      if (!o.alive || !o.solid || a.y > o.height - 0.05) continue;
+      const ox = nx - o.x, oz = nz - o.z;
+      const d = Math.hypot(ox, oz), min = a.radius + o.radius;
+      if (d < min) {
+        if (d < 1e-4) { nx += min; continue; }
+        nx = o.x + (ox / d) * min;
+        nz = o.z + (oz / d) * min;
+      }
+    }
+    a.x = nx;
+    a.z = nz;
+    // Walking into loose objects shoves them; heavy ones shove back.
+    const items = this.itemGrid.query(a.x, a.z, a.radius + 0.8, this.qb);
+    for (const it of items) {
+      if (!it.alive || it.carriedBy || it.y > a.y + 1.1) continue;
+      if (it.seatTakenBy) continue;
+      const ox = it.x - a.x, oz = it.z - a.z;
+      const d = Math.hypot(ox, oz), min = a.radius + it.radius;
+      if (d >= min || d < 1e-4) continue;
+      const mass = ITEMS[it.itemType!].mass;
+      const share = mass > 3 ? 0.45 : 1;
+      const push = min - d;
+      it.x += (ox / d) * push * share;
+      it.z += (oz / d) * push * share;
+      a.x -= (ox / d) * push * (1 - share);
+      a.z -= (oz / d) * push * (1 - share);
+      const kick = Math.min(4, Math.hypot(a.vx, a.vz)) / Math.max(1, mass * 0.6);
+      it.vx += (ox / d) * kick;
+      it.vz += (oz / d) * kick;
+      it.sleeping = false;
+    }
+  }
+
+  private surfaceAt(x: number, z: number) {
+    let h = 0;
+    for (const o of this.solidGrid.query(x, z, 2, this.qc)) {
+      if (o.surface !== undefined && o.alive && Math.hypot(x - o.x, z - o.z) < o.radius * 0.95) h = Math.max(h, o.surface);
+    }
+    return h;
+  }
+
+  private updateItem(it: Actor, dt: number) {
+    const def = ITEMS[it.itemType!];
+    if (it.carriedBy) {
+      const c = this.byId(it.carriedBy);
+      if (!c || !c.alive || c.hp <= 0) { it.carriedBy = undefined; it.sleeping = false; return; }
+      const reach = c.radius + def.radius * 0.7 + 0.1;
+      it.x = c.x + Math.sin(c.facing) * reach;
+      it.z = c.z + Math.cos(c.facing) * reach;
+      it.y = c.y + 0.95 - def.height * 0.35;
+      it.vx = c.vx; it.vz = c.vz; it.vy = 0;
+      it.facing = c.facing;
+      return;
+    }
+    if (it.sleeping) return;
+    const p = this.player;
+    // Far from the guardian, objects are held exactly where they lie.
+    if (Math.abs(it.x - p.x) > 60 || Math.abs(it.z - p.z) > 60) return;
+    it.vy -= 20 * dt;
+    it.x += it.vx * dt;
+    it.z += it.vz * dt;
+    it.y += it.vy * dt;
+    const ground = this.surfaceAt(it.x, it.z);
+    let onGround = false;
+    if (it.y <= ground) {
+      it.y = ground;
+      if (it.vy < -3) { it.vy = -it.vy * 0.28; it.vx *= 0.7; it.vz *= 0.7; }
+      else { it.vy = 0; onGround = true; }
+    }
+    const friction = onGround ? Math.exp(-dt * 7) : Math.exp(-dt * 0.15);
+    it.vx *= friction;
+    it.vz *= friction;
+    if (!onGround) it.facing += dt * 5;
+    it.x = clamp(it.x, -WORLD_LIMIT + 0.5, WORLD_LIMIT - 0.5);
+    it.z = clamp(it.z, -WORLD_LIMIT + 0.5, WORLD_LIMIT - 0.5);
+
+    for (const o of this.solidGrid.query(it.x, it.z, it.radius + 4, this.qa)) {
+      if (!o.alive || !o.solid || it.y >= o.height - 0.02) continue;
+      const ox = it.x - o.x, oz = it.z - o.z;
+      const d = Math.hypot(ox, oz), min = it.radius + o.radius;
+      if (d >= min || d < 1e-4) continue;
+      const nx = ox / d, nz = oz / d;
+      it.x = o.x + nx * min;
+      it.z = o.z + nz * min;
+      const vn = it.vx * nx + it.vz * nz;
+      if (vn < 0) { it.vx -= 1.45 * vn * nx; it.vz -= 1.45 * vn * nz; }
+    }
+    for (const o of this.itemGrid.query(it.x, it.z, it.radius + 0.6, this.qb)) {
+      if (o === it || o.carriedBy || Math.abs(o.y - it.y) > 0.5) continue;
+      const ox = it.x - o.x, oz = it.z - o.z;
+      const d = Math.hypot(ox, oz), min = it.radius + o.radius;
+      if (d >= min || d < 1e-4) continue;
+      const nx = ox / d, nz = oz / d, push = (min - d) * 0.5;
+      it.x += nx * push; it.z += nz * push;
+      const speed = Math.hypot(it.vx, it.vz);
+      if (speed > 0.8) {
+        const ratio = def.mass / (def.mass + ITEMS[o.itemType!].mass);
+        o.vx -= nx * speed * ratio; o.vz -= nz * speed * ratio;
+        it.vx *= 1 - ratio; it.vz *= 1 - ratio;
+        o.sleeping = false;
+      }
+    }
+    const speed = Math.hypot(it.vx, it.vz);
+    if (speed > 4 && it.y < 1.9) {
+      for (const c of this.chars) {
+        if (c.id === it.thrownBy && this.elapsed - (it.thrownAt ?? 0) < 0.45) continue;
+        if (Math.hypot(c.x - it.x, c.z - it.z) > c.radius + it.radius) continue;
+        const dmg = Math.round(def.mass * speed * 0.8 + 4);
+        this.hurt(c, dmg, it.thrownBy);
+        c.vx += it.vx * 0.4; c.vz += it.vz * 0.4;
+        it.vx *= -0.3; it.vz *= -0.3;
+        if (c.kind === 'villager' && it.thrownBy === PLAYER_ID) this.commitCrime('assault', 0, c);
+        if (c.kind === 'foe') this.alertFoe(c, this.player);
+        break;
+      }
+    }
+    if (onGround && speed < 0.06) {
+      it.restTimer = (it.restTimer ?? 0) + dt;
+      if (it.restTimer > 0.35) { it.sleeping = true; it.vx = it.vy = it.vz = 0; it.restTimer = 0; }
+    } else it.restTimer = 0;
+  }
+
+  private separateCharacters() {
+    const cs = this.chars;
+    for (let i = 0; i < cs.length; i++) {
+      const a = cs[i];
+      for (let j = i + 1; j < cs.length; j++) {
+        const b = cs[j];
+        const dx = b.x - a.x, dz = b.z - a.z;
+        if (Math.abs(dx) > 2 || Math.abs(dz) > 2) continue;
+        const d = Math.hypot(dx, dz), min = a.radius + b.radius;
+        if (d >= min || d < 1e-4 || a.hp <= 0 || b.hp <= 0) continue;
+        const push = (min - d) * 0.5, nx = dx / d, nz = dz / d;
+        a.x -= nx * push; a.z -= nz * push;
+        b.x += nx * push; b.z += nz * push;
+      }
+    }
+  }
+
+  private turnToward(a: Actor, target: number, rate: number, dt: number) {
+    a.facing += clamp(angleDelta(a.facing, target), -rate * dt, rate * dt);
+  }
+
+  private steer(a: Actor, target: Point, speed: number, dt: number, stop = 0.4) {
+    const dx = target.x - a.x, dz = target.z - a.z;
+    const d = Math.hypot(dx, dz);
+    let tx = 0, tz = 0;
+    if (d > stop) {
+      const ang = Math.atan2(dx, dz) + ((a.detourT ?? 0) > 0 ? a.detour ?? 0 : 0);
+      const s = Math.min(speed, (d - stop) * 3 + 0.4);
+      tx = Math.sin(ang) * s;
+      tz = Math.cos(ang) * s;
+      this.turnToward(a, ang, 7, dt);
+    }
+    const k = 1 - Math.exp(-dt * 8);
+    a.vx += (tx - a.vx) * k;
+    a.vz += (tz - a.vz) * k;
+    const bx = a.x, bz = a.z;
+    this.moveCharacter(a, a.vx * dt, a.vz * dt);
+    if (d > stop && Math.hypot(a.x - bx, a.z - bz) < speed * dt * 0.25) {
+      a.stuck = (a.stuck ?? 0) + dt;
+      if (a.stuck > 0.4) { a.detour = (this.rng() < 0.5 ? 1 : -1) * 1.25; a.detourT = 1.1; a.stuck = 0; }
+    } else a.stuck = 0;
+    if (a.detourT) a.detourT = Math.max(0, a.detourT - dt);
+    return d;
+  }
+
+  private stopMoving(a: Actor, dt: number) {
+    const k = 1 - Math.exp(-dt * 10);
+    a.vx -= a.vx * k;
+    a.vz -= a.vz * k;
+    if (Math.abs(a.vx) + Math.abs(a.vz) > 0.02) this.moveCharacter(a, a.vx * dt, a.vz * dt);
+  }
+
+  private startAction(a: Actor, kind: ActionKind, dur: number) {
+    a.action = kind; a.actionT = 0; a.actionDur = dur; a.actionHit = false;
+  }
+
+  // ---------------------------------------------------------------- the guardian
+  private updatePlayer(dt: number) {
+    const p = this.player;
+    this.staminaDelay -= dt;
+    if (this.staminaDelay <= 0) this.stamina = Math.min(this.maxStamina, this.stamina + 24 * dt);
+    p.focus = Math.min(p.maxFocus ?? 0, (p.focus ?? 0) + dt * (2 + (p.attrs?.will ?? 6) * 0.2));
+    if (p.hp <= 0) { this.stopMoving(p, dt); return; }
+    if (p.sittingOn) {
+      const seat = this.byId(p.sittingOn);
+      const wantMove = Math.hypot(this.input.x, this.input.z) > 0.15;
+      if (!seat || !seat.alive || seat.carriedBy || wantMove) {
+        if (seat && seat.seatTakenBy === PLAYER_ID) seat.seatTakenBy = undefined;
+        p.sittingOn = undefined;
+      } else {
+        p.x = seat.x; p.z = seat.z; p.vx = 0; p.vz = 0;
+        this.stamina = Math.min(this.maxStamina, this.stamina + 30 * dt);
+        return;
+      }
+    }
+    if (p.action) {
+      p.actionT! += dt;
+      this.resolvePlayerAction(p);
+      if (p.actionT! >= p.actionDur!) this.finishAction(p);
+    }
+    const held = this.held();
+    const locked = p.action === 'gather' || p.action === 'pickup' || p.action === 'hurt' || p.action === 'land';
+    const attacking = !!p.action && p.action.startsWith('attack');
+    let ix = this.dialogue ? 0 : this.input.x, iz = this.dialogue ? 0 : this.input.z;
+    const len = Math.hypot(ix, iz);
+    if (len > 1) { ix /= len; iz /= len; }
+    let tx = 0, tz = 0;
+    if (p.action === 'roll') {
+      tx = Math.sin(p.facing) * 8.5;
+      tz = Math.cos(p.facing) * 8.5;
+    } else if (!locked) {
+      const mass = held ? ITEMS[held.itemType!].mass : 0;
+      const sprint = this.input.sprint && len > 0.1 && this.stamina > 1 && mass < 3 && !attacking && !p.sneaking;
+      const speed = (attacking ? 1.2 : mass >= 3 ? 2.8 : held ? 3.8 : sprint ? 7.4 : 4.3) * (p.sneaking ? 0.55 : 1);
+      if (sprint) { this.stamina -= 15 * dt; this.staminaDelay = 0.7; }
+      tx = ix * speed;
+      tz = iz * speed;
+      if (len > 0.1 && !attacking) this.turnToward(p, Math.atan2(ix, iz), 11, dt);
+    }
+    const k = 1 - Math.exp(-dt * (p.y > 0.05 ? 2.5 : 11));
+    p.vx += (tx - p.vx) * k;
+    p.vz += (tz - p.vz) * k;
+    this.moveCharacter(p, p.vx * dt, p.vz * dt);
+    if (p.y > 0 || p.vy > 0) {
+      p.vy -= 22 * dt;
+      p.y += p.vy * dt;
+      if (p.y <= 0) {
+        if (p.vy < -17) this.hurt(p, Math.round((-p.vy - 15) * 4));
+        if (p.vy < -10 && !p.action) this.startAction(p, 'land', 0.22);
+        p.y = 0; p.vy = 0;
+      }
+    }
+  }
+
+  private resolvePlayerAction(p: Actor) {
+    if (p.actionHit) return;
+    const t = p.actionT!;
+    if ((p.action === 'attack1' || p.action === 'attack2') && t >= 0.2) { p.actionHit = true; this.playerStrike(p.action === 'attack1' ? 1 : 2); }
+    else if (p.action === 'attack3' && t >= 0.4) { p.actionHit = true; this.playerStrike(3); }
+    else if (p.action === 'gather' && t >= 0.75) { p.actionHit = true; this.completeGather(p); }
+  }
+
+  private finishAction(p: Actor) {
+    const was = p.action;
+    p.action = undefined;
+    if (this.queuedAttack && (was === 'attack1' || was === 'attack2')) {
+      this.queuedAttack = false;
+      if (this.stamina >= 6) {
+        this.stamina -= 12; this.staminaDelay = 0.8;
+        this.startAction(p, was === 'attack1' ? 'attack2' : 'attack3', was === 'attack1' ? 0.48 : 0.72);
+      }
+    }
+    this.queuedAttack = false;
+  }
+
+  jump() {
+    const p = this.player;
+    if (p.hp <= 0 || this.dialogue || p.y > 0.01 || (p.action && p.action !== 'land') || this.stamina < 8) return;
+    if (this.held() && ITEMS[this.held()!.itemType!].mass >= 3) return;
+    p.vy = 7.2;
+    p.y = 0.001;
+    this.stamina -= 10;
+    this.staminaDelay = 0.6;
+  }
+
+  dodge() {
+    const p = this.player;
+    if (p.hp <= 0 || this.dialogue || p.y > 0.05 || this.stamina < 15 || this.held()) return;
+    if (p.action && p.action !== 'attack1' && p.action !== 'attack2' && p.action !== 'attack3' && p.action !== 'land') return;
+    const len = Math.hypot(this.input.x, this.input.z);
+    if (len > 0.1) p.facing = Math.atan2(this.input.x, this.input.z);
+    this.stamina -= 20;
+    this.staminaDelay = 0.9;
+    this.queuedAttack = false;
+    this.startAction(p, 'roll', 0.55);
+    this.invulnUntil = this.elapsed + 0.42;
+  }
+
+  attack() {
+    const p = this.player;
+    if (p.hp <= 0 || this.dialogue) return;
+    if (this.held()) { this.throwHeld(); return; }
+    if (p.action === 'attack1' || p.action === 'attack2') { this.queuedAttack = true; return; }
+    if (p.action || this.stamina < 6) return;
+    this.stamina -= 12;
+    this.staminaDelay = 0.8;
+    this.startAction(p, 'attack1', 0.48);
+  }
+
+  private playerStrike(step: number) {
+    const p = this.player;
+    const dmg = (this.meleeDamage(p) + 6 + (this.level - 1) * 3) * [1, 1.15, 1.7][step - 1];
+    const range = step === 3 ? 2.7 : 2.4;
+    let hitAny = false;
+    for (const a of this.actors) {
+      if (!a.alive || a.id === PLAYER_ID || a.carriedBy) continue;
+      const hittable = a.kind === 'foe' || a.kind === 'villager' || a.kind === 'item' || (a.faction === 'wild' && (a.kind === 'tower' || a.kind === 'camp'));
+      if (!hittable) continue;
+      const d = distance(a, p) - a.radius;
+      if (d > range || Math.abs(a.y - p.y) > 1.6) continue;
+      if (d > 0.5 && Math.abs(angleDelta(p.facing, angleTo(p, a))) > 1.1) continue;
+      const nx = Math.sin(angleTo(p, a)), nz = Math.cos(angleTo(p, a));
+      if (a.kind === 'item') {
+        const mass = ITEMS[a.itemType!].mass;
+        a.vx += (nx * 7) / Math.max(1, mass);
+        a.vz += (nz * 7) / Math.max(1, mass);
+        a.vy = 3 / Math.max(1, mass * 0.5);
+        a.y = Math.max(a.y, 0.05);
+        a.sleeping = false;
+        continue;
+      }
+      hitAny = true;
+      if (a.kind === 'foe') this.skillXp('blade', 2);
+      this.hurt(a, dmg, PLAYER_ID);
+      a.vx += nx * (step === 3 ? 6 : 3);
+      a.vz += nz * (step === 3 ? 6 : 3);
+      if (a.kind === 'foe') this.alertFoe(a, p);
+      if (a.kind === 'villager' && this.hostileUntil < this.elapsed) this.commitCrime('assault', 0, a);
+    }
+    if (hitAny) this.combatUntil = this.elapsed + 6;
+  }
+
+  hurt(target: Actor, damage: number, source?: string) {
+    if (!target.alive || target.hp <= 0) return;
+    if (target.kind === 'player' && this.elapsed < this.invulnUntil) return;
+    if (target.kind === 'player' && source) {
+      damage *= 1 - Math.min(0.45, (target.armor ?? 0) + (target.skills?.guard ?? 0) * 0.002);
+      this.skillXp('guard', 1.5);
+    }
+    if (target.kind !== 'player') damage *= 1 - (target.armor ?? 0) * 0.7;
+    target.hp = Math.max(0, target.hp - damage);
+    if (target.kind === 'player') {
+      this.combatUntil = this.elapsed + 6;
+      if (target.action !== 'roll') { this.startAction(target, 'hurt', 0.28); this.queuedAttack = false; }
+      if (target.hp <= 0) {
+        target.action = undefined;
+        const held = this.held();
+        if (held) { held.carriedBy = undefined; held.sleeping = false; }
+      }
+      return;
+    }
+    if (source === PLAYER_ID && (target.kind === 'foe' || target.kind === 'villager' || target.kind === 'tower' || target.kind === 'camp')) {
+      this.targetId = target.id;
+      this.targetUntil = this.elapsed + 4;
+    }
+    if (target.kind === 'villager') {
+      target.hp = Math.max(1, target.hp);
+      this.startAction(target, 'hurt', 0.3);
+      if (target.memory) target.memory.alarmUntil = this.elapsed + 30;
+      return;
+    }
+    if (target.kind === 'foe') {
+      if (target.action === 'windup') target.attackCooldown = 0.6;
+      this.startAction(target, 'hurt', 0.3);
+    }
+    if (target.hp > 0) return;
+    if (target.kind === 'citadel') { this.say('The Citadel light gutters and goes dark.'); return; }
+    target.alive = false;
+    target.solid = false;
+    if (STATIC_KINDS.has(target.kind)) this.staticDirty = true;
+    if (target.kind === 'foe' && target.foeKind) {
+      this.stock.gold += FOES[target.foeKind].bounty;
+      this.awardExperience(15);
+      if (this.rng() < 0.35) { const h = this.spawnItem('herb', target.x, target.z, 0.6); h.sleeping = false; }
+      if ((target.carriedWood ?? 0) > 0) { const l = this.spawnItem('log', target.x + 0.4, target.z, 0.6); l.sleeping = false; }
+    } else if (target.kind === 'camp' && target.faction === 'wild') {
+      this.say('The camp burns. The wilds will remember this.');
+      this.awardExperience(60);
+    }
+  }
+
+  private alertFoe(f: Actor, at: Point) {
+    f.intent = f.intent === 'flee' ? 'flee' : 'chase';
+    f.lastKnown = { x: at.x, z: at.z };
+    f.lostFor = 0;
+    // Foes call to each other: anyone in earshot comes to look.
+    for (const ally of this.chars) {
+      if (ally.kind !== 'foe' || ally === f || !ally.alive) continue;
+      if (distance(ally, f) < 14 && ally.intent !== 'chase' && ally.intent !== 'flee') {
+        ally.intent = 'search';
+        ally.lastKnown = { x: at.x, z: at.z };
+        ally.lostFor = 0;
+      }
+    }
+  }
+
+  held() {
+    for (const a of this.actors) if (a.carriedBy === PLAYER_ID && a.alive) return a;
+    return undefined;
+  }
+
+  // ---------------------------------------------------------------- interaction
+  focus(): Actor | null {
+    const p = this.player;
+    let best: Actor | null = null, bestScore = Infinity;
+    for (const a of this.actors) {
+      if (!a.alive || a.id === PLAYER_ID || a.carriedBy || !INTERACTIVE.has(a.kind)) continue;
+      if ((a.kind === 'camp' && a.faction !== 'citadel') || (a.kind === 'villager' && a.activity === 'Sleeping')) continue;
+      const dx = a.x - p.x, dz = a.z - p.z;
+      if (Math.abs(dx) > 5 || Math.abs(dz) > 5) continue;
+      const d = Math.hypot(dx, dz) - a.radius;
+      const reach = a.kind === 'item' ? 1.3 : 1.8;
+      if (d > reach || (a.kind === 'item' && Math.abs(a.y - p.y) > 1.7)) continue;
+      const ang = Math.abs(angleDelta(p.facing, Math.atan2(dx, dz)));
+      if (ang > 1.35 && d > 0.45) continue;
+      const score = d + ang * 0.8 + (a.kind === 'item' ? -0.15 : 0) + (STATIC_KINDS.has(a.kind) && a.kind !== 'tree' && a.kind !== 'ore' && a.kind !== 'rune' && a.kind !== 'echo' && a.kind !== 'bell' && a.kind !== 'note' ? 0.6 : 0);
+      if (score < bestScore) { bestScore = score; best = a; }
+    }
+    return best;
+  }
+
+  private verb(a: Actor): Prompt {
+    const name = a.kind === 'rune' || a.kind === 'echo' ? a.name : a.name;
+    switch (a.kind) {
+      case 'villager': return { name, primary: 'Talk', crime: false };
+      case 'item': {
+        const def = ITEMS[a.itemType!];
+        if (a.itemType === 'stool') return { name, primary: this.player.sittingOn === a.id ? 'Stand' : 'Sit', secondary: 'Lift', crime: false };
+        if (a.itemType === 'strongbox') return { name, primary: a.locked ? 'Pick the lock' : (a.loot?.length ? 'Open' : 'Examine'), crime: false };
+        const owned = !!a.owner && a.owner !== 'player';
+        return def.take ? { name, primary: owned ? 'Steal' : 'Take', secondary: 'Lift', crime: owned } : { name, primary: 'Lift', crime: false };
+      }
+      case 'tree': return { name, primary: 'Chop', crime: false };
+      case 'ore': return { name, primary: 'Mine', crime: false };
+      case 'rune': return { name, primary: 'Turn', secondary: 'Examine', crime: false };
+      case 'echo': return { name, primary: 'Strike', crime: false };
+      case 'note': return { name, primary: 'Read', crime: false };
+      case 'bell': return { name, primary: this.waveActive ? 'Examine' : 'Ring', crime: false };
+      case 'camp': return { name, primary: 'Rest', crime: false };
+      case 'well': return { name, primary: 'Drink', crime: false };
+      default: return { name, primary: 'Examine', crime: false };
+    }
+  }
+
+  private examineText(a: Actor) {
+    if (a.kind === 'rune') return `The face shows the ${RUNE_NAMES[a.currentRune ?? 0]} sign. Cut low into the base: ${RUNE_NAMES[a.targetRune ?? 0]}.`;
+    if (a.kind === 'villager') return `${a.name}. ${a.profession} of the village. ${a.persona ? impression(a) : ''}`.trim();
+    if (a.kind === 'item' && a.itemType === 'strongbox') return a.locked ? 'Iron bands and a good lock. Slim steel would sing in there.' : (a.loot?.length ? 'Unlocked. Something shifts inside.' : 'Empty but for dust.');
+    if (a.kind === 'item') return ITEMS[a.itemType!].desc;
+    if (a.kind === 'tower' && a.faction === 'wild') return 'Lashed timber and stolen stone. Crude, but it will hold.';
+    return a.desc ?? a.name;
+  }
+
+  /** Primary action (E). Returns true when a conversation was opened. */
+  interact(): boolean {
+    const p = this.player;
+    if (p.hp <= 0 || this.dialogue || (p.action && p.action !== 'land')) return false;
+    if (this.placing) { this.confirmBuild(); return false; }
+    const held = this.held();
+    if (held) { this.release(held, false); return false; }
+    const t = this.focus();
+    if (!t) return false;
+    p.facing = angleTo(p, t);
+    switch (t.kind) {
+      case 'villager': this.openDialogue(t); return true;
+      case 'item':
+        if (t.itemType === 'stool') { this.toggleSit(t); return false; }
+        if (t.itemType === 'strongbox') { if (t.locked) this.attemptLockpick(t); else this.openBox(t); return false; }
+        if (ITEMS[t.itemType!].take) this.takeItem(t); else this.grab(t);
+        return false;
+      case 'tree': case 'ore':
+        p.gatherTarget = t.id;
+        this.startAction(p, 'gather', 0.95);
+        return false;
+      case 'rune':
+        t.currentRune = ((t.currentRune ?? 0) + 1) % RUNE_NAMES.length;
+        t.struckAt = this.elapsed;
+        return false;
+      case 'echo': this.strikeEcho(t); return false;
+      case 'note': this.say(t.text ?? '', undefined, 6); return false;
+      case 'bell':
+        if (this.waveActive) this.say(this.examineText(t));
+        else this.startWave();
+        return false;
+      case 'camp':
+        p.hp = p.maxHp;
+        this.respawn = { x: t.x + t.radius + 1, z: t.z };
+        this.say('You rest a while. You will wake here if you fall.');
+        return false;
+      case 'well':
+        p.hp = Math.min(p.maxHp, p.hp + 5);
+        this.say('The water is cold enough to ache.');
+        return false;
+      default: this.say(this.examineText(t), undefined, 4.5); return false;
+    }
+  }
+
+  private toggleSit(seat: Actor) {
+    const p = this.player;
+    if (p.sittingOn === seat.id) {
+      seat.seatTakenBy = undefined;
+      p.sittingOn = undefined;
+      return;
+    }
+    if (seat.seatTakenBy || seat.carriedBy) { this.say('Taken.'); return; }
+    if (p.sittingOn) this.toggleSit(this.byId(p.sittingOn)!);
+    seat.seatTakenBy = PLAYER_ID;
+    p.sittingOn = seat.id;
+    p.x = seat.x; p.z = seat.z; p.vx = 0; p.vz = 0;
+  }
+
+  private attemptLockpick(box: Actor) {
+    const p = this.player;
+    if (!this.takeFromPackSilent('lockpicks')) { this.say('Locked fast. You would need lockpicks.'); return; }
+    this.addToPack('lockpicks', 1);
+    this.startAction(p, 'pickup', 0.6);
+    const chance = 35 + (p.skills?.lockpick ?? 0) * 0.8 - (box.locked ?? 20);
+    if (this.rng() * 100 < chance) {
+      box.locked = 0;
+      this.say('The lock gives with a soft click.');
+      this.skillXp('lockpick', 8);
+    } else {
+      this.noise(box, 8);
+      if (this.rng() < 0.3) { this.takeFromPackSilent('lockpicks'); this.say('A pick snaps inside the lock.'); }
+      else this.say('The picks scrape and slip. The noise carries.');
+      this.skillXp('lockpick', 3);
+      if (p.sneaking) this.skillXp('stealth', 2);
+    }
+  }
+
+  private takeFromPackSilent(type: ItemType): boolean {
+    if ((this.pack[type] ?? 0) <= 0) return false;
+    return this.takeFromPack(type);
+  }
+
+  private openBox(box: Actor) {
+    if (!box.loot?.length) { this.say('Empty but for dust.'); return; }
+    for (const type of box.loot) {
+      const it = this.spawnItem(type, box.x + (this.rng() - 0.5), box.z + 0.8, 1);
+      it.sleeping = false;
+    }
+    box.loot = [];
+    this.startAction(this.player, 'pickup', 0.35);
+  }
+
+  /** Secondary action (F): lift, set down, or look closely. */
+  secondary() {
+    const p = this.player;
+    if (p.hp <= 0 || this.dialogue || p.action) return;
+    const held = this.held();
+    if (held) { this.release(held, false); return; }
+    const t = this.focus();
+    if (!t) return;
+    if (t.kind === 'item') this.grab(t);
+    else this.say(this.examineText(t), undefined, 4.5);
+  }
+
+  private takeItem(it: Actor) {
+    const def = ITEMS[it.itemType!];
+    const owned = !!it.owner && it.owner !== 'player';
+    if (owned) this.commitCrime('theft', def.value);
+    if (def.stock) this.stock[def.stock] += 2;
+    else if (def.gold) this.stock.gold += def.gold;
+    else this.addToPack(it.itemType!);
+    this.actors = this.actors.filter((a) => a !== it);
+    this.byIdCache.delete(it.id);
+    this.startAction(this.player, 'pickup', 0.38);
+  }
+
+  private grab(it: Actor) {
+    if (it.owner && it.owner !== 'player') {
+      const owner = this.npc(it.owner);
+      if (owner && distance(owner, this.player) < 8 && owner.activity !== 'Sleeping') this.bark(owner, 'Careful with that. It is not yours.');
+    }
+    it.carriedBy = PLAYER_ID;
+    it.sleeping = false;
+    this.startAction(this.player, 'pickup', 0.3);
+  }
+
+  private release(it: Actor, thrown: boolean) {
+    const p = this.player;
+    const def = ITEMS[it.itemType!];
+    it.carriedBy = undefined;
+    it.sleeping = false;
+    const reach = p.radius + def.radius + 0.15;
+    it.x = p.x + Math.sin(p.facing) * reach;
+    it.z = p.z + Math.cos(p.facing) * reach;
+    it.y = p.y + (thrown ? 1.4 : 0.9);
+    if (thrown) {
+      const power = 11 / Math.max(1, def.mass * 0.45);
+      it.vx = Math.sin(p.facing) * power + p.vx * 0.5;
+      it.vz = Math.cos(p.facing) * power + p.vz * 0.5;
+      it.vy = 3.4;
+      it.thrownBy = PLAYER_ID;
+      it.thrownAt = this.elapsed;
+      this.startAction(p, 'throw', 0.35);
+    } else { it.vx = it.vz = it.vy = 0; }
+  }
+
+  throwHeld() { const h = this.held(); if (h && this.player.hp > 0) this.release(h, true); }
+
+  private completeGather(p: Actor) {
+    const node = p.gatherTarget ? this.byId(p.gatherTarget) : undefined;
+    if (!node || !node.alive) return;
+    node.hp -= 1;
+    node.struckAt = this.elapsed;
+    const type: ItemType = node.kind === 'tree' ? 'log' : 'stoneChunk';
+    const pop = () => {
+      const a = this.rng() * Math.PI * 2;
+      const it = this.spawnItem(type, node.x + Math.sin(a) * (node.radius + 0.4), node.z + Math.cos(a) * (node.radius + 0.4), 1.2);
+      it.vx = Math.sin(a) * 2; it.vz = Math.cos(a) * 2; it.vy = 2.5; it.sleeping = false;
+    };
+    pop();
+    if (node.hp <= 0) { pop(); node.alive = false; node.solid = false; this.staticDirty = true; }
+  }
+
+  private strikeEcho(t: Actor) {
+    t.struckAt = this.elapsed;
+    if (!this.quests.echo) this.startQuest('echo', 'sound');
+    if (this.echoSolved) { this.say('The stone hums softly, already at peace.'); return; }
+    const order = [0, 1, 2, 0];
+    if (t.variant === order[this.echoProgress]) {
+      this.echoProgress++;
+      if (this.echoProgress === order.length) {
+        this.echoSolved = true;
+        this.stock.essence += 2;
+        this.stock.gold += 20;
+        const it = this.spawnItem('draught', t.x, t.z + 1.2, 1.5);
+        it.sleeping = false;
+        this.say('The grove answers in a single long chord. Something glints at the base of the stones.');
+      }
+    } else {
+      this.echoProgress = t.variant === 0 ? 1 : 0;
+      this.say('The note sours and fades.');
+    }
+  }
+
+  // ---------------------------------------------------------------- conversation
+  openDialogue(n: Actor) {
+    if (n.memory) n.memory.conversations++;
+    if (n.talkingTo) { const other = this.byId(n.talkingTo); if (other) other.talkingTo = undefined; n.talkingTo = undefined; }
+    if (n.activity === 'Sleeping') n.activity = 'Talking';
+    this.dialogue = { npcId: n.id, line: greetingFor(this, n), options: buildOptions(this, n), shop: false };
+    this.subtitle = null;
+  }
+
+  choose(optionId: string) {
+    const d = this.dialogue;
+    if (!d) return;
+    const n = this.byId(d.npcId);
+    const option = d.options.find((o) => o.id === optionId);
+    if (!n || !option) return;
+    this.skillXp('speech', 1);
+    const reply = option.run(this, n);
+    if (reply.end) { this.dialogue = null; this.say(reply.line, n.name, 5); return; }
+    d.line = reply.line;
+    d.shop = !!reply.shop;
+    d.options = reply.options ?? buildOptions(this, n);
+  }
+
+  closeDialogue() {
+    const d = this.dialogue;
+    if (!d) return;
+    this.dialogue = null;
+    const n = this.byId(d.npcId);
+    if (n && n.profession !== 'Warden') this.say('Light keep you.', n.name, 2);
+  }
+
+  dialogueView(): DialogueView | null {
+    const d = this.dialogue;
+    if (!d) return null;
+    const n = this.byId(d.npcId);
+    return { npcId: d.npcId, speaker: n?.name ?? '', line: d.line, options: d.options.map((o) => ({ id: o.id, text: o.text })), shop: d.shop };
+  }
+
+  private priceMult() {
+    const tobin = this.npc('Tobin');
+    const opinion = tobin?.memory?.opinion ?? 0;
+    const speech = 1 - Math.min(0.15, (this.player.skills?.speech ?? 0) * 0.0015);
+    return clamp(1 - opinion / 200, 0.75, 1.35) * (this.flags.discount ? 0.8 : 1) * (this.flags.ledger === 'exposed' ? 1.2 : 1) * speech;
+  }
+  shopList(): ShopEntry[] {
+    const m = this.priceMult();
+    const list: ShopEntry[] = [
+      { id: 'draught', name: 'Healing draught', price: Math.round(20 * m), detail: 'Honey and copper.' },
+      { id: 'bread', name: 'Loaf of bread', price: Math.round(5 * m), detail: 'Bran baked it this morning.' },
+      { id: 'cheese', name: 'Wheel of cheese', price: Math.round(8 * m), detail: 'Keeps for weeks.' },
+      { id: 'timber', name: 'Timber from the stores', price: Math.round(15 * m), detail: `Three lengths. ${this.citadel.stockWood ?? 0} left.` },
+      { id: 'stone', name: 'Stone from the stores', price: Math.round(12 * m), detail: `Two blocks. ${this.citadel.stockStone ?? 0} left.` },
+    ];
+    if (this.weaponLevel < 2) list.push({ id: 'blade', name: 'Iron blade', price: Math.round(65 * m), detail: "Sera's work. Heavier, keener." });
+    list.push({ id: 'lockpicks', name: 'Lockpicks', price: Math.round(8 * m), detail: 'Slim steel. Ask no questions.' });
+    if ((this.player.armor ?? 0) < 0.25) list.push({ id: 'coat', name: "Warden's coat", price: Math.round(45 * m), detail: 'Boiled leather. Turns a blade, somewhat.' });
+    return list;
+  }
+  buy(id: string): string {
+    const entry = this.shopList().find((e) => e.id === id);
+    if (!entry) return '';
+    if (this.stock.gold < entry.price) return 'You do not have enough crowns.';
+    if (id === 'timber' || id === 'stone') {
+      const key = id === 'timber' ? 'stockWood' : 'stockStone';
+      const amount = id === 'timber' ? 3 : 2;
+      if ((this.citadel[key] ?? 0) < amount) return 'The stores are bare. The workers will fill them again.';
+      this.citadel[key] = (this.citadel[key] ?? 0) - amount;
+      this.stock[id === 'timber' ? 'wood' : 'stone'] += amount;
+    } else if (id === 'blade') { this.weaponLevel = 2; this.player.weapon = 'blade'; }
+    else if (id === 'coat') this.player.armor = 0.25;
+    else this.addToPack(id as ItemType);
+    this.stock.gold -= entry.price;
+    this.skillXp('speech', 2);
+    return `Bought: ${entry.name.toLowerCase()}.`;
+  }
+  sellList(): SellEntry[] {
+    const m = 1 / this.priceMult();
+    const list: SellEntry[] = [];
+    if (this.stock.wood >= 5) list.push({ id: 'timber', name: 'Five timber', price: Math.round(25 * m), count: Math.floor(this.stock.wood / 5) });
+    for (const [type, count] of Object.entries(this.pack) as [ItemType, number][]) {
+      if (!count || type === 'ledger') continue;
+      list.push({ id: type, name: ITEMS[type].name, price: Math.max(1, Math.round(ITEMS[type].value * 0.5 * m)), count });
+    }
+    return list;
+  }
+  sell(id: ItemType | 'timber'): string {
+    const entry = this.sellList().find((e) => e.id === id);
+    if (!entry) return '';
+    if (id === 'timber') {
+      this.stock.wood -= 5;
+      this.citadel.stockWood = Math.min(60, (this.citadel.stockWood ?? 0) + 5);
+    } else this.takeFromPack(id);
+    this.stock.gold += entry.price;
+    return `Sold for ${entry.price} crowns.`;
+  }
+
+  // ---------------------------------------------------------------- villagers
+  private updateVillager(n: Actor, dt: number) {
+    const m = n.memory!, needs = n.needs!;
+    const asleep = n.activity === 'Sleeping';
+    needs.energy = clamp(needs.energy + (asleep ? dt / 70 : -dt / 600), 0, 1);
+    needs.hunger = clamp(needs.hunger + dt / 480, 0, 1);
+    needs.social = clamp(needs.social + dt / 320, 0, 1);
+    needs.fun = clamp(needs.fun + dt / 420, 0, 1);
+    if ((n.homeFood ?? 0) < 2 && this.rng() < dt / 300) n.homeFood = (n.homeFood ?? 0) + 1;
+    n.focus = Math.min(n.maxFocus ?? 60, (n.focus ?? 0) + dt * 3);
+    n.attackCooldown = Math.max(0, (n.attackCooldown ?? 0) - dt);
+    n.workCooldown = Math.max(0, (n.workCooldown ?? 0) - dt);
+    if (n.action) {
+      n.actionT! += dt;
+      if (n.action === 'windup' && n.actionT! >= n.actionDur!) { this.startAction(n, 'strike', 0.32); this.npcStrike(n); }
+      else if (n.actionT! >= n.actionDur!) n.action = undefined;
+      if (n.action === 'hurt') { this.stopMoving(n, dt); return; }
+    }
+    if (this.dialogue?.npcId === n.id) {
+      n.activity = 'Talking';
+      n.lookAt = PLAYER_ID;
+      this.stopMoving(n, dt);
+      this.turnToward(n, angleTo(n, this.player), 6, dt);
+      return;
+    }
+    const p = this.player;
+    const dp = distance(n, p);
+    n.lookAt = !asleep && dp < 5 && p.hp > 0 ? PLAYER_ID : n.talkingTo;
+    if (dp < 3.2 && !asleep && p.hp > 0 && this.elapsed - m.lastGreet > 50 && m.alarmUntil < this.elapsed && !n.talkingTo && n.profession !== 'Warden') {
+      m.lastGreet = this.elapsed;
+      this.bark(n, barkFor(this, n));
+    }
+
+    n.decideIn = (n.decideIn ?? 0) - dt;
+    if (n.decideIn <= 0) { this.vividDecide(n); n.decideIn = 0.8 + this.rng() * 0.5; }
+
+    const warden = n.profession === 'Warden';
+    if (warden && n.quarryId) {
+      const q = this.byId(n.quarryId);
+      if (!q || !q.alive || (q.wantedUntil ?? 0) < this.elapsed) n.quarryId = undefined;
+      else {
+        n.activity = 'Pursuing';
+        const d = this.steer(n, q, 4.3, dt, 1.2);
+        if (d < 1.9) {
+          q.crowns = Math.max(0, (q.crowns ?? 0) - (q.wanted ?? 10));
+          const stall = this.actors.find((a) => a.kind === 'stall');
+          for (const [type, count] of Object.entries(q.stolen ?? {}) as [ItemType, number][]) {
+            if (this.take(q, type, count) && stall) {
+              for (let i = 0; i < count; i++) this.spawnItem(type, stall.x + (this.rng() - 0.5) * 0.8, stall.z + (this.rng() - 0.5) * 0.6, stall.surface ?? 0.9, 'Tobin');
+            }
+          }
+          q.stolen = {};
+          q.wanted = 0; q.wantedUntil = 0; q.utility = undefined; n.quarryId = undefined;
+          this.bark(n, 'The fine is paid, and the goods go back. See that it does not happen again.');
+        }
+        return;
+      }
+    }
+    if (warden && (n.activity === 'Pursuing' || n.activity === 'Fighting')) {
+      n.goal = { x: p.x, z: p.z };
+      const d = this.steer(n, p, n.activity === 'Fighting' ? 4.4 : 4, dt, 1.4);
+      if (d < 1.9) {
+        this.turnToward(n, angleTo(n, p), 8, dt);
+        if (n.activity === 'Fighting' && n.attackCooldown <= 0) {
+          n.attackCooldown = 1.4;
+          this.startAction(n, 'strike', 0.35);
+          this.hurt(p, 9, n.id);
+        } else if (n.activity === 'Pursuing' && this.confrontCooldown <= 0 && !this.dialogue && p.hp > 0) {
+          this.confrontCooldown = 25;
+          this.dialogue = { npcId: n.id, line: `Stop right there. You owe ${Math.ceil(this.bounty)} crowns for what you did. Pay up, or come with me.`, options: confrontOptions(this), shop: false };
+        }
+      }
+      return;
+    }
+    if (n.utility) this.runGoal(n, dt);
+    else this.stopMoving(n, dt);
+  }
+
+  /** Vivid AI: keep a worthwhile goal, otherwise weigh every desire against the moment. */
+  private vividDecide(n: Actor) {
+    const m = n.memory!;
+    if (n.talkingTo) {
+      const other = this.byId(n.talkingTo);
+      if (other && other.talkingTo === n.id && (n.socialUntil ?? 0) > this.elapsed) {
+        n.activity = 'Conversing';
+        n.utility = { kind: 'chat', until: n.socialUntil ?? this.elapsed + 10 };
+        return;
+      }
+      if (other && other.talkingTo === n.id) this.shareRumors(n, other);
+      this.endConversation(n);
+    }
+    if (m.alarmUntil > this.elapsed && n.profession !== 'Warden') {
+      n.utility = { kind: 'flee', until: this.elapsed + 6 };
+      this.endConversation(n);
+      return;
+    }
+    if (n.profession === 'Warden') {
+      const hostile = this.hostileUntil > this.elapsed;
+      const seesPlayer = distance(n, this.player) < (n.activity === 'Pursuing' || n.activity === 'Fighting' ? 22 : 14);
+      if ((this.bounty > 0 || hostile) && seesPlayer && this.player.hp > 0) {
+        n.activity = hostile ? 'Fighting' : 'Pursuing';
+        this.endConversation(n);
+        return;
+      }
+      if (n.activity === 'Pursuing' || n.activity === 'Fighting') n.activity = 'Patrolling';
+      const criminal = this.chars.find((a) => a.kind === 'villager' && a.id !== n.id && (a.wantedUntil ?? 0) > this.elapsed && distance(a, n) < 18);
+      if (criminal) { n.quarryId = criminal.id; return; }
+    }
+    if (n.activity === 'Sleeping' && n.needs!.energy < 0.65 && this.hour() < (n.routine?.wake ?? 6.5)) {
+      n.utility = { kind: 'sleep', until: this.elapsed + 30 };
+      return;
+    }
+    const cur = n.utility;
+    if (cur && cur.until > this.elapsed && this.goalValid(n, cur)) return;
+    if (n.sittingOn && cur?.kind !== 'sit') this.releaseSeat(n);
+    n.utility = chooseGoal(this, n);
+  }
+
+  private goalValid(n: Actor, g: Goal): boolean {
+    const needs = n.needs!;
+    switch (g.kind) {
+      case 'sleep': return needs.energy < 0.92;
+      case 'eatFood': case 'eatHome': case 'buyFood': return needs.hunger > 0.18;
+      case 'steal': { const t = g.targetId ? this.byId(g.targetId) : undefined; return !!t && t.alive && !t.carriedBy && needs.hunger > 0.3; }
+      case 'scavenge': { const t = g.targetId ? this.byId(g.targetId) : undefined; return !!t && t.alive && !t.carriedBy && !t.owner; }
+      case 'sit': {
+        const seat = g.targetId ? this.byId(g.targetId) : undefined;
+        return !!seat && seat.alive && !seat.carriedBy && (!seat.seatTakenBy || seat.seatTakenBy === n.id) && (needs.energy < 0.9 || needs.fun > 0.25);
+      }
+      case 'chat': return needs.social > 0.12 || !!n.talkingTo;
+      case 'work': { const h = this.hour(), r = n.routine!; return h >= r.workStart - 0.3 && h < r.workEnd + 0.3; }
+      case 'stroll': return needs.fun > 0.15;
+      case 'heal': { const t = g.targetId ? this.byId(g.targetId) : undefined; return !!t && t.alive && t.hp < t.maxHp * 0.95; }
+      case 'fight': { const t = g.targetId ? this.byId(g.targetId) : undefined; return !!t && t.alive && distance(t, n) < 16; }
+      case 'flee': { const t = g.targetId ? this.byId(g.targetId) : undefined; return !!t && t.alive && distance(t, n) < 14; }
+      case 'investigate': return true;
+      default: return false;
+    }
+  }
+
+  private releaseSeat(n: Actor) {
+    if (!n.sittingOn) return;
+    const seat = this.byId(n.sittingOn);
+    if (seat && seat.seatTakenBy === n.id) seat.seatTakenBy = undefined;
+    n.sittingOn = undefined;
+  }
+
+  /** Execute the current goal: steer, arrive, act. Goals resolve their own targets as the world changes. */
+  private runGoal(n: Actor, dt: number) {
+    const g = n.utility!;
+    const needs = n.needs!;
+    const go = (pt: Point, speed: number, stop: number) => this.steer(n, pt, speed, dt, stop);
+    switch (g.kind) {
+      case 'sleep': {
+        const d = go(n.home!, 1.7, 0.5);
+        n.activity = d <= 0.9 ? 'Sleeping' : 'Heading home';
+        break;
+      }
+      case 'eatFood': case 'eatHome': {
+        if (g.kind === 'eatHome' && go(n.home!, 1.4, 0.6) > 1) { n.activity = 'Heading home'; break; }
+        n.activity = 'Eating';
+        this.stopMoving(n, dt);
+        needs.hunger = Math.max(0, needs.hunger - dt * 0.055);
+        if (needs.hunger <= 0.22) {
+          if (g.kind === 'eatFood') { const f = this.firstFood(n); if (f) this.take(n, f); }
+          else n.homeFood = Math.max(0, (n.homeFood ?? 1) - 1);
+          n.utility = undefined;
+        }
+        break;
+      }
+      case 'buyFood': {
+        const stall = this.actors.find((a) => a.kind === 'stall')!;
+        const d = go({ x: stall.x, z: stall.z + 1.7 }, 1.5, 0.4);
+        n.activity = 'Buying';
+        if (d <= 0.8) {
+          if ((n.crowns ?? 0) >= 5) {
+            n.crowns! -= 5;
+            const tobin = this.npc('Tobin');
+            if (tobin) tobin.crowns = (tobin.crowns ?? 0) + 5;
+            this.give(n, 'bread');
+            n.utility = { kind: 'eatFood', until: this.elapsed + 25 };
+          } else n.utility = undefined;
+        }
+        break;
+      }
+      case 'steal': {
+        const t = g.targetId ? this.byId(g.targetId) : undefined;
+        if (!t || !t.alive || t.carriedBy) { n.utility = undefined; break; }
+        n.activity = 'Sneaking';
+        const d = go(t, 2.3, t.radius + 0.9);
+        if (d > t.radius + 1.7) break;
+        this.stopMoving(n, dt);
+        const seen = this.seenByOthers(t, n);
+        if (t.itemType === 'strongbox') {
+          const chance = 30 + (n.skills?.lockpick ?? 0) * 0.8 - (t.locked ?? 20);
+          if (seen.length === 0 && this.rng() * 100 < chance) {
+            t.locked = 0; t.loot = [];
+            n.crowns = (n.crowns ?? 0) + 12;
+            if (n.skills) n.skills.lockpick += 4;
+          } else if (seen.length) this.caughtStealing(n, seen);
+          n.utility = undefined;
+          break;
+        }
+        if (seen.length) { this.caughtStealing(n, seen); break; }
+        this.actors = this.actors.filter((a) => a !== t);
+        this.byIdCache.delete(t.id);
+        this.give(n, t.itemType!, 1, !!t.owner);
+        if (n.skills) n.skills.stealth += 3;
+        n.utility = { kind: 'eatFood', until: this.elapsed + 25 };
+        break;
+      }
+      case 'sit': {
+        const seat = g.targetId ? this.byId(g.targetId) : undefined;
+        if (!seat || !seat.alive || seat.carriedBy || (seat.seatTakenBy && seat.seatTakenBy !== n.id)) {
+          // Someone took the seat, or it was carried off: choose again rather than stand stuck.
+          this.releaseSeat(n);
+          n.utility = undefined;
+          break;
+        }
+        if (n.sittingOn === seat.id) {
+          n.activity = 'Sitting';
+          n.x = seat.x; n.z = seat.z; n.vx = 0; n.vz = 0;
+          needs.energy = clamp(needs.energy + dt / 260, 0, 1);
+          needs.fun = Math.max(0, needs.fun - dt / 320);
+          const near = this.chars.find((c) => c.kind === 'villager' && c !== n && Math.abs(c.x - n.x) + Math.abs(c.z - n.z) < 3.4);
+          if (near) this.turnToward(n, angleTo(n, near), 3, dt);
+          break;
+        }
+        n.activity = 'Strolling';
+        if (go(seat, 1.4, 0.15) <= 1.1) {
+          this.releaseSeat(n);
+          seat.seatTakenBy = n.id;
+          n.sittingOn = seat.id;
+          n.x = seat.x; n.z = seat.z;
+          n.activity = 'Sitting';
+        }
+        break;
+      }
+      case 'chat': {
+        if (n.talkingTo) {
+          const other = this.byId(n.talkingTo);
+          if (other && other.talkingTo === n.id) {
+            const d = go(other, 1.3, 0.85);
+            n.activity = 'Conversing';
+            if (d <= 1.4) { this.stopMoving(n, dt); this.turnToward(n, angleTo(n, other), 4, dt); needs.social = Math.max(0, needs.social - dt * 0.03); }
+            break;
+          }
+          this.endConversation(n);
+        }
+        const partner = this.actors.find((o) => o !== n && o.kind === 'villager' && o.alive && !o.talkingTo && o.profession !== 'Warden' &&
+          o.activity !== 'Sleeping' && o.activity !== 'Talking' && (o.needs?.social ?? 0) > 0.2 && distance(o, n) < 10 && this.dialogue?.npcId !== o.id);
+        if (partner) {
+          n.talkingTo = partner.id; partner.talkingTo = n.id;
+          n.socialUntil = partner.socialUntil = this.elapsed + 14 + this.rng() * 8;
+          n.activity = partner.activity = 'Conversing';
+        } else {
+          go(n.social!, 1.3, 0.6);
+          n.activity = 'Conversing';
+        }
+        break;
+      }
+      case 'work': {
+        if (n.profession === 'Warden' && n.patrol) {
+          const tgt = n.patrol[n.patrolIndex ?? 0];
+          if (distance(n, tgt) < 1.2) n.patrolIndex = ((n.patrolIndex ?? 0) + 1) % n.patrol.length;
+          go(n.patrol[n.patrolIndex ?? 0], 1.5, 0.6);
+          n.activity = 'Patrolling';
+          break;
+        }
+        let spot = n.work!;
+        const blocker = this.chars.find((c) => c !== n && c.hp > 0 && distance(c, n.work!) < 0.9 && (c.kind === 'player' || c.sittingOn || (c.kind === 'villager' && c.activity !== 'Strolling')));
+        if (blocker) {
+          const a = angleTo(blocker, n) || n.variant;
+          spot = { x: n.work!.x + Math.sin(a) * 1.6, z: n.work!.z + Math.cos(a) * 1.6 };
+          if (blocker.kind === 'player' && (n.workCooldown ?? 0) <= 0 && distance(n, this.player) < 4) {
+            this.bark(n, (n.persona?.temper ?? 0.5) < 0.35 ? 'You are in my way.' : 'Mind yourself, I need that spot.');
+            n.workCooldown = 20;
+          }
+        }
+        const d = go(spot, 1.35, 0.7);
+        n.activity = WORK_ACTIVITY[n.profession ?? ''] ?? 'Working';
+        if (d <= 1.1) {
+          this.stopMoving(n, dt);
+          if (n.activity === 'Chopping' && this.rng() < dt / 22) this.citadel.stockWood = Math.min(60, (this.citadel.stockWood ?? 0) + 1);
+          if (n.activity === 'Masonry' && this.rng() < dt / 26) this.citadel.stockStone = Math.min(60, (this.citadel.stockStone ?? 0) + 1);
+        }
+        break;
+      }
+      case 'scavenge': {
+        const t = g.targetId ? this.byId(g.targetId) : undefined;
+        if (!t || !t.alive || t.carriedBy || t.owner) { n.utility = undefined; break; }
+        n.activity = 'Strolling';
+        const d = go(t, 1.6, t.radius + 0.4);
+        if (d > t.radius + 0.9) break;
+        this.actors = this.actors.filter((a) => a !== t);
+        this.byIdCache.delete(t.id);
+        if (t.itemType === 'pouch') n.crowns = (n.crowns ?? 0) + 12; else this.give(n, t.itemType!);
+        this.startAction(n, 'pickup', 0.38);
+        n.utility = undefined;
+        break;
+      }
+      case 'stroll': {
+        const pt = g.point ?? n.routine!.haunt;
+        const d = go(pt, 1.2, 0.8);
+        n.activity = d <= 1.2 ? 'Watching' : 'Strolling';
+        if (d <= 1.2) { this.stopMoving(n, dt); needs.fun = Math.max(0, needs.fun - dt * 0.045); }
+        break;
+      }
+      case 'heal': {
+        const t = g.targetId ? this.byId(g.targetId) : undefined;
+        if (!t || !t.alive || t.hp >= t.maxHp) { n.utility = undefined; break; }
+        const d = go(t, 1.7, 4);
+        n.activity = 'Tending';
+        if (d <= 6.5) {
+          this.stopMoving(n, dt);
+          this.turnToward(n, angleTo(n, t), 5, dt);
+          if ((n.workCooldown ?? 0) <= 0) { this.castMending(n); n.workCooldown = 2.5; }
+        }
+        break;
+      }
+      case 'fight': {
+        const t = g.targetId ? this.byId(g.targetId) : undefined;
+        if (!t || !t.alive) { n.utility = undefined; break; }
+        const reach = 1.15 + t.radius;
+        const d = go(t, 3.4, reach * 0.8);
+        n.activity = 'Fighting';
+        if (d <= reach + 0.35) {
+          this.turnToward(n, angleTo(n, t), 7, dt);
+          this.stopMoving(n, dt);
+          if ((n.attackCooldown ?? 0) <= 0 && !n.action) {
+            n.targetId = t.id;
+            n.attackCooldown = 1.35;
+            this.startAction(n, 'windup', 0.45);
+          }
+        }
+        break;
+      }
+      case 'flee': {
+        const threat = g.targetId ? this.byId(g.targetId) : undefined;
+        const away = threat && distance(threat, n) < 10 ? { x: n.x + (n.x - threat.x) * 2, z: n.z + (n.z - threat.z) * 2 } : n.home!;
+        go(away, 3.9, 0.4);
+        n.activity = 'Fleeing';
+        break;
+      }
+      case 'investigate': {
+        const d = go(g.point ?? n.social!, 1.8, 0.8);
+        n.activity = d <= 1.2 ? 'Watching' : 'Investigating';
+        if (d <= 1.2) this.stopMoving(n, dt);
+        break;
+      }
+      default: {
+        go(n.social!, 1.2, 0.8);
+        n.activity = 'Idle';
+      }
+    }
+  }
+
+  /** Who can see this spot, allowing for a thief who knows how to move quietly. */
+  private seenByOthers(at: Point, thief: Actor): Actor[] {
+    const stealth = thief.skills?.stealth ?? 0;
+    const radius = 4.2 + (1 - Math.min(1, stealth / 100)) * 4.5;
+    const seen: Actor[] = [];
+    for (const o of this.chars) {
+      if (o === thief || !o.alive || o.hp <= 0) continue;
+      if (o.kind !== 'villager' && o.kind !== 'player') continue;
+      if (o.kind === 'villager' && o.activity === 'Sleeping') continue;
+      const d = distance(o, at);
+      if (d > radius) continue;
+      if (d < 3 || Math.abs(angleDelta(o.facing, angleTo(o, at))) < 1.9) seen.push(o);
+    }
+    return seen;
+  }
+
+  private caughtStealing(n: Actor, seen: Actor[]) {
+    const witness = seen.find((o) => o.kind === 'villager') ?? seen[0];
+    this.say('Thief! Wardens!', witness.name, 3);
+    n.wanted = 12;
+    n.wantedUntil = this.elapsed + 150;
+    for (const o of seen) if (o.kind === 'villager' && o.memory) { this.addRumor(o, `thief:${n.name}`); this.adjustOpinion(o, -15); }
+    n.utility = { kind: 'flee', targetId: witness.id, until: this.elapsed + 10 };
+  }
+
+  /** A villager's blow, resolved when their wind-up completes. Uses the same melee rules as foes. */
+  private npcStrike(n: Actor) {
+    const t = n.targetId ? this.byId(n.targetId) : undefined;
+    if (!t || !t.alive || t.kind !== 'foe') return;
+    if (distance(n, t) > 1.3 + WEAPONS[n.weapon ?? 'fists'].reach + t.radius) return;
+    this.hurt(t, this.meleeDamage(n), n.id);
+    if (n.skills) n.skills.blade = Math.min(100, n.skills.blade + 1.5);
+    t.targetId = n.id;
+    this.alertFoe(t, n);
+  }
+
+  /** Sounds carry. Curious villagers come and look; wardens come faster. */
+  noise(at: Point, radius = 7) {
+    for (const n of this.chars) {
+      if (n.kind !== 'villager' || !n.alive || n.activity === 'Sleeping' || n.activity === 'Fleeing') continue;
+      if (distance(n, at) > radius) continue;
+      if (n.profession === 'Warden' || (n.persona?.courage ?? 0) > 0.35) {
+        n.utility = { kind: 'investigate', point: { x: at.x, z: at.z }, until: this.elapsed + 16 };
+        n.decideIn = Math.min(n.decideIn ?? 0, 2.5);
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- spells & skills (shared by everyone)
+  skillXp(kind: SkillKind, amount: number) {
+    const p = this.player;
+    if (!p.skills) return;
+    const before = Math.floor(p.skills[kind] / 25);
+    p.skills[kind] = Math.min(100, p.skills[kind] + amount);
+    if (Math.floor(p.skills[kind] / 25) > before) this.notify(`Your ${kind} skill improves.`);
+  }
+
+  castMending(caster: Actor): boolean {
+    if ((caster.focus ?? 0) < SPELLS.mending.cost) return false;
+    let target: Actor | undefined, worst = 1;
+    for (const a of this.actors) {
+      if (!a.alive || a.hp <= 0) continue;
+      const ally = caster.faction === 'wild' ? a.kind === 'foe' : a.kind === 'villager' || a.kind === 'player';
+      if (!ally || distance(a, caster) > SPELLS.mending.range) continue;
+      const f = a.hp / a.maxHp;
+      if (f < worst) { worst = f; target = a; }
+    }
+    if (!target || worst >= 1) return false;
+    caster.focus! -= SPELLS.mending.cost;
+    target.hp = Math.min(target.maxHp, target.hp + SPELLS.mending.power * (1 + (caster.skills?.magic ?? 0) / 100));
+    caster.shotAt = this.elapsed; caster.shotX = target.x; caster.shotZ = target.z;
+    this.startAction(caster, 'strike', 0.35);
+    if (caster.kind === 'player') this.skillXp('magic', 6);
+    return true;
+  }
+
+  castBolt(caster: Actor, target?: Actor): boolean {
+    if ((caster.focus ?? 0) < SPELLS.bolt.cost) return false;
+    let t = target;
+    if (!t || !t.alive) {
+      let bd = SPELLS.bolt.range;
+      for (const a of this.actors) {
+        if (!a.alive || a.hp <= 0) continue;
+        const hostile = caster.faction === 'wild' ? a.kind === 'player' : a.kind === 'foe';
+        if (!hostile) continue;
+        const d = distance(a, caster);
+        if (d < bd) { bd = d; t = a; }
+      }
+    }
+    if (!t) return false;
+    caster.focus! -= SPELLS.bolt.cost;
+    caster.facing = angleTo(caster, t);
+    caster.shotAt = this.elapsed; caster.shotX = t.x; caster.shotZ = t.z;
+    this.startAction(caster, 'strike', 0.3);
+    this.hurt(t, SPELLS.bolt.power * (1 + (caster.skills?.magic ?? 0) / 120), caster.id);
+    if (t.kind === 'foe') this.alertFoe(t, caster);
+    if (caster.kind === 'player') this.skillXp('magic', 5);
+    return true;
+  }
+
+  /** The guardian casts with the same rules, focus and skills as any villager mage. */
+  castSpell(id: SpellId) {
+    const p = this.player;
+    if (!p.spells?.includes(id) || p.hp <= 0 || this.dialogue) return;
+    if (id === 'mending') { if (!this.castMending(p)) this.say('The verse will not come. Either you are unhurt, or your focus is spent.'); }
+    else if (!this.castBolt(p)) this.say('No foe within reach of the spark.');
+  }
+
+  toggleSneak() {
+    const p = this.player;
+    if (p.hp <= 0 || p.sittingOn) return;
+    p.sneaking = !p.sneaking;
+  }
+
+  private endConversation(n: Actor) {
+    if (!n.talkingTo) return;
+    const other = this.byId(n.talkingTo);
+    if (other && other.talkingTo === n.id) { other.talkingTo = undefined; if (other.activity === 'Conversing') other.activity = 'Strolling'; }
+    n.talkingTo = undefined;
+  }
+
+  /** Word travels: whatever one villager knows about the guardian, the other now knows too. */
+  private shareRumors(a: Actor, b: Actor) {
+    const exchange = (from: Actor, to: Actor) => {
+      for (const r of from.memory!.rumors) {
+        if (to.memory!.rumors.includes(r)) continue;
+        to.memory!.rumors.push(r);
+        this.adjustOpinion(to, r === 'crime' ? -8 : r === 'helped' ? 6 : 0);
+      }
+    };
+    exchange(a, b); exchange(b, a);
+    a.memory!.conversations++; b.memory!.conversations++;
+    a.needs!.social = 0; b.needs!.social = 0;
+  }
+
+  // ---------------------------------------------------------------- the wilds
+  private updateFoe(f: Actor, dt: number) {
+    const def = FOES[f.foeKind!];
+    f.attackCooldown = Math.max(0, (f.attackCooldown ?? 0) - dt);
+    f.workCooldown = Math.max(0, (f.workCooldown ?? 0) - dt);
+    if (f.action) {
+      f.actionT! += dt;
+      if (f.action === 'windup') {
+        const t = f.targetId ? this.byId(f.targetId) : undefined;
+        if (t) this.turnToward(f, angleTo(f, t), 3, dt);
+        if (f.actionT! >= f.actionDur!) { this.startAction(f, 'strike', 0.32); this.foeStrike(f); }
+      } else if (f.actionT! >= f.actionDur!) f.action = undefined;
+      if (f.action) { this.stopMoving(f, dt); return; }
+    }
+    if (f.foeKind === 'wisp' && f.workCooldown <= 0) {
+      const ally = this.chars.find((a) => a.kind === 'foe' && a !== f && a.hp < a.maxHp * 0.8 && distance(a, f) < 6);
+      if (ally) { ally.hp = Math.min(ally.maxHp, ally.hp + 14); f.workCooldown = 3; }
+    }
+    const p = this.player;
+    const dp = distance(f, p);
+    const sees = p.hp > 0 && (dp < (p.sneaking ? 4.5 : 8) || (dp < (p.sneaking ? 8 : 15) && Math.abs(angleDelta(f.facing, angleTo(f, p))) < 1.1));
+    if (sees && f.intent !== 'chase' && f.intent !== 'flee') this.alertFoe(f, p);
+    if (sees) { f.lastKnown = { x: p.x, z: p.z }; f.lostFor = 0; }
+    if (f.hp < f.maxHp * 0.3 && def.courage < 0.5 && dp < 12) f.intent = 'flee';
+
+    if (f.intent === 'flee') {
+      const away = { x: f.x + (f.x - p.x), z: f.z + (f.z - p.z) };
+      this.steer(f, away, def.speed * 1.1, dt);
+      if (dp > 20) f.intent = 'return';
+      return;
+    }
+    if (f.intent === 'chase' || f.intent === 'raid') {
+      if (f.intent === 'chase' && !sees) {
+        f.lostFor = (f.lostFor ?? 0) + dt;
+        if ((f.lostFor ?? 0) > 3) { f.intent = 'search'; return; }
+      }
+      let target: Actor = p;
+      const quarry = f.targetId ? this.byId(f.targetId) : undefined;
+      if (quarry && quarry.alive && quarry.kind === 'villager' && distance(quarry, f) < 9) target = quarry;
+      if (f.intent === 'raid' && (!sees || dp > 6)) {
+        target = this.actors.find((a) => a.alive && a.faction === 'citadel' && (a.kind === 'tower' || a.kind === 'barricade' || a.kind === 'camp') && distance(a, f) < 6) ?? this.citadel;
+      }
+      if (target === p && p.hp <= 0) { f.intent = f.intent === 'raid' ? 'raid' : 'return'; return; }
+      const reach = def.reach + target.radius;
+      const d = distance(f, target);
+      if (f.foeKind === 'wisp' && d > reach && d < 10 && f.workCooldown <= 0) {
+        f.workCooldown = 3.2;
+        f.focus = 99; f.maxFocus = 99;
+        this.castBolt(f, target);
+        return;
+      }
+      if (d <= reach) {
+        this.turnToward(f, angleTo(f, target), 6, dt);
+        this.stopMoving(f, dt);
+        if (f.attackCooldown <= 0) {
+          f.targetId = target.id;
+          f.attackCooldown = def.windup + 1.1;
+          this.startAction(f, 'windup', def.windup);
+        }
+      } else this.steer(f, target, def.speed, dt, reach * 0.9);
+      return;
+    }
+    if (f.intent === 'search') {
+      const tgt = f.lastKnown ?? this.camp;
+      const d = this.steer(f, tgt, def.speed * 0.8, dt, 1);
+      f.lostFor = (f.lostFor ?? 0) + dt;
+      if (d < 1.2 || (f.lostFor ?? 0) > 9) f.intent = 'return';
+      return;
+    }
+    // Forage and return: workers decide from their own load and the camp's needs.
+    const camp = this.actors.filter((a) => a.kind === 'camp' && a.faction === 'wild' && a.alive).sort((a, b) => distance(a, f) - distance(b, f))[0];
+    if (!camp) { this.stopMoving(f, dt); return; }
+    const load = (f.carriedWood ?? 0) + (f.carriedStone ?? 0);
+    if (load >= 3 || f.intent === 'return') {
+      f.intent = 'return';
+      if (distance(f, camp) <= camp.radius + f.radius + 1) {
+        camp.stockWood = (camp.stockWood ?? 0) + (f.carriedWood ?? 0);
+        camp.stockStone = (camp.stockStone ?? 0) + (f.carriedStone ?? 0);
+        f.carriedWood = 0; f.carriedStone = 0; f.intent = 'forage'; f.targetId = undefined;
+      } else this.steer(f, camp, def.speed * 0.75, dt, camp.radius + f.radius + 0.5);
+      return;
+    }
+    let node = f.targetId ? this.byId(f.targetId) : undefined;
+    if (!node || !node.alive || (node.kind !== 'tree' && node.kind !== 'ore')) {
+      const want = (camp.stockWood ?? 0) < (camp.stockStone ?? 0) * 1.5 + 3 ? 'tree' : 'ore';
+      node = undefined;
+      let best = Infinity;
+      for (const a of this.solidGrid.query(camp.x, camp.z, 26, this.qa)) {
+        if (!a.alive || a.kind !== want) continue;
+        const d = distance(a, f);
+        if (d < best && distance(a, camp) < 26) { best = d; node = a; }
+      }
+      f.targetId = node?.id;
+    }
+    if (!node) { this.stopMoving(f, dt); return; }
+    const reach = f.radius + node.radius + 0.8;
+    if (distance(f, node) > reach) this.steer(f, node, def.speed * 0.65, dt, reach - 0.2);
+    else {
+      this.stopMoving(f, dt);
+      this.turnToward(f, angleTo(f, node), 5, dt);
+      if (f.workCooldown <= 0) {
+        f.workCooldown = 2.8;
+        this.startAction(f, 'strike', 0.32);
+        if (node.kind === 'tree') f.carriedWood = (f.carriedWood ?? 0) + 1; else f.carriedStone = (f.carriedStone ?? 0) + 1;
+        node.hp = Math.max(0, node.hp - 0.25);
+        node.struckAt = this.elapsed;
+        if (node.hp === 0) { node.alive = false; node.solid = false; this.staticDirty = true; }
+      }
+    }
+  }
+
+  private foeStrike(f: Actor) {
+    const def = FOES[f.foeKind!];
+    const t = f.targetId ? this.byId(f.targetId) : undefined;
+    if (!t || !t.alive) return;
+    const dmg = def.damage * (1 + ((f.weaponLevel ?? 1) - 1) * 0.3);
+    if (t.kind === 'player') {
+      if (distance(f, t) > def.reach + t.radius + 0.5) return;
+      if (Math.abs(angleDelta(f.facing, angleTo(f, t))) > 1.2) return;
+      this.hurt(t, dmg, f.id);
+      if (this.elapsed >= this.invulnUntil) {
+        const a = angleTo(f, t);
+        t.vx += Math.sin(a) * 5; t.vz += Math.cos(a) * 5;
+      }
+    } else this.hurt(t, dmg, f.id);
+  }
+
+  private updateCamps() {
+    for (const camp of this.actors.filter((a) => a.alive && a.kind === 'camp' && a.faction === 'wild')) {
+      const wood = camp.stockWood ?? 0, stone = camp.stockStone ?? 0;
+      const guards = this.actors.filter((a) => a.alive && a.kind === 'tower' && a.faction === 'wild' && distance(a, camp) < 12).length;
+      if (wood >= 5 && stone >= 3 && guards < 2) {
+        const spot = this.findBuildSpot(camp, 5, 10, 1.4);
+        if (spot) {
+          camp.stockWood = wood - 5; camp.stockStone = stone - 3;
+          this.add('tower', 'Wild watchtower', spot.x, spot.z, { faction: 'wild', structure: 'archer', radius: 1.35, height: 5, hp: 180, maxHp: 180, attackCooldown: 0 });
+          continue;
+        }
+      }
+      if (wood >= 2 && stone >= 2) {
+        const worker = this.chars.find((a) => a.kind === 'foe' && distance(a, camp) < 8 && (a.weaponLevel ?? 1) < 2);
+        if (worker) { worker.weaponLevel = 2; camp.stockWood = wood - 2; camp.stockStone = stone - 2; continue; }
+      }
+      if (wood >= 12 && stone >= 8 && this.wildCampCount() < 2) {
+        const spot = this.findBuildSpot({ x: camp.x + 16, z: camp.z - 10 }, 3, 9, 2.5);
+        if (spot) {
+          camp.stockWood = wood - 12; camp.stockStone = stone - 8;
+          this.add('camp', 'Wild outpost', spot.x, spot.z, { faction: 'wild', radius: 2.4, height: 4, hp: 220, maxHp: 220, stockWood: 0, stockStone: 0, desc: 'A newer camp. The wilds are spreading.' });
+        }
+      }
+    }
+  }
+
+  private updateTower(t: Actor, dt: number) {
+    t.attackCooldown = Math.max(0, (t.attackCooldown ?? 0) - dt);
+    if (t.attackCooldown > 0) return;
+    if (t.structure === 'ward' && t.faction === 'citadel') {
+      t.attackCooldown = 2;
+      for (const a of this.actors) if (a.alive && a.faction === 'citadel' && (a.kind === 'citadel' || a.kind === 'tower') && distance(a, t) < 12) a.hp = Math.min(a.maxHp, a.hp + 3);
+      return;
+    }
+    let target: Actor | undefined, best = 12;
+    for (const a of this.chars) {
+      if (a.hp <= 0 || (t.faction === 'citadel' ? a.kind !== 'foe' : a.kind !== 'player')) continue;
+      const d = distance(a, t);
+      if (d < best) { best = d; target = a; }
+    }
+    if (!target) return;
+    t.attackCooldown = 1.1;
+    t.facing = angleTo(t, target);
+    t.shotAt = this.elapsed; t.shotX = target.x; t.shotZ = target.z;
+    this.hurt(target, t.faction === 'wild' ? 9 : 22, t.id);
+  }
+
+  // ---------------------------------------------------------------- building & waves
+  private validBuild(point: Point, radius: number) {
+    if (Math.abs(point.x) > WORLD_LIMIT - radius || Math.abs(point.z) > WORLD_LIMIT - radius) return false;
+    for (const a of this.solidGrid.query(point.x, point.z, radius + 4, this.qa)) if (a.alive && a.solid && distance(a, point) < a.radius + radius + 0.3) return false;
+    return !this.chars.some((c) => distance(c, point) < c.radius + radius);
+  }
+  private findBuildSpot(origin: Point, start: number, end: number, radius: number): Point | null {
+    for (let r = start; r <= end; r += 1) for (let i = 0; i < 16; i++) {
+      const a = (i * Math.PI) / 8;
+      const p = { x: origin.x + Math.cos(a) * r, z: origin.z + Math.sin(a) * r };
+      if (this.validBuild(p, radius)) return p;
+    }
+    return null;
+  }
+  buildPreview(): { point: Point; valid: boolean; affordable: boolean } | null {
+    if (!this.placing) return null;
+    const def = BUILDINGS[this.placing];
+    const p = this.player;
+    const d = p.radius + def.radius + 1.2;
+    const point = { x: p.x + Math.sin(p.facing) * d, z: p.z + Math.cos(p.facing) * d };
+    return { point, valid: this.validBuild(point, def.radius), affordable: this.stock.wood >= def.wood && this.stock.stone >= def.stone && this.stock.gold >= def.gold };
+  }
+  confirmBuild() {
+    const preview = this.buildPreview();
+    if (!preview || !this.placing) return false;
+    if (!preview.affordable) { const b = BUILDINGS[this.placing]; this.say(`I need ${b.wood} timber, ${b.stone} stone and ${b.gold} crowns for that.`); return false; }
+    if (!preview.valid) { this.say('Not enough room there.'); return false; }
+    const ok = this.build(this.placing, preview.point);
+    if (ok) this.placing = null;
+    return ok;
+  }
+  build(kind: StructureKind, point: Point) {
+    const def = BUILDINGS[kind];
+    if (this.stock.wood < def.wood || this.stock.stone < def.stone || this.stock.gold < def.gold || !this.validBuild(point, def.radius)) return false;
+    this.stock.wood -= def.wood; this.stock.stone -= def.stone; this.stock.gold -= def.gold;
+    const hp = kind === 'barricade' ? 260 : kind === 'outpost' ? 240 : 180;
+    this.add(kind === 'barricade' ? 'barricade' : kind === 'outpost' ? 'camp' : 'tower', def.name, point.x, point.z, {
+      faction: 'citadel', structure: kind, radius: def.radius, height: kind === 'barricade' ? 1.3 : kind === 'outpost' ? 3 : 5,
+      hp, maxHp: hp, attackCooldown: 0, desc: def.description,
+    });
+    return true;
+  }
+  startWave() {
+    if (this.waveActive || this.player.hp <= 0 || this.citadel.hp <= 0) return;
+    if (this.wildCampCount() === 0) { this.say('The bell rings out over an empty valley. No one answers.'); return; }
+    this.wave++;
+    this.spawnQueue = 3 + this.wave * 2;
+    this.spawnTimer = 2;
+    this.waveActive = true;
+    this.cameraEvents.push({ target: { x: this.camp.x, z: this.camp.z }, duration: 3.2 });
+    this.say('The bell carries south. Somewhere past the watch post, something answers.', undefined, 5);
+  }
+
+  respawnAtCitadel() {
+    const p = this.player;
+    p.x = 0; p.z = 4; p.vx = p.vz = 0;
+    this.hostileUntil = 0;
+  }
+
+  recover() {
+    const p = this.player;
+    p.hp = p.maxHp;
+    p.x = this.respawn.x; p.z = this.respawn.z; p.y = 0; p.vx = p.vz = p.vy = 0;
+    p.action = undefined;
+    this.stock.gold = Math.floor(this.stock.gold * 0.9);
+    this.hostileUntil = 0;
+    if (this.citadel.hp <= 0) this.citadel.hp = Math.floor(this.citadel.maxHp * 0.5);
+    for (const a of this.actors) if (a.kind === 'foe' && a.intent === 'raid') { a.alive = false; a.solid = false; }
+    this.waveActive = false; this.spawnQueue = 0;
+    this.say('You wake, aching, with a lighter purse.');
+  }
+
+  // ---------------------------------------------------------------- views
+  hud(): HudView {
+    const p = this.player;
+    const h = this.hour();
+    const held = this.held();
+    let prompt: Prompt | null = null;
+    if (!this.dialogue && !this.placing && p.hp > 0) {
+      if (held) prompt = { name: held.name, primary: 'Set down', secondary: 'Throw', crime: false };
+      else { const f = this.focus(); if (f) prompt = this.verb(f); }
+    }
+    const target = this.targetId && this.targetUntil > this.elapsed ? this.byId(this.targetId) : undefined;
+    const hh = Math.floor(h), mm = Math.floor(((h % 1) * 60) / 10) * 10;
+    return {
+      hp: Math.ceil(p.hp), maxHp: p.maxHp, stamina: Math.round(this.stamina), maxStamina: this.maxStamina,
+      combat: this.combatUntil > this.elapsed || this.waveActive || this.hostileUntil > this.elapsed,
+      prompt,
+      subtitle: this.subtitle ? { speaker: this.subtitle.speaker, text: this.subtitle.text } : null,
+      notice: this.notice.until > this.elapsed ? this.notice.text : '',
+      target: target && target.alive ? { name: target.name, hp: Math.ceil(target.hp), maxHp: target.maxHp } : null,
+      marker: this.questTarget(),
+      citadel: { x: this.citadel.x, z: this.citadel.z },
+      player: { x: p.x, z: p.z },
+      wave: this.wave, waveActive: this.waveActive,
+      waveEnemies: this.spawnQueue + this.chars.filter((a) => a.kind === 'foe' && a.intent === 'raid').length,
+      bounty: Math.ceil(this.bounty), defeated: p.hp <= 0,
+      dialogue: this.dialogueView(),
+      time: `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`,
+      day: Math.floor((8 + this.elapsed / 30) / 24) + 1,
+      holding: held ? held.name : null,
+      placing: this.placing,
+      focus: Math.floor(p.focus ?? 0), maxFocus: p.maxFocus ?? 0, spellsKnown: p.spells?.length ?? 0, sneaking: !!p.sneaking,
+    };
+  }
+
+  snapshot(): WorldSave {
+    return JSON.parse(JSON.stringify({
+      version: SAVE_VERSION, seed: this.seed, actors: this.actors, stock: this.stock, pack: this.pack, elapsed: this.elapsed,
+      level: this.level, xp: this.xp, weaponLevel: this.weaponLevel, flags: this.flags, quests: this.quests, tracked: this.tracked,
+      wave: this.wave, waveCleared: this.waveCleared, bounty: this.bounty, standing: this.standing, nextId: this.nextId,
+      echoProgress: this.echoProgress, echoSolved: this.echoSolved, respawn: this.respawn,
+    })) as WorldSave;
+  }
+
+  private restore(s: WorldSave) {
+    if (!s.actors.some((a) => a.id === PLAYER_ID) || !s.actors.some((a) => a.id === CITADEL_ID)) return;
+    this.actors = s.actors;
+    this.stock = { ...this.stock, ...s.stock };
+    this.pack = { ...s.pack };
+    this.elapsed = s.elapsed; this.level = s.level; this.xp = s.xp; this.weaponLevel = s.weaponLevel;
+    this.flags = { ...s.flags };
+    this.quests = s.quests && s.quests.light ? s.quests : this.quests;
+    this.tracked = s.tracked && this.quests[s.tracked] ? s.tracked : 'light';
+    this.wave = s.wave; this.waveCleared = s.waveCleared; this.bounty = s.bounty; this.standing = s.standing;
+    this.nextId = Number.isFinite(s.nextId) && s.nextId > 0 ? s.nextId : this.actors.length + 1000;
+    this.echoProgress = s.echoProgress ?? 0; this.echoSolved = !!s.echoSolved;
+    this.respawn = s.respawn ?? this.respawn;
+    // Raids in progress do not survive a reload; everything else is exactly as it was left.
+    for (const a of this.actors) if (a.kind === 'foe' && a.intent === 'raid') { a.alive = false; a.solid = false; }
+    this.reindex();
+    this.autoRepair();
+  }
+
+  verify(): VerificationIssue[] { return verifyWorld(this, WORLD_LIMIT); }
+  autoRepair() { const report = repairWorld(this, WORLD_LIMIT); this.reindex(); return report; }
+  stats() {
+    const items = this.actors.filter((a) => a.kind === 'item' && a.alive);
+    return { actors: this.actors.length, items: items.length, awake: items.filter((a) => !a.sleeping).length, colliders: this.actors.filter((a) => a.solid && a.alive).length };
+  }
+}
