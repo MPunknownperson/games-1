@@ -37,10 +37,11 @@ const tmpC = new THREE.Color();
 /** Accumulates transformed, coloured primitives and merges them into a single geometry. */
 class Shape {
   private parts: THREE.BufferGeometry[] = [];
+  constructor(private textured = false) {}
   add(prim: Prim, color: string, x: number, y: number, z: number, sx: number, sy: number, sz: number, ry = 0, rx = 0, rz = 0) {
     const src = PRIM[prim];
     const g = src.index ? src.toNonIndexed() : src.clone();
-    g.deleteAttribute('uv');
+    if (!this.textured) g.deleteAttribute('uv');
     tmpM.compose(tmpP.set(x, y, z), tmpQ.setFromEuler(tmpE.set(rx, ry, rz)), tmpS.set(sx, sy, sz));
     g.applyMatrix4(tmpM);
     tmpC.set(color);
@@ -111,6 +112,8 @@ export class WorldRenderer {
   private visuals = new Map<string, Visual>();
   private pools = new Map<string, Pool>();
   private geometryCache = new Map<string, THREE.BufferGeometry>();
+  private itemTextures = new Map<ItemType, THREE.CanvasTexture>();
+  private itemMaterials = new Map<ItemType, THREE.MeshStandardMaterial>();
   private frame = 0;
   private time = 0;
   private introTime = 0;
@@ -356,6 +359,29 @@ export class WorldRenderer {
         const s = new Shape().add('box', C.stone, 0, 0.9, 0, 2.2 * (a.radius / 1.1), 1.8, 0.6, v * 0.9).add('box', C.stoneLight, 0.4, 2.0, 0, 1.0, 0.5, 0.55, v * 0.9);
         return s.add('dodec', C.stoneDark, 0.8, 0.25, 0.6, 0.7, 0.5, 0.6).add('dodec', C.stone, -0.7, 0.2, 0.5, 0.5, 0.4, 0.5).build();
       });
+      case 'tavern': return this.cached('tavern', () => {
+        const s = new Shape();
+        s.add('box', C.stoneDark, 0, 0.18, 0, 4.9, 0.35, 4.2).add('box', C.plaster, 0, 1.75, 0, 4.1, 2.7, 3.5)
+          .add('box', C.timber, -2.05, 1.75, 0, 0.2, 2.9, 3.6).add('box', C.timber, 2.05, 1.75, 0, 0.2, 2.9, 3.6)
+          .add('box', C.timber, 0, 3.1, 0, 4.2, 0.2, 3.6).add('box', C.timber, 0, 1.65, 0, 4.2, 0.13, 3.6);
+        s.add('cone4', C.roofRed, 0, 4.35, 0, 5.8, 2.1, 5.2, Math.PI / 4)
+          .add('box', C.door, 0, 1.25, 1.79, 1.0, 2.3, 0.1).add('box', C.bronze, 0.32, 1.25, 1.86, 0.08, 0.08, 0.05)
+          .add('box', C.stone, 1.25, 4.2, 0.2, 0.45, 1.35, 0.45);
+        s.add('box', C.timber, -2.25, 3.25, 1.6, 0.12, 1.4, 0.12)
+          .add('box', '#d8cdb2', -2.25, 3.75, 1.7, 1.1, 0.6, 0.06, 0.08)
+          .add('cyl', C.bronze, -2.25, 3.88, 1.75, 0.24, 0.08, 0.24, 0, Math.PI / 2);
+        return s.build();
+      });
+      case 'dungeon': return this.cached(`dungeon-${a.locationId ?? 'unknown'}`, () => new Shape()
+        .add('box', '#161713', 0, 1.25, 0.08, 1.28, 2.3, 0.12)
+        .add('box', C.stoneDark, -0.92, 1.25, 0, 0.68, 2.8, 1.1)
+        .add('box', C.stone, 0.92, 1.25, 0, 0.68, 2.8, 1.1)
+        .add('box', C.stoneLight, 0, 2.72, 0, 2.5, 0.65, 1.15)
+        .add('dodec', C.stone, -1.08, 3.02, 0, 0.85, 0.7, 1.0, 0.3)
+        .add('dodec', C.stoneLight, 0.84, 3.03, 0.1, 0.9, 0.76, 1.0, 1.1)
+        .add('dodec', C.stoneDark, -1.35, 0.32, 0.2, 0.75, 0.55, 0.9, 0.7)
+        .add('dodec', C.stone, 1.3, 0.28, 0.1, 0.8, 0.5, 0.9, 1.7)
+        .add('box', C.wood, 0, 0.28, 0.03, 0.1, 0.5, 0.1).build());
       case 'post': return this.cached('post', () => {
         const s = new Shape();
         for (const x of [-0.6, 0.6]) for (const z of [-0.6, 0.6]) s.add('box', C.timber, x, 1.7, z, 0.18, 3.4, 0.18);
@@ -375,34 +401,145 @@ export class WorldRenderer {
     }
   }
 
-  private itemGeometry(type: ItemType) {
-    return this.cached(`item-${type}`, () => {
-      const s = new Shape();
+  private itemTexture(type: ItemType) {
+    let texture = this.itemTextures.get(type);
+    if (texture) return texture;
+    const canvas = document.createElement('canvas');
+    canvas.width = canvas.height = 128;
+    const ctx = canvas.getContext('2d')!;
+    ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, 128, 128);
+    let seed = [...type].reduce((n, ch) => (n * 33 + ch.charCodeAt(0)) | 0, 19) >>> 0;
+    const random = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 4294967296; };
+    for (let i = 0; i < 850; i++) {
+      const shade = random() > 0.5 ? '35,25,15' : '255,255,255';
+      ctx.fillStyle = `rgba(${shade},${0.025 + random() * 0.09})`;
+      ctx.fillRect(random() * 128, random() * 128, 1 + random() * 2, 1 + random() * 2);
+    }
+    if (['barrel', 'crate', 'log', 'stool', 'basket', 'bucket', 'pot'].includes(type)) {
+      ctx.strokeStyle = 'rgba(74,43,24,0.15)'; ctx.lineWidth = 2;
+      for (let y = 8; y < 128; y += 13) { ctx.beginPath(); ctx.moveTo(0, y); ctx.bezierCurveTo(36, y - 3, 82, y + 3, 128, y - 1); ctx.stroke(); }
+    } else if (['book', 'ledger', 'tomeBolt', 'tomeMend', 'mercenaryWrit', 'familyLocket'].includes(type)) {
+      ctx.strokeStyle = 'rgba(76,54,35,0.16)'; ctx.lineWidth = 1;
+      for (let y = 20; y < 116; y += 12) { ctx.beginPath(); ctx.moveTo(18, y); ctx.lineTo(108, y + 1); ctx.stroke(); }
+      ctx.strokeStyle = 'rgba(166,123,62,0.22)'; ctx.lineWidth = 3; ctx.strokeRect(8, 8, 112, 112);
+    } else if (['hammer', 'lockpicks', 'strongbox', 'lantern'].includes(type)) {
+      ctx.strokeStyle = 'rgba(38,43,45,0.16)'; ctx.lineWidth = 2;
+      for (let i = 0; i < 9; i++) { const x = random() * 128, y = random() * 128; ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + 18 + random() * 18, y - 2); ctx.stroke(); }
+    }
+    texture = new THREE.CanvasTexture(canvas);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    texture.anisotropy = Math.min(4, this.renderer.capabilities.getMaxAnisotropy());
+    this.itemTextures.set(type, texture);
+    return texture;
+  }
+
+  private itemMaterial(type: ItemType) {
+    let material = this.itemMaterials.get(type);
+    if (!material) {
+      const metal = ['hammer', 'lockpicks', 'strongbox', 'lantern', 'familyLocket'].includes(type);
+      material = new THREE.MeshStandardMaterial({ map: this.itemTexture(type), vertexColors: true, flatShading: true, roughness: metal ? 0.5 : 0.86, metalness: metal ? 0.24 : 0 });
+      this.itemMaterials.set(type, material);
+    }
+    return material;
+  }
+
+  private itemGeometry(type: ItemType, lowDetail = false) {
+    return this.cached(`item-${type}${lowDetail ? '-low' : ''}`, () => {
+      const s = new Shape(true);
+      if (lowDetail) {
+        if (['apple', 'bread', 'cheese', 'herb', 'pouch', 'draught'].includes(type)) s.add('ico', '#ffffff', 0, 0.12, 0, 0.34, 0.22, 0.3);
+        else if (['barrel', 'pot', 'jug', 'bucket', 'basket', 'stool'].includes(type)) s.add('cyl', '#ffffff', 0, 0.22, 0, 0.5, 0.45, 0.5);
+        else if (['hammer', 'lockpicks', 'log'].includes(type)) s.add('box', '#ffffff', 0, 0.09, 0, 0.4, 0.14, 0.22);
+        else s.add('box', '#ffffff', 0, 0.12, 0, 0.42, 0.24, 0.34);
+        return s.build();
+      }
       switch (type) {
-        case 'apple': s.add('ico', '#a8402f', 0, 0.11, 0, 0.22, 0.21, 0.22).add('box', C.trunk, 0, 0.23, 0, 0.02, 0.06, 0.02); break;
-        case 'bread': s.add('ico', '#c28a4f', 0, 0.09, 0, 0.42, 0.2, 0.26).add('box', '#a46b38', 0, 0.17, 0, 0.3, 0.03, 0.03); break;
-        case 'cheese': s.add('cyl', '#d8b85a', 0, 0.07, 0, 0.38, 0.14, 0.38); break;
-        case 'book': s.add('box', '#6b3b2c', 0, 0.035, 0, 0.3, 0.07, 0.22).add('box', '#e4dac2', 0.01, 0.035, 0, 0.29, 0.05, 0.2); break;
-        case 'ledger': s.add('box', '#3e2a1f', 0, 0.035, 0, 0.32, 0.07, 0.24).add('box', '#b8954f', 0.16, 0.035, 0, 0.03, 0.05, 0.08); break;
-        case 'pot': s.add('taper', '#a86a43', 0, 0.15, 0, 0.42, 0.3, 0.42, 0, Math.PI).add('cyl', '#94593a', 0, 0.31, 0, 0.3, 0.05, 0.3); break;
-        case 'jug': s.add('ico', '#9b8b72', 0, 0.15, 0, 0.32, 0.3, 0.32).add('cyl', '#8a7a62', 0, 0.32, 0, 0.12, 0.12, 0.12); break;
-        case 'barrel': s.add('cyl', C.wood, 0, 0.47, 0, 0.84, 0.94, 0.84).add('cyl', C.iron, 0, 0.18, 0, 0.87, 0.06, 0.87).add('cyl', C.iron, 0, 0.76, 0, 0.87, 0.06, 0.87); break;
-        case 'crate': s.add('box', C.woodLight, 0, 0.45, 0, 0.95, 0.9, 0.95).add('box', C.wood, 0, 0.45, 0.48, 0.97, 0.12, 0.02).add('box', C.wood, 0, 0.45, -0.48, 0.97, 0.12, 0.02).add('box', C.wood, 0.48, 0.45, 0, 0.02, 0.12, 0.97); break;
-        case 'bucket': s.add('taper', C.wood, 0, 0.18, 0, 0.46, 0.36, 0.46, 0, Math.PI).add('box', C.iron, 0, 0.42, 0, 0.42, 0.03, 0.03); break;
-        case 'hammer': s.add('box', C.wood, 0, 0.03, 0, 0.05, 0.05, 0.42).add('box', C.iron, 0, 0.06, 0.2, 0.18, 0.11, 0.1); break;
-        case 'candle': s.add('cyl', '#e8e0c8', 0, 0.1, 0, 0.12, 0.2, 0.12).add('box', C.dark, 0, 0.22, 0, 0.01, 0.04, 0.01); break;
-        case 'pouch': s.add('ico', '#7a5a3a', 0, 0.09, 0, 0.22, 0.18, 0.22).add('cyl', '#5b4028', 0, 0.18, 0, 0.08, 0.05, 0.08); break;
-        case 'herb': s.add('box', '#5d8a45', 0, 0.05, 0, 0.06, 0.1, 0.22, 0.3).add('box', '#6e9a52', 0.04, 0.05, 0, 0.06, 0.1, 0.2, -0.5).add('box', '#4f7a3b', -0.04, 0.05, 0.02, 0.06, 0.12, 0.18, 1.2); break;
-        case 'log': s.add('cyl', C.trunk, 0, 0.22, 0, 0.44, 0.8, 0.44, 0, 0, Math.PI / 2).add('cyl', '#c39b6a', 0.41, 0.22, 0, 0.38, 0.02, 0.38, 0, 0, Math.PI / 2); break;
-        case 'stoneChunk': s.add('box', C.stone, 0, 0.2, 0, 0.5, 0.4, 0.44).add('box', C.stoneLight, 0.05, 0.4, 0, 0.42, 0.02, 0.36); break;
-        case 'draught': s.add('cyl', '#7a3b46', 0, 0.09, 0, 0.16, 0.18, 0.16).add('cyl', '#7a3b46', 0, 0.2, 0, 0.06, 0.06, 0.06).add('cyl', C.woodLight, 0, 0.25, 0, 0.06, 0.04, 0.06); break;
-        case 'stool': s.add('cyl', C.wood, 0, 0.43, 0, 0.5, 0.06, 0.5); for (let i = 0; i < 3; i++) { const a = (i / 3) * Math.PI * 2; s.add('box', C.timber, Math.cos(a) * 0.15, 0.2, Math.sin(a) * 0.15, 0.05, 0.42, 0.05); } break;
-        case 'basket': s.add('taper', '#b08a52', 0, 0.15, 0, 0.62, 0.3, 0.62, 0, Math.PI).add('cyl', '#987443', 0, 0.3, 0, 0.62, 0.03, 0.62); break;
-        case 'lantern': s.add('box', C.dark, 0, 0.14, 0, 0.2, 0.28, 0.2).add('box', '#f2c66d', 0, 0.14, 0, 0.16, 0.18, 0.21).add('box', C.dark, 0, 0.32, 0, 0.1, 0.06, 0.1); break;
-        case 'tomeBolt': s.add('box', '#4a3436', 0, 0.035, 0, 0.3, 0.07, 0.22).add('box', '#e4dac2', 0.01, 0.035, 0, 0.29, 0.05, 0.2).add('box', '#c7744c', 0, 0.075, 0, 0.1, 0.01, 0.1); break;
-        case 'tomeMend': s.add('box', '#3d4a3a', 0, 0.035, 0, 0.3, 0.07, 0.22).add('box', '#e4dac2', 0.01, 0.035, 0, 0.29, 0.05, 0.2).add('box', '#9bb17c', 0, 0.075, 0, 0.1, 0.01, 0.1); break;
-        case 'lockpicks': s.add('box', C.iron, 0, 0.02, 0.03, 0.03, 0.02, 0.24, 0, 0, 0.2).add('box', C.iron, 0.04, 0.02, -0.03, 0.03, 0.02, 0.22, 0, 0, -0.15); break;
-        case 'strongbox': s.add('box', '#4c4438', 0, 0.21, 0, 0.68, 0.42, 0.52).add('box', C.iron, 0, 0.21, 0.27, 0.7, 0.44, 0.03).add('box', C.iron, 0, 0.21, -0.27, 0.7, 0.44, 0.03).add('box', C.iron, 0.34, 0.21, 0, 0.03, 0.44, 0.54).add('box', C.iron, -0.34, 0.21, 0, 0.03, 0.44, 0.54).add('box', C.bronze, 0, 0.24, 0.28, 0.12, 0.16, 0.04); break;
+        case 'apple':
+          s.add('ico', '#a8402f', 0, 0.11, 0, 0.24, 0.22, 0.23).add('ico', '#c45038', 0.04, 0.14, 0.04, 0.14, 0.13, 0.14)
+            .add('box', C.trunk, 0, 0.25, 0, 0.025, 0.08, 0.025).add('box', '#688744', 0.055, 0.28, 0, 0.1, 0.025, 0.05, 0, 0, 0.38); break;
+        case 'bread':
+          s.add('ico', '#c28a4f', 0, 0.09, 0, 0.42, 0.2, 0.28).add('box', '#a46b38', 0, 0.17, 0, 0.3, 0.025, 0.035)
+            .add('box', '#d2a16b', 0, 0.15, 0.08, 0.29, 0.025, 0.03, 0, 0.22); break;
+        case 'cheese':
+          s.add('cyl', '#d8b85a', 0, 0.07, 0, 0.38, 0.14, 0.38);
+          for (const [x, z, r] of [[-0.1, 0.1, 0.032], [0.11, 0.06, 0.025], [0.03, -0.12, 0.03], [-0.14, -0.04, 0.02]]) s.add('ico', '#b18e3f', x, 0.145, z, r, r, r);
+          break;
+        case 'book': case 'ledger': case 'tomeBolt': case 'tomeMend': {
+          const cover = type === 'ledger' ? '#3e2a1f' : type === 'tomeBolt' ? '#4a3436' : type === 'tomeMend' ? '#3d4a3a' : '#6b3b2c';
+          s.add('box', '#d4c9ae', 0, 0.035, 0, 0.32, 0.075, 0.24).add('box', cover, 0, 0.078, 0, 0.34, 0.026, 0.26)
+            .add('box', cover, 0, -0.005, 0, 0.34, 0.02, 0.26).add('box', cover, -0.155, 0.035, 0, 0.03, 0.08, 0.26)
+            .add('box', type === 'tomeMend' ? '#9bb17c' : type === 'tomeBolt' ? '#c7744c' : '#b8954f', 0, 0.095, 0, 0.12, 0.008, 0.12)
+            .add('box', '#eee5d1', 0.17, 0.035, 0, 0.015, 0.08, 0.25);
+          break;
+        }
+        case 'mercenaryWrit':
+          s.add('box', '#cbbb98', 0, 0.025, 0, 0.32, 0.035, 0.25).add('box', '#dfd1ad', 0, 0.047, 0, 0.28, 0.008, 0.2)
+            .add('cyl', '#3c2425', 0.08, 0.06, 0.04, 0.08, 0.025, 0.08).add('ico', '#8d3f2c', 0.08, 0.08, 0.04, 0.045, 0.03, 0.045); break;
+        case 'familyLocket':
+          s.add('cyl', '#b38a4d', 0, 0.08, 0, 0.2, 0.08, 0.2).add('cyl', '#e0c47b', 0, 0.125, 0, 0.16, 0.02, 0.16)
+            .add('box', '#9b7542', 0, 0.145, 0, 0.07, 0.008, 0.08).add('box', '#d3b66e', 0, 0.17, 0, 0.025, 0.035, 0.025); break;
+        case 'pot':
+          s.add('taper', '#a86a43', 0, 0.15, 0, 0.42, 0.3, 0.42, 0, Math.PI).add('cyl', '#94593a', 0, 0.31, 0, 0.31, 0.05, 0.31)
+            .add('cyl', '#c08657', 0, 0.33, 0, 0.34, 0.035, 0.34).add('cyl', '#8c5036', 0, 0.305, 0, 0.25, 0.02, 0.25); break;
+        case 'jug':
+          s.add('ico', '#9b8b72', 0, 0.15, 0, 0.32, 0.3, 0.32).add('cyl', '#8a7a62', 0, 0.32, 0, 0.13, 0.12, 0.13)
+            .add('cyl', '#c0af91', 0, 0.39, 0, 0.16, 0.025, 0.16).add('box', '#82745f', 0.2, 0.18, 0, 0.05, 0.15, 0.055, 0, 0, 0.25); break;
+        case 'barrel':
+          s.add('cyl', C.wood, 0, 0.47, 0, 0.84, 0.94, 0.84).add('cyl', C.iron, 0, 0.18, 0, 0.88, 0.06, 0.88)
+            .add('cyl', C.iron, 0, 0.76, 0, 0.88, 0.06, 0.88).add('cyl', '#b58a56', 0, 0.945, 0, 0.76, 0.025, 0.76);
+          for (let i = 0; i < 8; i++) { const a = (i / 8) * Math.PI * 2; s.add('box', '#9b7145', Math.sin(a) * 0.39, 0.46, Math.cos(a) * 0.39, 0.018, 0.72, 0.03, -a); }
+          break;
+        case 'crate':
+          s.add('box', C.woodLight, 0, 0.45, 0, 0.95, 0.9, 0.95).add('box', C.wood, 0, 0.45, 0.48, 0.97, 0.12, 0.02)
+            .add('box', C.wood, 0, 0.45, -0.48, 0.97, 0.12, 0.02).add('box', C.wood, 0.48, 0.45, 0, 0.02, 0.12, 0.97)
+            .add('box', C.timber, 0, 0.45, -0.51, 0.08, 0.9, 0.025).add('box', C.timber, -0.45, 0.45, -0.51, 0.08, 0.9, 0.025)
+            .add('box', '#c39b6a', 0, 0.92, 0, 0.94, 0.06, 0.94); break;
+        case 'bucket':
+          s.add('taper', C.wood, 0, 0.18, 0, 0.46, 0.36, 0.46, 0, Math.PI).add('cyl', C.iron, 0, 0.38, 0, 0.48, 0.035, 0.48)
+            .add('box', C.iron, 0, 0.42, 0, 0.42, 0.03, 0.03).add('box', C.iron, -0.21, 0.39, 0, 0.03, 0.08, 0.03); break;
+        case 'hammer':
+          s.add('box', C.wood, 0, 0.03, 0, 0.055, 0.055, 0.42).add('box', C.iron, 0, 0.06, 0.2, 0.2, 0.12, 0.12)
+            .add('box', '#888b89', 0, 0.065, 0.26, 0.12, 0.07, 0.018); break;
+        case 'candle':
+          s.add('cyl', '#e8e0c8', 0, 0.1, 0, 0.12, 0.2, 0.12).add('cyl', '#eee7d3', 0, 0.19, 0, 0.125, 0.03, 0.125)
+            .add('box', C.dark, 0, 0.22, 0, 0.01, 0.04, 0.01); break;
+        case 'pouch':
+          s.add('ico', '#7a5a3a', 0, 0.09, 0, 0.24, 0.2, 0.23).add('cyl', '#5b4028', 0, 0.18, 0, 0.1, 0.05, 0.1)
+            .add('box', '#bb9655', 0, 0.19, 0, 0.11, 0.02, 0.11); break;
+        case 'herb':
+          s.add('box', '#5d8a45', 0, 0.05, 0, 0.06, 0.1, 0.22, 0.3).add('box', '#6e9a52', 0.04, 0.05, 0, 0.06, 0.1, 0.2, -0.5)
+            .add('box', '#4f7a3b', -0.04, 0.05, 0.02, 0.06, 0.12, 0.18, 1.2).add('box', '#9bb17c', 0, 0.02, 0, 0.025, 0.16, 0.025); break;
+        case 'log':
+          s.add('cyl', C.trunk, 0, 0.22, 0, 0.44, 0.8, 0.44, 0, 0, Math.PI / 2).add('cyl', '#c39b6a', 0.41, 0.22, 0, 0.38, 0.025, 0.38, 0, 0, Math.PI / 2)
+            .add('cyl', '#c39b6a', -0.41, 0.22, 0, 0.38, 0.025, 0.38, 0, 0, Math.PI / 2); break;
+        case 'stoneChunk':
+          s.add('dodec', C.stone, 0, 0.2, 0, 0.5, 0.4, 0.44).add('box', C.stoneLight, 0.05, 0.4, 0, 0.42, 0.025, 0.36)
+            .add('box', C.stoneDark, -0.08, 0.33, 0.08, 0.25, 0.025, 0.03, 0, 0.2); break;
+        case 'draught':
+          s.add('cyl', '#d4c5aa', 0, 0.09, 0, 0.18, 0.18, 0.18).add('cyl', '#8d3f4a', 0, 0.09, 0.01, 0.145, 0.12, 0.145)
+            .add('cyl', '#8d3f4a', 0, 0.2, 0, 0.07, 0.07, 0.07).add('cyl', C.woodLight, 0, 0.25, 0, 0.07, 0.045, 0.07); break;
+        case 'stool':
+          s.add('cyl', C.wood, 0, 0.43, 0, 0.5, 0.07, 0.5);
+          for (let i = 0; i < 3; i++) { const a = (i / 3) * Math.PI * 2; s.add('box', C.timber, Math.cos(a) * 0.15, 0.2, Math.sin(a) * 0.15, 0.055, 0.42, 0.055); }
+          s.add('box', C.woodLight, 0, 0.2, 0, 0.36, 0.04, 0.36); break;
+        case 'basket':
+          s.add('taper', '#b08a52', 0, 0.15, 0, 0.62, 0.3, 0.62, 0, Math.PI).add('cyl', '#987443', 0, 0.3, 0, 0.62, 0.035, 0.62)
+            .add('cyl', '#b99158', 0, 0.32, 0, 0.55, 0.025, 0.55);
+          for (let y = 0.06; y < 0.29; y += 0.07) s.add('cyl', '#c19b63', 0, y, 0, 0.59, 0.018, 0.59);
+          break;
+        case 'lantern':
+          s.add('box', C.dark, 0, 0.14, 0, 0.22, 0.3, 0.22).add('box', '#f2c66d', 0, 0.14, 0, 0.17, 0.19, 0.17)
+            .add('box', C.iron, 0, 0.14, 0.1, 0.025, 0.27, 0.025).add('box', C.iron, 0, 0.14, -0.1, 0.025, 0.27, 0.025)
+            .add('box', C.dark, 0, 0.32, 0, 0.12, 0.06, 0.12).add('cyl', C.iron, 0, 0.38, 0, 0.15, 0.03, 0.15); break;
+        case 'lockpicks':
+          s.add('box', C.iron, 0, 0.02, 0.03, 0.03, 0.02, 0.24, 0, 0, 0.2).add('box', C.iron, 0.04, 0.02, -0.03, 0.03, 0.02, 0.22, 0, 0, -0.15)
+            .add('box', C.bronze, -0.035, 0.025, 0.02, 0.015, 0.02, 0.08); break;
+        case 'strongbox':
+          s.add('box', '#4c4438', 0, 0.21, 0, 0.68, 0.42, 0.52).add('box', C.iron, 0, 0.21, 0.27, 0.7, 0.44, 0.03)
+            .add('box', C.iron, 0, 0.21, -0.27, 0.7, 0.44, 0.03).add('box', C.iron, 0.34, 0.21, 0, 0.03, 0.44, 0.54)
+            .add('box', C.iron, -0.34, 0.21, 0, 0.03, 0.44, 0.54).add('box', C.bronze, 0, 0.24, 0.28, 0.12, 0.16, 0.04);
+          for (const x of [-0.28, 0.28]) for (const y of [0.06, 0.36]) s.add('cyl', '#b59a64', x, y, 0.29, 0.035, 0.035, 0.035);
+          break;
       }
       return s.build();
     });
@@ -487,9 +624,15 @@ export class WorldRenderer {
       v.body = body;
       v.obj = g;
     } else if (a.kind === 'item') {
-      const m = new THREE.Mesh(this.itemGeometry(a.itemType!), this.vertexMat);
-      m.castShadow = a.itemType === 'barrel' || a.itemType === 'crate';
-      v.obj = m;
+      const type = a.itemType!;
+      const lod = new THREE.LOD();
+      const detailed = new THREE.Mesh(this.itemGeometry(type), this.itemMaterial(type));
+      const simple = new THREE.Mesh(this.itemGeometry(type, true), this.itemMaterial(type));
+      detailed.castShadow = type === 'barrel' || type === 'crate' || type === 'strongbox';
+      simple.castShadow = false;
+      lod.addLevel(detailed, 0);
+      lod.addLevel(simple, 34);
+      v.obj = lod;
       v.isStatic = true;
     } else {
       const g = new THREE.Group();
@@ -574,15 +717,17 @@ export class WorldRenderer {
       return speed > 5.4 ? 'run' : speed > 0.3 ? 'walk' : 'idle';
     }
     if (a.kind === 'villager') {
+      if (a.capturedFor || a.activity === 'Captured') return 'captured';
       if (a.activity === 'Sitting') return 'sit';
       if (a.activity === 'Sneaking') return speed > 0.3 ? 'sneak' : 'idle';
       if (speed > 0.3) return speed > 3 ? 'run' : 'walk';
       switch (a.activity) {
         case 'Chopping': return 'gather';
-        case 'Masonry': case 'Smithing': case 'Baking': return 'work';
-        case 'Tending fields': case 'Gardening': case 'Gathering herbs': case 'Foraging': return 'tend';
-        case 'Conversing': case 'Talking': case 'Minding the stall': return 'talk';
+        case 'Masonry': case 'Smithing': case 'Baking': case 'Forging': case 'Working for a meal': return 'work';
+        case 'Tending fields': case 'Gardening': case 'Gathering herbs': case 'Foraging': case 'Looking for work': return 'tend';
+        case 'Conversing': case 'Talking': case 'Minding the stall': case 'At the tavern': case 'Confronting': return 'talk';
         case 'Studying': case 'Eating': return 'sit';
+        case 'Barring the door': return 'idle';
         default: return 'idle';
       }
     }
@@ -795,14 +940,17 @@ export class WorldRenderer {
 
   dispose() {
     window.removeEventListener('resize', this.resizeHandler);
+    const sharedItemTextures = new Set<THREE.Texture>(this.itemTextures.values());
     this.scene.traverse((o) => {
       if (o instanceof THREE.InstancedMesh || o instanceof THREE.Line) o.geometry.dispose();
       if (o instanceof THREE.Mesh) {
         const mat = o.material as THREE.Material & { map?: THREE.Texture | null };
-        if (mat.map) mat.map.dispose();
+        if (mat.map && !sharedItemTextures.has(mat.map)) mat.map.dispose();
       }
     });
     for (const g of this.geometryCache.values()) g.dispose();
+    for (const material of this.itemMaterials.values()) material.dispose();
+    for (const texture of this.itemTextures.values()) texture.dispose();
     this.renderer.dispose();
   }
 

@@ -2,13 +2,15 @@
 // with a position and a body, and everything persists exactly where it was left.
 import { repairWorld, verifyWorld, type VerificationIssue } from '../engine/verifier';
 import { ITEMS, type ItemType } from './items';
-import { QUESTS, barkFor, buildOptions, confrontOptions, greetingFor, type StoryOption } from './story';
-import { SPELLS, chooseGoal, makeAttrs, makePersona, makeRoutine, makeSkills, type Attrs, type Goal, type Persona, type Routine, type SkillKind, type Skills, type SpellId, impression } from './vivid';
+import { QUESTS, barkFor, buildOptions, confrontOptions, greetingFor, type DynamicQuestData, type StoryOption } from './story';
+import { SPELLS, canSee, chooseGoal, makeAttrs, makeDesires, makePersona, makeRoutine, makeSkills, type Attrs, type Desires, type Goal, type Persona, type Routine, type SkillKind, type Skills, type SpellId, impression } from './vivid';
+import { DUNGEON_SITES, WORLD_LOCATIONS } from './narrative';
+import { activePackage, makePackages, type AiPackage } from './packages';
 
 export type Faction = 'citadel' | 'wild' | 'neutral';
 export type ActorKind =
   | 'player' | 'villager' | 'foe' | 'tree' | 'ore' | 'item' | 'rune' | 'echo' | 'citadel' | 'house' | 'camp'
-  | 'tower' | 'barricade' | 'well' | 'table' | 'stall' | 'pillar' | 'roof' | 'ruin' | 'post' | 'note' | 'bell';
+  | 'tower' | 'barricade' | 'well' | 'table' | 'stall' | 'pillar' | 'roof' | 'ruin' | 'post' | 'note' | 'bell' | 'dungeon' | 'tavern';
 export type StructureKind = 'archer' | 'ward' | 'barricade' | 'outpost';
 export type FoeKind = 'slime' | 'brute' | 'wisp' | 'stalker';
 export type WeaponKind = 'fists' | 'club' | 'sword' | 'blade' | 'staff';
@@ -21,8 +23,35 @@ export type ActionKind =
 
 export interface Point { x: number; z: number }
 export interface Stock { gold: number; wood: number; stone: number; essence: number }
-export interface Memory { opinion: number; conversations: number; witnessedCrime: number; alarmUntil: number; lastGreet: number; rumors: string[] }
+export interface Memory { opinion: number; conversations: number; witnessedCrime: number; alarmUntil: number; lastGreet: number; rumors: string[]; threatId?: string }
 export interface Needs { energy: number; hunger: number; social: number; fun: number }
+export type DeedKind = 'theft' | 'assault' | 'murder' | 'trespass';
+export interface Deed {
+  id: string;
+  kind: DeedKind;
+  at: number;
+  locationId: string;
+  locationName: string;
+  victimId?: string;
+  victimName?: string;
+  witnessIds: string[];
+  reaction?: 'estate' | 'vendetta' | 'alarm';
+  inheritedBy?: string;
+  inheritedCrowns?: number;
+}
+export interface Vendetta {
+  id: string;
+  familyId: string;
+  victimId: string;
+  victimName: string;
+  contractorId?: string;
+  createdAt: number;
+  ambushAt: number;
+  point: Point;
+  count: number;
+  triggered: boolean;
+  resolved: boolean;
+}
 
 export interface Actor extends Point {
   id: string; kind: ActorKind; name: string;
@@ -35,17 +64,20 @@ export interface Actor extends Point {
   profession?: string; home?: Point; work?: Point; social?: Point;
   memory?: Memory; needs?: Needs; activity?: string; goal?: Point; talkingTo?: string; socialUntil?: number; lookAt?: string;
   decideIn?: number; stuck?: number; detour?: number; detourT?: number; patrol?: Point[]; patrolIndex?: number;
-  foeKind?: FoeKind; intent?: 'forage' | 'return' | 'raid' | 'chase' | 'search' | 'flee'; targetId?: string; lastKnown?: Point; lostFor?: number;
+  foeKind?: FoeKind; intent?: 'forage' | 'return' | 'raid' | 'chase' | 'search' | 'flee' | 'guard'; targetId?: string; lastKnown?: Point; lostFor?: number;
   carriedWood?: number; carriedStone?: number; attackCooldown?: number; workCooldown?: number; weaponLevel?: number;
   action?: ActionKind; actionT?: number; actionDur?: number; actionHit?: boolean; gatherTarget?: string; combo?: number;
   // Vivid AI: temperament, capabilities, routine and the goal currently being pursued.
   persona?: Persona; attrs?: Attrs; skills?: Skills; routine?: Routine; utility?: Goal;
+  desires?: Desires; packages?: AiPackage[]; activePackage?: string;
   spells?: SpellId[]; focus?: number; maxFocus?: number; armor?: number;
   crowns?: number; homeFood?: number; wanted?: number; wantedUntil?: number;
   /** Shared inventory & equipment: the guardian's pack is the player actor's `items`. */
   items?: Partial<Record<ItemType, number>>; stolen?: Partial<Record<ItemType, number>>;
   weapon?: WeaponKind;
   seatTakenBy?: string; sittingOn?: string; sneaking?: boolean; quarryId?: string;
+  familyId?: string; locationId?: string; capturedFor?: string; followingPlayer?: boolean; vendettaFor?: string;
+  houseId?: string; residents?: string[]; doorLocked?: boolean; homeDefenseUntil?: number; earnTimer?: number; workProgress?: number;
   locked?: number; loot?: ItemType[]; acc?: number; far?: boolean;
   structure?: StructureKind; currentRune?: number; targetRune?: number; stockWood?: number; stockStone?: number;
   shotAt?: number; shotX?: number; shotZ?: number; struckAt?: number;
@@ -59,17 +91,19 @@ export const BUILDINGS: Record<StructureKind, { name: string; description: strin
 };
 
 export const RUNE_NAMES = ['dawn', 'leaf', 'star'];
+export const TAVERN_POINT: Point = { x: -5.4, z: -4.6 };
 export const WORLD_LIMIT = 90;
 export const PLAYER_ID = 'guardian';
 const CITADEL_ID = 'citadel';
 const SAVE_VERSION = 2;
 
-export interface QuestState { stage: string; status: 'active' | 'done'; log: string[] }
+export interface QuestState { stage: string; status: 'active' | 'done'; log: string[]; title?: string; data?: DynamicQuestData }
 export interface WorldSave {
   version: number; seed: number; actors: Actor[]; stock: Stock; pack: Partial<Record<ItemType, number>>;
   elapsed: number; level: number; xp: number; weaponLevel: number; flags: Record<string, string | number | boolean>;
   quests: Record<string, QuestState>; tracked: string; wave: number; waveCleared: number; bounty: number; standing: number;
   nextId: number; echoProgress: number; echoSolved: boolean; respawn: Point;
+  visitedLocations?: string[]; metNpcIds?: string[]; deeds?: Deed[]; vendettas?: Vendetta[];
 }
 export interface Prompt { name: string; primary?: string; secondary?: string; crime: boolean }
 export interface DialogueView { npcId: string; speaker: string; line: string; options: { id: string; text: string }[]; shop: boolean }
@@ -101,6 +135,8 @@ const STATIC_DESC: Partial<Record<ActorKind, string>> = {
   pillar: 'A post holding up the storehouse roof.',
   tower: 'A tower of fitted stone.',
   barricade: 'Sharpened stakes, bound tight.',
+  dungeon: 'A stone mouth descends beneath the old earth.',
+  tavern: 'The Kettle & Crown. Warm light, thin ale, and every rumour in the valley.',
 };
 
 function random(seed: number) {
@@ -145,11 +181,11 @@ class Grid {
   }
 }
 
-const INTERACTIVE = new Set<ActorKind>(['item', 'villager', 'tree', 'ore', 'rune', 'echo', 'note', 'camp', 'well', 'house', 'table', 'stall', 'post', 'citadel', 'bell', 'ruin', 'tower', 'barricade']);
-const STATIC_KINDS = new Set<ActorKind>(['tree', 'ore', 'rune', 'echo', 'citadel', 'house', 'camp', 'tower', 'barricade', 'well', 'table', 'stall', 'pillar', 'ruin', 'post', 'note', 'bell']);
+const INTERACTIVE = new Set<ActorKind>(['item', 'villager', 'tree', 'ore', 'rune', 'echo', 'note', 'camp', 'well', 'house', 'table', 'stall', 'post', 'citadel', 'bell', 'ruin', 'tower', 'barricade', 'dungeon', 'tavern']);
+const STATIC_KINDS = new Set<ActorKind>(['tree', 'ore', 'rune', 'echo', 'citadel', 'house', 'camp', 'tower', 'barricade', 'well', 'table', 'stall', 'pillar', 'ruin', 'post', 'note', 'bell', 'dungeon', 'tavern']);
 const WORK_ACTIVITY: Record<string, string> = {
   Keeper: 'Keeping watch', Merchant: 'Minding the stall', Warden: 'Patrolling', Mason: 'Masonry', Woodcutter: 'Chopping',
-  Herbalist: 'Gathering herbs', Farmer: 'Tending fields', Forager: 'Foraging', Apprentice: 'Studying', Smith: 'Smithing',
+  Herbalist: 'Gathering herbs', Farmer: 'Tending fields', Forager: 'Foraging', Apprentice: 'Studying', Smith: 'Forging',
   Gardener: 'Gardening', Baker: 'Baking', Scout: 'Scouting',
 };
 
@@ -164,6 +200,10 @@ export class SandboxWorld {
   weaponLevel = 1;
   flags: Record<string, string | number | boolean> = {};
   quests: Record<string, QuestState> = {};
+  visitedLocations: string[] = [];
+  metNpcIds: string[] = [];
+  deeds: Deed[] = [];
+  vendettas: Vendetta[] = [];
   tracked = 'light';
   wave = 0;
   waveActive = false;
@@ -208,6 +248,7 @@ export class SandboxWorld {
     this.seed = seed;
     this.rng = random(seed);
     this.createWorld();
+    this.visitedLocations.push('village');
     this.quests.light = { stage: 'meet', status: 'active', log: [QUESTS.light.stages.meet.journal(this)] };
     if (saved && saved.version === SAVE_VERSION && Array.isArray(saved.actors)) this.restore(saved);
     this.reindex();
@@ -215,6 +256,7 @@ export class SandboxWorld {
 
   get player() { return this.byId(PLAYER_ID)!; }
   get citadel() { return this.byId(CITADEL_ID)!; }
+  get tavern() { return this.actors.find((a) => a.kind === 'tavern' && a.alive); }
   get camp() {
     return this.actors.find((a) => a.kind === 'camp' && a.faction === 'wild' && a.alive) ?? this.actors.find((a) => a.kind === 'camp' && a.faction === 'wild')!;
   }
@@ -225,7 +267,7 @@ export class SandboxWorld {
     if (found) this.byIdCache.set(id, found);
     return found;
   }
-  npc(name: string) { return this.actors.find((a) => a.kind === 'villager' && a.name === name); }
+  npc(name: string) { return this.actors.find((a) => a.kind === 'villager' && a.name === name && a.alive); }
   nearest(kind: ActorKind) {
     let best: Actor | undefined, bd = Infinity;
     for (const a of this.actors) if (a.alive && a.kind === kind) { const d = distance(a, this.player); if (d < bd) { bd = d; best = a; } }
@@ -272,9 +314,17 @@ export class SandboxWorld {
     this.add('camp', 'Wild camp', 5, 57, { radius: 2.6, height: 4, hp: 320, maxHp: 320, faction: 'wild', stockWood: 0, stockStone: 0, desc: 'Hide tents and a crude totem. It smells of smoke and wet fur.' });
     this.add('bell', 'Warning bell', 4.6, -3.4, { radius: 0.55, height: 3, desc: 'A bronze bell on a timber frame. Rung only when the village is ready to fight.' });
     this.add('well', 'Village well', 6, 0, { radius: 1.2, height: 1, desc: 'Cold, clean water.' });
+    this.add('tavern', 'The Kettle & Crown', TAVERN_POINT.x, TAVERN_POINT.z, {
+      radius: 2.15, height: 4.8, solid: true, faction: 'citadel',
+      desc: 'A low-beamed tavern. The sign shows a crown above a steaming kettle.',
+    });
+    this.add('table', 'Tavern table', TAVERN_POINT.x, TAVERN_POINT.z + 2.7, { radius: 0.8, height: 0.9, surface: 0.9, desc: 'A scarred table, ringed with old cup marks.' });
+    this.spawnItem('stool', TAVERN_POINT.x - 0.85, TAVERN_POINT.z + 2.7, 0, 'tavern');
+    this.spawnItem('stool', TAVERN_POINT.x + 0.85, TAVERN_POINT.z + 2.7, 0, 'tavern');
 
+    const houseActors: Actor[] = [];
     const houses: [number, number, number][] = [[-13, -5, 0], [13, -6, 1], [-17, 5, 1], [16, 7, 0], [-11, -18, 0], [12, -18, 1], [22, -3, 1], [-23, -12, 0]];
-    houses.forEach(([x, z, variant]) => this.add('house', 'Village home', x, z, { radius: 2.7, height: 6, variant, faction: 'citadel', desc: STATIC_DESC.house }));
+    houses.forEach(([x, z, variant]) => houseActors.push(this.add('house', 'Village home', x, z, { radius: 2.7, height: 6, variant, faction: 'citadel', residents: [], desc: STATIC_DESC.house })));
 
     const people: [string, string, Point, Point, Point, number][] = [
       ['Mara', 'Keeper', { x: -10, z: -2 }, { x: -2.5, z: 5 }, { x: 3, z: 4 }, 0],
@@ -293,8 +343,10 @@ export class SandboxWorld {
       ['Vela', 'Scout', { x: 12.6, z: -14.4 }, { x: 10, z: 23 }, { x: 5, z: 5 }, 13],
     ];
     for (const [name, profession, home, work, social, variant] of people) {
-      this.add('villager', name, work.x, work.z, {
+      const house = houseActors.reduce((best, candidate) => distance(candidate, home) < distance(best, home) ? candidate : best, houseActors[0]);
+      const npc = this.add('villager', name, work.x, work.z, {
         radius: 0.42, height: 1.8, solid: false, hp: 80, maxHp: 80, faction: 'citadel', profession, home, work, social, variant,
+        familyId: name === 'Tobin' || name === 'Bran' ? 'marlowe' : undefined,
         activity: WORK_ACTIVITY[profession], decideIn: this.rng(),
         memory: { opinion: 0, conversations: 0, witnessedCrime: 0, alarmUntil: 0, lastGreet: -99, rumors: [] },
         needs: { energy: 0.8 + this.rng() * 0.2, hunger: this.rng() * 0.4, social: this.rng() * 0.5, fun: this.rng() * 0.4 },
@@ -306,6 +358,15 @@ export class SandboxWorld {
         spells: (['Apprentice', 'Herbalist', 'Keeper'] as string[]).includes(profession) ? (['mending', 'bolt'] as SpellId[]) : undefined,
         focus: 60, maxFocus: 60, armor: profession === 'Warden' ? 0.2 : 0,
       });
+      // Generated after the established actor values so worlds remain seed-compatible.
+      npc.houseId = house.id;
+      npc.desires = makeDesires(this.rng, profession, npc.persona);
+      npc.packages = makePackages(npc.routine!, profession);
+      house.residents!.push(npc.id);
+    }
+    for (const name of ['Tobin', 'Bran']) {
+      const owner = this.npc(name)!;
+      this.spawnItem('candle', owner.home!.x + 1, owner.home!.z + 0.8, 0, name);
     }
     this.npc('Alden')!.patrol = [{ x: -6, z: 8 }, { x: -14, z: -1 }, { x: -5, z: -14 }, { x: 8, z: -12 }, { x: 9, z: 9 }];
     this.npc('Nell')!.patrol = [{ x: 4.5, z: 25 }, { x: 7, z: 31 }, { x: -1, z: 30 }];
@@ -345,6 +406,13 @@ export class SandboxWorld {
     this.spawnItem('pot', mx - 0.9, mz + 0.8, 0);
     this.spawnItem('stoneChunk', mx + 1.2, mz - 0.4, 0);
     this.add('note', 'Torn page', mx + 1.1, mz + 1.4, { radius: 0.3, height: 1.2, text: '...left it by the millstone, I am sure of it. Must come back before Vela goes poking about. T.' });
+
+    for (const site of DUNGEON_SITES) {
+      this.add('dungeon', site.name, site.point.x, site.point.z, {
+        radius: 1.3, height: 3.6, solid: true, locationId: site.id,
+        desc: `A dark entrance into ${site.name.toLowerCase()}. The stone around it is older than the road.`,
+      });
+    }
 
     // Watch post, standing stones, echo stones.
     this.add('post', 'Watch post', 3, 28, { radius: 0.9, height: 4.5, desc: STATIC_DESC.post });
@@ -404,7 +472,7 @@ export class SandboxWorld {
   startQuest(id: string, stage: string) {
     if (this.quests[id]) return;
     const def = QUESTS[id];
-    this.quests[id] = { stage, status: 'active', log: [def.stages[stage].journal(this)] };
+    this.quests[id] = { stage, status: 'active', title: def.title, log: [def.stages[stage].journal(this)] };
     this.tracked = id;
     this.notify(`New in your journal: ${def.title}`);
   }
@@ -415,12 +483,12 @@ export class SandboxWorld {
     q.stage = stage;
     if (stage === 'done') {
       q.status = 'done';
-      this.notify(`${def.title} — completed`);
+      this.notify(`${this.questTitle(id)} — completed`);
       if (this.tracked === id) this.tracked = Object.keys(this.quests).find((k) => this.quests[k].status === 'active') ?? id;
       return;
     }
     q.log.push(def.stages[stage].journal(this));
-    this.notify(`Journal updated: ${def.title}`);
+    this.notify(`Journal updated: ${this.questTitle(id)}`);
   }
   journalText(id: string) {
     const q = this.quests[id];
@@ -428,6 +496,7 @@ export class SandboxWorld {
     if (q.status === 'done') return q.log[q.log.length - 1];
     return QUESTS[id].stages[q.stage].journal(this);
   }
+  questTitle(id: string) { return this.quests[id]?.title ?? QUESTS[id]?.title ?? id; }
   questTarget(): Point | null {
     const q = this.quests[this.tracked];
     if (!q || q.status !== 'active') return null;
@@ -439,6 +508,115 @@ export class SandboxWorld {
       const next = QUESTS[id].stages[q.stage]?.update?.(this);
       if (next) this.setStage(id, next);
     }
+  }
+
+  private updateWorldHistory() {
+    const p = this.player;
+    for (const place of WORLD_LOCATIONS) {
+      if (!this.visitedLocations.includes(place.id) && distance(p, place.point) <= place.radius) {
+        this.visitedLocations.push(place.id);
+        if (place.kind !== 'settlement') this.notify(`Discovered: ${place.name}`);
+      }
+    }
+    for (const n of this.actors) {
+      if (n.kind !== 'villager' || !n.alive || this.metNpcIds.includes(n.id)) continue;
+      if (distance(p, n) < 6 && canSee(n, p, 7, this.hour(), p.skills?.stealth ?? 0, !!p.sneaking)) this.metNpcIds.push(n.id);
+    }
+  }
+
+  canGenerateRescue(patron: Actor) {
+    if (patron.kind !== 'villager' || !patron.alive || this.quests.rescue || !this.metNpcIds.includes(patron.id)) return false;
+    if ((patron.memory?.opinion ?? 0) < 10) return false;
+    const captive = this.actors.some((a) => a.kind === 'villager' && a.alive && a !== patron && !a.capturedFor
+      && this.metNpcIds.includes(a.id) && (a.memory?.opinion ?? 0) > 0 && a.profession !== 'Warden');
+    return captive && DUNGEON_SITES.some((site) => !this.visitedLocations.includes(site.id));
+  }
+
+  generateRescueQuest(patron: Actor) {
+    if (!this.canGenerateRescue(patron)) return false;
+    const captives = this.actors.filter((a) => a.kind === 'villager' && a.alive && a !== patron && !a.capturedFor
+      && this.metNpcIds.includes(a.id) && (a.memory?.opinion ?? 0) > 0 && a.profession !== 'Warden');
+    captives.sort((a, b) => (b.memory?.opinion ?? 0) - (a.memory?.opinion ?? 0) || a.id.localeCompare(b.id));
+    const captive = captives[0];
+    const readiness = this.level - 1 + (this.weaponLevel > 1 ? 1 : 0) + ((this.player.spells?.length ?? 0) > 0 ? 1 : 0);
+    const sites = DUNGEON_SITES.filter((site) => !this.visitedLocations.includes(site.id));
+    sites.sort((a, b) => {
+      const score = (site: typeof a) => distance(this.player, site.point) * 0.14 + Math.abs(site.difficulty - Math.min(3, readiness)) * 12;
+      return score(a) - score(b);
+    });
+    const site = sites[0];
+    const door = this.actors.find((a) => a.kind === 'dungeon' && a.locationId === site.id);
+    if (!captive || !site || !door) return false;
+
+    if (captive.sittingOn) this.releaseSeat(captive);
+    this.endConversation(captive);
+    const originalPoint = { x: captive.x, z: captive.z };
+    const guardCount = clamp(1 + Math.floor(readiness / 2) + Math.max(0, site.difficulty - 1), 1, 3);
+    const stealth = this.player.skills?.stealth ?? 0;
+    const approach = stealth >= 20
+      ? 'Your stealth may let you slip past the sentries.'
+      : readiness >= 2 ? 'The sentries know the tunnels. Expect a fight if you rush in.' : 'The entrance is close; stay quiet and look for a way through.';
+    const data: DynamicQuestData = {
+      kind: 'rescue', patronId: patron.id, captiveId: captive.id, captiveName: captive.name,
+      dungeonId: site.id, dungeonName: site.name, dungeonActorId: door.id,
+      point: { ...site.point }, originalPoint, reward: 25 + readiness * 10, guardCount, approach,
+    };
+    const state: QuestState = { stage: 'travel', status: 'active', title: `${captive.name} at ${site.name}`, log: [], data };
+    this.quests.rescue = state;
+    state.log.push(QUESTS.rescue.stages.travel.journal(this));
+    this.tracked = 'rescue';
+    captive.capturedFor = 'rescue';
+    captive.followingPlayer = false;
+    captive.activity = 'Captured';
+    captive.utility = undefined;
+    captive.goal = undefined;
+    captive.action = undefined; captive.actionT = 0; captive.actionDur = 0;
+    captive.x = site.point.x + 2.4;
+    captive.z = site.point.z + 2.2;
+    captive.vx = captive.vz = 0;
+    for (let i = 0; i < guardCount; i++) {
+      const angle = (i / guardCount) * Math.PI * 2;
+      const guard = this.spawnFoe('stalker', site.point.x + Math.cos(angle) * 5, site.point.z + Math.sin(angle) * 5);
+      guard.name = 'Cell guard';
+      guard.intent = 'guard';
+      guard.lastKnown = { ...site.point };
+      guard.targetId = PLAYER_ID;
+    }
+    this.notify(`New in your journal: ${state.title}`);
+    return true;
+  }
+
+  rescueCaptive(captive: Actor) {
+    const quest = this.quests.rescue, data = quest?.data;
+    if (!quest || quest.status !== 'active' || quest.stage !== 'free' || !data || data.captiveId !== captive.id || !captive.alive) return false;
+    data.rescued = true;
+    captive.capturedFor = undefined;
+    captive.followingPlayer = true;
+    captive.activity = 'Following';
+    captive.utility = undefined;
+    captive.action = undefined;
+    captive.decideIn = 1;
+    this.adjustOpinion(captive, 12);
+    this.addRumor(captive, 'helped');
+    this.setStage('rescue', 'report');
+    return true;
+  }
+
+  finishRescueQuest(patron: Actor) {
+    const quest = this.quests.rescue, data = quest?.data;
+    const captive = data ? this.byId(data.captiveId) : undefined;
+    if (!quest || quest.status !== 'active' || quest.stage !== 'report' || !data || data.patronId !== patron.id || !captive?.alive) return false;
+    this.stock.gold += data.reward;
+    this.awardExperience(25);
+    this.addToPack('familyLocket');
+    this.adjustOpinion(patron, 10);
+    this.adjustOpinion(captive, 8);
+    captive.followingPlayer = false;
+    captive.activity = undefined;
+    captive.utility = undefined;
+    this.addRumor(patron, 'helped');
+    this.setStage('rescue', 'done');
+    return true;
   }
 
   // ---------------------------------------------------------------- people
@@ -522,26 +700,175 @@ export class SandboxWorld {
     const sneaking = this.player.sneaking;
     return this.actors.filter((n) => {
       if (n.kind !== 'villager' || !n.alive || n.id === exclude || n.activity === 'Sleeping') return false;
-      const d = distance(n, at);
-      if (d > (sneaking ? 6 : 13)) return false;
-      return d < (sneaking ? 2 : 4) || Math.abs(angleDelta(n.facing, angleTo(n, at))) < (sneaking ? 1.1 : 2.0);
+      return canSee(n, at, sneaking ? 6 : 13, this.hour(), this.player.skills?.stealth ?? 0, !!sneaking);
     });
   }
-  private commitCrime(kind: 'theft' | 'assault', value: number, victim?: Actor) {
+  private commitCrime(kind: 'theft' | 'assault' | 'murder', value: number, victim?: Actor) {
     const seen = this.witnesses(this.player, undefined);
-    if (victim && victim.kind === 'villager' && !seen.includes(victim)) seen.push(victim);
+    if (victim && victim.kind === 'villager' && victim.alive && !seen.includes(victim)) seen.push(victim);
     if (!seen.length) return false;
-    this.bounty += kind === 'theft' ? value * 2 + 5 : 25;
-    this.standing = Math.max(-100, this.standing - 4);
+    this.bounty += kind === 'theft' ? value * 2 + 5 : kind === 'murder' ? 100 : 25;
+    this.standing = Math.max(-100, this.standing - (kind === 'murder' ? 20 : 4));
     for (const w of seen) {
       w.memory!.witnessedCrime++;
-      w.memory!.alarmUntil = this.elapsed + (kind === 'assault' ? 45 : 20);
-      this.adjustOpinion(w, kind === 'assault' ? -25 : -12);
-      this.addRumor(w, 'crime');
+      w.memory!.alarmUntil = this.elapsed + (kind === 'murder' ? 90 : kind === 'assault' ? 45 : 20);
+      w.memory!.threatId = this.player.id;
+      this.adjustOpinion(w, kind === 'murder' ? -55 : kind === 'assault' ? -25 : -12);
+      this.addRumor(w, kind === 'murder' && victim ? `murder:${victim.name}` : 'crime');
     }
+    if (kind !== 'murder') this.recordDeed(kind, victim, seen);
     const shout = seen.find((w) => w.profession !== 'Warden') ?? seen[0];
-    this.say(kind === 'theft' ? 'Thief! Somebody fetch the wardens!' : 'Help! Wardens!', shout.name, 3);
+    this.say(kind === 'theft' ? 'Thief! Somebody fetch the wardens!' : kind === 'murder' ? 'Murder! Wardens!' : 'Help! Wardens!', shout.name, 3);
     return true;
+  }
+
+  private locationAt(point: Point) {
+    let best = WORLD_LOCATIONS[0], bd = Infinity;
+    for (const place of WORLD_LOCATIONS) {
+      const d = distance(place.point, point);
+      if (d < bd) { bd = d; best = place; }
+    }
+    return best;
+  }
+
+  /** Persistent world memory of what the guardian did, where, and who saw it. */
+  recordDeed(kind: DeedKind, victim: Actor | undefined, witnessesSeen: Actor[], reaction?: Deed['reaction']) {
+    const existing = victim ? [...this.deeds].reverse().find((d) => d.kind === kind && d.victimId === victim.id && this.elapsed - d.at < 1) : undefined;
+    if (existing) {
+      if (reaction) existing.reaction = reaction;
+      return existing;
+    }
+    const place = this.locationAt(this.player);
+    const deed: Deed = {
+      id: `deed${this.nextId++}`, kind, at: this.elapsed,
+      locationId: place.id, locationName: place.name,
+      victimId: victim?.id, victimName: victim?.name,
+      witnessIds: witnessesSeen.filter((a) => a.alive && a.id !== PLAYER_ID).map((a) => a.id),
+      reaction,
+    };
+    this.deeds.push(deed);
+    for (const w of this.deeds.length > 20 ? witnessesSeen.slice(-2) : witnessesSeen) {
+      if (w.kind === 'villager' && w.memory) this.addRumor(w, `${kind}:${deed.locationName}`);
+    }
+    return deed;
+  }
+
+  houseFor(n: Actor) {
+    if (n.houseId) return this.byId(n.houseId);
+    return this.actors.find((a) => a.kind === 'house' && !!n.home && distance(a, n.home) < 4);
+  }
+
+  residentsOf(house: Actor) {
+    return (house.residents ?? []).map((id) => this.byId(id)).filter((a): a is Actor => !!a && a.alive);
+  }
+
+  houseOwner(house: Actor) {
+    const residents = this.residentsOf(house);
+    return residents.find((a) => !!a.home && distance(a.home!, house) < 4.5) ?? residents[0];
+  }
+
+  /** Doors are barred while the household's night package is active. */
+  houseLocked(house: Actor) {
+    if (house.kind !== 'house') return false;
+    const residents = this.residentsOf(house);
+    if (!residents.length) return false;
+    const hour = this.hour();
+    return residents.some((n) => {
+      const r = n.routine;
+      return !!r && (hour >= r.bedtime - 0.25 || hour < r.wake + 0.25);
+    });
+  }
+
+  activePackageFor(n: Actor, hour = this.hour()) {
+    const pkg = activePackage(n.packages, hour);
+    n.activePackage = pkg?.id;
+    return pkg;
+  }
+
+  /**
+   * The guardian cannot enter a private home. At night the attempt is a break-in:
+   * sleeping residents wake, arm themselves with a warning, and make the intruder leave.
+   */
+  attemptHouseEntry(house: Actor) {
+    if (house.kind !== 'house') return false;
+    const residents = this.residentsOf(house);
+    const owner = this.houseOwner(house);
+    if (!owner) { this.say('The door is locked. No one seems to live here.'); return false; }
+    if (!this.houseLocked(house)) {
+      this.say(`${owner.name}'s door is unbarred, though propriety keeps you on the step.`);
+      return false;
+    }
+    const homeSleepers = residents.filter((n) => distance(n, n.home ?? house) < 4.5 && (n.activity === 'Sleeping' || (n.utility?.kind === 'sleep' && distance(n, n.home ?? house) < 3)));
+    if (!homeSleepers.length) {
+      this.say('The door is barred. No one answers.');
+      return false;
+    }
+    const witnessesSeen = this.witnesses(house, undefined);
+    const deed = this.recordDeed('trespass', undefined, witnessesSeen, 'alarm');
+    if (!deed.witnessIds.length) deed.reaction = 'alarm';
+    this.bounty += 5;
+    for (const n of homeSleepers) {
+      if (n.sittingOn) this.releaseSeat(n);
+      this.endConversation(n);
+      n.memory!.alarmUntil = this.elapsed + 80;
+      n.memory!.threatId = PLAYER_ID;
+      n.homeDefenseUntil = this.elapsed + 24;
+      n.activity = 'Confronting';
+      n.lookAt = PLAYER_ID;
+      n.utility = { kind: 'confront', targetId: PLAYER_ID, until: this.elapsed + 24, score: 2.4 };
+      n.decideIn = 0;
+      this.adjustOpinion(n, -30);
+      this.addRumor(n, 'trespass');
+      n.doorLocked = true;
+    }
+    this.say(this.homeDefenseLine(owner), owner.name, 5);
+    this.noise(house, 13);
+    return true;
+  }
+
+  private homeDefenseLine(owner: Actor) {
+    const responsibility = owner.desires?.responsibility ?? 0.5;
+    const aggression = owner.desires?.aggression ?? 0.4;
+    if (aggression > 0.72) return 'Get out of my house before I put you out myself!';
+    if (responsibility > 0.66) return 'Out! The wardens will hear of this!';
+    return 'What in the light are you doing in my home? Get out!';
+  }
+
+  private recordVendetta(victim: Actor, relatives: Actor[]) {
+    const familyId = victim.familyId ?? `house-${victim.houseId ?? victim.id}`;
+    const contractor = relatives[0];
+    const point = DUNGEON_SITES.find((site) => !this.visitedLocations.includes(site.id))?.point ?? { x: 55, z: -35 };
+    const vendetta: Vendetta = {
+      id: `vendetta${this.nextId++}`, familyId, victimId: victim.id, victimName: victim.name,
+      contractorId: contractor?.id, createdAt: this.elapsed, ambushAt: this.elapsed + 18,
+      point: { x: point.x + 7, z: point.z + 7 }, count: 2, triggered: false, resolved: false,
+    };
+    this.vendettas.push(vendetta);
+    return vendetta;
+  }
+
+  private updateVendettas() {
+    const p = this.player;
+    const inWilderness = Math.hypot(p.x, p.z) > 32;
+    for (const vendetta of this.vendettas) {
+      if (vendetta.triggered || vendetta.resolved || this.elapsed < vendetta.ambushAt || !inWilderness) continue;
+      const contractor = vendetta.contractorId ? this.byId(vendetta.contractorId) : undefined;
+      if (!contractor?.alive) { vendetta.resolved = true; continue; }
+      vendetta.triggered = true;
+      for (let i = 0; i < vendetta.count; i++) {
+        const angle = (i / Math.max(1, vendetta.count)) * Math.PI * 2;
+        const hunter = this.spawnFoe('stalker', p.x + Math.cos(angle) * 7, p.z + Math.sin(angle) * 7);
+        hunter.name = 'Hired blade';
+        hunter.intent = 'chase';
+        hunter.targetId = PLAYER_ID;
+        hunter.vendettaFor = vendetta.victimId;
+        hunter.lastKnown = { x: p.x, z: p.z };
+        hunter.lostFor = 0;
+      }
+      const deed = [...this.deeds].reverse().find((d) => d.kind === 'murder' && d.victimId === vendetta.victimId);
+      if (deed) deed.reaction = 'vendetta';
+      this.say('Hired steel steps out of the trees. The family has not forgotten.', undefined, 5);
+    }
   }
 
   // ---------------------------------------------------------------- update
@@ -601,7 +928,7 @@ export class SandboxWorld {
     this.campTimer += dt;
     if (this.campTimer >= 5) { this.campTimer = 0; this.updateCamps(); }
     this.questTimer += dt;
-    if (this.questTimer >= 0.5) { this.questTimer = 0; this.updateQuests(); }
+    if (this.questTimer >= 0.5) { this.questTimer = 0; this.updateWorldHistory(); this.updateQuests(); this.updateVendettas(); }
     this.confrontCooldown = Math.max(0, this.confrontCooldown - dt);
     if (this.subtitle && this.subtitle.until < this.elapsed) this.subtitle = null;
   }
@@ -729,7 +1056,6 @@ export class SandboxWorld {
         this.hurt(c, dmg, it.thrownBy);
         c.vx += it.vx * 0.4; c.vz += it.vz * 0.4;
         it.vx *= -0.3; it.vz *= -0.3;
-        if (c.kind === 'villager' && it.thrownBy === PLAYER_ID) this.commitCrime('assault', 0, c);
         if (c.kind === 'foe') this.alertFoe(c, this.player);
         break;
       }
@@ -766,8 +1092,22 @@ export class SandboxWorld {
     const d = Math.hypot(dx, dz);
     let tx = 0, tz = 0;
     if (d > stop) {
-      const ang = Math.atan2(dx, dz) + ((a.detourT ?? 0) > 0 ? a.detour ?? 0 : 0);
-      const s = Math.min(speed, (d - stop) * 3 + 0.4);
+      let sx = dx, sz = dz;
+      const targetId = a.kind === 'player' ? this.targetId
+        : a.utility?.targetId ?? a.talkingTo ?? a.quarryId ?? a.targetId
+          ?? (a.followingPlayer || (a.kind === 'foe' && (a.intent === 'chase' || a.intent === 'raid')) ? PLAYER_ID : undefined);
+      for (const other of this.chars) {
+        if (other === a || !other.alive || other.hp <= 0 || other.id === targetId || other.activity === 'Sleeping') continue;
+        const ax = a.x - other.x, az = a.z - other.z;
+        const separation = Math.hypot(ax, az), clearance = a.radius + other.radius + 0.55;
+        if (separation > 1e-4 && separation < clearance) {
+          const strength = (clearance - separation) / clearance * 1.6;
+          sx += ax / separation * strength;
+          sz += az / separation * strength;
+        }
+      }
+      const ang = Math.atan2(sx, sz) + ((a.detourT ?? 0) > 0 ? a.detour ?? 0 : 0);
+      const s = Math.min(speed * this.agilityScale(a), (d - stop) * 3 + 0.4);
       tx = Math.sin(ang) * s;
       tz = Math.cos(ang) * s;
       this.turnToward(a, ang, 7, dt);
@@ -796,12 +1136,20 @@ export class SandboxWorld {
     a.action = kind; a.actionT = 0; a.actionDur = dur; a.actionHit = false;
   }
 
+  private regenerateFocus(actor: Actor, dt: number) {
+    actor.focus = Math.min(actor.maxFocus ?? 0, (actor.focus ?? 0) + dt * (2 + (actor.attrs?.will ?? 6) * 0.2));
+  }
+
+  private agilityScale(actor: Actor) {
+    return 0.88 + clamp(actor.attrs?.agility ?? 6, 0, 12) * 0.02;
+  }
+
   // ---------------------------------------------------------------- the guardian
   private updatePlayer(dt: number) {
     const p = this.player;
     this.staminaDelay -= dt;
     if (this.staminaDelay <= 0) this.stamina = Math.min(this.maxStamina, this.stamina + 24 * dt);
-    p.focus = Math.min(p.maxFocus ?? 0, (p.focus ?? 0) + dt * (2 + (p.attrs?.will ?? 6) * 0.2));
+    this.regenerateFocus(p, dt);
     if (p.hp <= 0) { this.stopMoving(p, dt); return; }
     if (p.sittingOn) {
       const seat = this.byId(p.sittingOn);
@@ -828,12 +1176,12 @@ export class SandboxWorld {
     if (len > 1) { ix /= len; iz /= len; }
     let tx = 0, tz = 0;
     if (p.action === 'roll') {
-      tx = Math.sin(p.facing) * 8.5;
-      tz = Math.cos(p.facing) * 8.5;
+      tx = Math.sin(p.facing) * 8.5 * this.agilityScale(p);
+      tz = Math.cos(p.facing) * 8.5 * this.agilityScale(p);
     } else if (!locked) {
       const mass = held ? ITEMS[held.itemType!].mass : 0;
       const sprint = this.input.sprint && len > 0.1 && this.stamina > 1 && mass < 3 && !attacking && !p.sneaking;
-      const speed = (attacking ? 1.2 : mass >= 3 ? 2.8 : held ? 3.8 : sprint ? 7.4 : 4.3) * (p.sneaking ? 0.55 : 1);
+      const speed = (attacking ? 1.2 : mass >= 3 ? 2.8 : held ? 3.8 : sprint ? 7.4 : 4.3) * this.agilityScale(p) * (p.sneaking ? 0.55 : 1);
       if (sprint) { this.stamina -= 15 * dt; this.staminaDelay = 0.7; }
       tx = ix * speed;
       tz = iz * speed;
@@ -937,7 +1285,6 @@ export class SandboxWorld {
       a.vx += nx * (step === 3 ? 6 : 3);
       a.vz += nz * (step === 3 ? 6 : 3);
       if (a.kind === 'foe') this.alertFoe(a, p);
-      if (a.kind === 'villager' && this.hostileUntil < this.elapsed) this.commitCrime('assault', 0, a);
     }
     if (hitAny) this.combatUntil = this.elapsed + 6;
   }
@@ -945,11 +1292,10 @@ export class SandboxWorld {
   hurt(target: Actor, damage: number, source?: string) {
     if (!target.alive || target.hp <= 0) return;
     if (target.kind === 'player' && this.elapsed < this.invulnUntil) return;
-    if (target.kind === 'player' && source) {
-      damage *= 1 - Math.min(0.45, (target.armor ?? 0) + (target.skills?.guard ?? 0) * 0.002);
-      this.skillXp('guard', 1.5);
+    damage *= 1 - Math.min(0.45, (target.armor ?? 0) + (target.skills?.guard ?? 0) * 0.002);
+    if (source && (target.kind === 'player' || target.kind === 'villager' || target.kind === 'foe')) {
+      this.trainSkill(target, 'guard', target.kind === 'player' ? 1.5 : 0.8);
     }
-    if (target.kind !== 'player') damage *= 1 - (target.armor ?? 0) * 0.7;
     target.hp = Math.max(0, target.hp - damage);
     if (target.kind === 'player') {
       this.combatUntil = this.elapsed + 6;
@@ -966,9 +1312,23 @@ export class SandboxWorld {
       this.targetUntil = this.elapsed + 4;
     }
     if (target.kind === 'villager') {
-      target.hp = Math.max(1, target.hp);
-      this.startAction(target, 'hurt', 0.3);
-      if (target.memory) target.memory.alarmUntil = this.elapsed + 30;
+      if (target.hp > 0) {
+        this.startAction(target, 'hurt', 0.3);
+        if (target.memory) { target.memory.alarmUntil = this.elapsed + 30; target.memory.threatId = source; }
+        if (source === PLAYER_ID && this.hostileUntil < this.elapsed) this.commitCrime('assault', 0, target);
+        return;
+      }
+      this.releaseSeat(target);
+      this.endConversation(target);
+      target.alive = false;
+      target.solid = false;
+      target.activity = 'Dead';
+      target.capturedFor = undefined;
+      target.followingPlayer = false;
+      if (source === PLAYER_ID) {
+        this.onVillagerDeath(target);
+        if (this.hostileUntil < this.elapsed) this.commitCrime('murder', 0, target);
+      }
       return;
     }
     if (target.kind === 'foe') {
@@ -985,10 +1345,56 @@ export class SandboxWorld {
       this.awardExperience(15);
       if (this.rng() < 0.35) { const h = this.spawnItem('herb', target.x, target.z, 0.6); h.sleeping = false; }
       if ((target.carriedWood ?? 0) > 0) { const l = this.spawnItem('log', target.x + 0.4, target.z, 0.6); l.sleeping = false; }
+      if (target.vendettaFor) { const writ = this.spawnItem('mercenaryWrit', target.x, target.z, 0.4); writ.sleeping = false; }
     } else if (target.kind === 'camp' && target.faction === 'wild') {
       this.say('The camp burns. The wilds will remember this.');
       this.awardExperience(60);
     }
+  }
+
+  private onVillagerDeath(victim: Actor) {
+    const blood = this.actors.filter((a) => a.alive && a.kind === 'villager' && a.id !== victim.id
+      && !!victim.familyId && a.familyId === victim.familyId);
+    const relatives = blood.length ? blood : this.actors.filter((a) => a.alive && a.kind === 'villager' && a.id !== victim.id
+      && !!victim.houseId && a.houseId === victim.houseId);
+    const deed = this.recordDeed('murder', victim, this.witnesses(this.player, undefined), relatives.length ? 'estate' : 'alarm');
+    if (!relatives.length) {
+      this.stock.gold += Math.max(0, Math.floor((victim.crowns ?? 0) * 0.5));
+      victim.crowns = 0;
+      victim.items = {};
+      return;
+    }
+    const kin = relatives[0];
+    // The estate, not merely the grudge, passes to the next of kin.
+    const crowns = victim.crowns ?? 0;
+    const items = { ...(victim.items ?? {}) };
+    victim.crowns = 0;
+    victim.items = {};
+    kin.crowns = (kin.crowns ?? 0) + crowns;
+    for (const [type, count] of Object.entries(items) as [ItemType, number][]) this.give(kin, type, count);
+    deed.inheritedBy = kin.id;
+    deed.inheritedCrowns = crowns;
+    deed.reaction = 'vendetta';
+    this.recordVendetta(victim, relatives);
+    for (const relative of relatives) {
+      this.adjustOpinion(relative, -100);
+      if (relative.memory) {
+        relative.memory.alarmUntil = this.elapsed + 180;
+        relative.memory.threatId = PLAYER_ID;
+      }
+      this.addRumor(relative, `murder:${victim.name}`);
+    }
+    // A first show of force at home; the delayed wilderness ambush follows from world state.
+    for (let i = 0; i < 2; i++) {
+      const hunter = this.spawnFoe('stalker', kin.x + (i ? 1 : -1) * 5, kin.z + 5 + i * 2);
+      hunter.name = 'Hired blade';
+      hunter.intent = 'chase';
+      hunter.targetId = PLAYER_ID;
+      hunter.vendettaFor = victim.id;
+      hunter.lastKnown = { x: this.player.x, z: this.player.z };
+      hunter.lostFor = 0;
+    }
+    this.say(`${kin.name} has inherited ${victim.name}'s affairs, and sworn the family will have its reckoning.`, kin.name, 5);
   }
 
   private alertFoe(f: Actor, at: Point) {
@@ -1040,7 +1446,8 @@ export class SandboxWorld {
         if (a.itemType === 'stool') return { name, primary: this.player.sittingOn === a.id ? 'Stand' : 'Sit', secondary: 'Lift', crime: false };
         if (a.itemType === 'strongbox') return { name, primary: a.locked ? 'Pick the lock' : (a.loot?.length ? 'Open' : 'Examine'), crime: false };
         const owned = !!a.owner && a.owner !== 'player';
-        return def.take ? { name, primary: owned ? 'Steal' : 'Take', secondary: 'Lift', crime: owned } : { name, primary: 'Lift', crime: false };
+        const trusted = this.isTrustedHouseholdItem(a);
+        return def.take ? { name, primary: owned && !trusted ? 'Steal' : 'Take', secondary: 'Lift', crime: owned && !trusted } : { name, primary: 'Lift', crime: false };
       }
       case 'tree': return { name, primary: 'Chop', crime: false };
       case 'ore': return { name, primary: 'Mine', crime: false };
@@ -1050,6 +1457,12 @@ export class SandboxWorld {
       case 'bell': return { name, primary: this.waveActive ? 'Examine' : 'Ring', crime: false };
       case 'camp': return { name, primary: 'Rest', crime: false };
       case 'well': return { name, primary: 'Drink', crime: false };
+      case 'dungeon': return { name, primary: 'Examine', crime: false };
+      case 'house': {
+        const locked = this.houseLocked(a);
+        return { name, primary: locked ? 'Try the door' : 'Examine', secondary: locked ? 'Listen' : 'Look in', crime: locked };
+      }
+      case 'tavern': return { name, primary: 'Enter', secondary: 'Listen', crime: false };
       default: return { name, primary: 'Examine', crime: false };
     }
   }
@@ -1057,6 +1470,12 @@ export class SandboxWorld {
   private examineText(a: Actor) {
     if (a.kind === 'rune') return `The face shows the ${RUNE_NAMES[a.currentRune ?? 0]} sign. Cut low into the base: ${RUNE_NAMES[a.targetRune ?? 0]}.`;
     if (a.kind === 'villager') return `${a.name}. ${a.profession} of the village. ${a.persona ? impression(a) : ''}`.trim();
+    if (a.kind === 'house') {
+      const owner = this.houseOwner(a);
+      const locked = this.houseLocked(a);
+      return owner ? `${owner.name}'s home. ${locked ? 'The door is barred from the inside.' : 'The door is unbarred.'}` : STATIC_DESC.house!;
+    }
+    if (a.kind === 'tavern') return STATIC_DESC.tavern!;
     if (a.kind === 'item' && a.itemType === 'strongbox') return a.locked ? 'Iron bands and a good lock. Slim steel would sing in there.' : (a.loot?.length ? 'Unlocked. Something shifts inside.' : 'Empty but for dust.');
     if (a.kind === 'item') return ITEMS[a.itemType!].desc;
     if (a.kind === 'tower' && a.faction === 'wild') return 'Lashed timber and stolen stone. Crude, but it will hold.';
@@ -1093,6 +1512,19 @@ export class SandboxWorld {
       case 'bell':
         if (this.waveActive) this.say(this.examineText(t));
         else this.startWave();
+        return false;
+      case 'dungeon':
+        this.say(this.examineText(t), undefined, 4.5);
+        return false;
+      case 'house':
+        this.attemptHouseEntry(t);
+        return false;
+      case 'tavern':
+        if (this.stock.gold >= 2) {
+          this.stock.gold -= 2;
+          p.hp = Math.min(p.maxHp, p.hp + 8);
+          this.say('You buy a cup of thin ale and listen to the room. The village is still talking.');
+        } else this.say('The tavern keeper shakes an empty cup. Two crowns buys a drink.');
         return false;
       case 'camp':
         p.hp = p.maxHp;
@@ -1170,13 +1602,21 @@ export class SandboxWorld {
   private takeItem(it: Actor) {
     const def = ITEMS[it.itemType!];
     const owned = !!it.owner && it.owner !== 'player';
-    if (owned) this.commitCrime('theft', def.value);
+    const trusted = this.isTrustedHouseholdItem(it);
+    if (owned && !trusted) this.commitCrime('theft', def.value);
     if (def.stock) this.stock[def.stock] += 2;
     else if (def.gold) this.stock.gold += def.gold;
     else this.addToPack(it.itemType!);
     this.actors = this.actors.filter((a) => a !== it);
     this.byIdCache.delete(it.id);
     this.startAction(this.player, 'pickup', 0.38);
+  }
+
+  isTrustedHouseholdItem(item: Actor) {
+    if (item.kind !== 'item' || !item.itemType || !item.owner) return false;
+    const owner = this.npc(item.owner);
+    return !!owner && !!owner.home && ITEMS[item.itemType].value <= 5 && (owner.memory?.opinion ?? 0) >= 40
+      && distance(item, owner.home) < 5.5;
   }
 
   private grab(it: Actor) {
@@ -1249,6 +1689,7 @@ export class SandboxWorld {
 
   // ---------------------------------------------------------------- conversation
   openDialogue(n: Actor) {
+    if (!this.metNpcIds.includes(n.id)) this.metNpcIds.push(n.id);
     if (n.memory) n.memory.conversations++;
     if (n.talkingTo) { const other = this.byId(n.talkingTo); if (other) other.talkingTo = undefined; n.talkingTo = undefined; }
     if (n.activity === 'Sleeping') n.activity = 'Talking';
@@ -1352,7 +1793,7 @@ export class SandboxWorld {
     needs.social = clamp(needs.social + dt / 320, 0, 1);
     needs.fun = clamp(needs.fun + dt / 420, 0, 1);
     if ((n.homeFood ?? 0) < 2 && this.rng() < dt / 300) n.homeFood = (n.homeFood ?? 0) + 1;
-    n.focus = Math.min(n.maxFocus ?? 60, (n.focus ?? 0) + dt * 3);
+    this.regenerateFocus(n, dt);
     n.attackCooldown = Math.max(0, (n.attackCooldown ?? 0) - dt);
     n.workCooldown = Math.max(0, (n.workCooldown ?? 0) - dt);
     if (n.action) {
@@ -1369,9 +1810,21 @@ export class SandboxWorld {
       return;
     }
     const p = this.player;
+    if (n.capturedFor) {
+      n.activity = 'Captured';
+      this.stopMoving(n, dt);
+      return;
+    }
+    if (n.followingPlayer) {
+      const d = this.steer(n, p, 2.5, dt, 2.6);
+      n.activity = d > 3.5 ? 'Following' : 'Waiting';
+      if (d <= 3.5) this.stopMoving(n, dt);
+      return;
+    }
     const dp = distance(n, p);
-    n.lookAt = !asleep && dp < 5 && p.hp > 0 ? PLAYER_ID : n.talkingTo;
-    if (dp < 3.2 && !asleep && p.hp > 0 && this.elapsed - m.lastGreet > 50 && m.alarmUntil < this.elapsed && !n.talkingTo && n.profession !== 'Warden') {
+    const seesPlayer = p.hp > 0 && canSee(n, p, 5, this.hour(), p.skills?.stealth ?? 0, !!p.sneaking);
+    n.lookAt = !asleep && seesPlayer ? PLAYER_ID : n.talkingTo;
+    if (dp < 3.2 && seesPlayer && !asleep && this.elapsed - m.lastGreet > 50 && m.alarmUntil < this.elapsed && !n.talkingTo && n.profession !== 'Warden') {
       m.lastGreet = this.elapsed;
       this.bark(n, barkFor(this, n));
     }
@@ -1409,7 +1862,8 @@ export class SandboxWorld {
         if (n.activity === 'Fighting' && n.attackCooldown <= 0) {
           n.attackCooldown = 1.4;
           this.startAction(n, 'strike', 0.35);
-          this.hurt(p, 9, n.id);
+          this.hurt(p, this.meleeDamage(n), n.id);
+          this.trainSkill(n, 'blade', 1.5);
         } else if (n.activity === 'Pursuing' && this.confrontCooldown <= 0 && !this.dialogue && p.hp > 0) {
           this.confrontCooldown = 25;
           this.dialogue = { npcId: n.id, line: `Stop right there. You owe ${Math.ceil(this.bounty)} crowns for what you did. Pay up, or come with me.`, options: confrontOptions(this), shop: false };
@@ -1434,14 +1888,38 @@ export class SandboxWorld {
       if (other && other.talkingTo === n.id) this.shareRumors(n, other);
       this.endConversation(n);
     }
+    if (n.homeDefenseUntil && n.homeDefenseUntil > this.elapsed) {
+      const intruder = this.byId(PLAYER_ID);
+      if (!intruder || intruder.hp <= 0 || distance(n, intruder) > 15) {
+        n.homeDefenseUntil = 0;
+        m.alarmUntil = 0;
+        n.utility = undefined;
+        n.activity = 'Barring the door';
+      } else {
+        n.utility = { kind: 'confront', targetId: PLAYER_ID, until: n.homeDefenseUntil, score: 2.4 };
+        n.activity = 'Confronting';
+        return;
+      }
+    }
     if (m.alarmUntil > this.elapsed && n.profession !== 'Warden') {
-      n.utility = { kind: 'flee', until: this.elapsed + 6 };
       this.endConversation(n);
+      if (n.sittingOn) this.releaseSeat(n);
+      const threat = m.threatId ? this.byId(m.threatId) : undefined;
+      const courage = n.persona?.courage ?? 0.5, loyalty = n.persona?.loyalty ?? 0.5;
+      const willDefend = threat?.kind === 'player' ? courage > 0.76 && loyalty > 0.55 : threat?.kind === 'foe' && courage > 0.46;
+      const standsGround = !!threat && threat.alive && threat.hp > 0 && distance(n, threat) < 12 && willDefend && n.hp > n.maxHp * 0.4;
+      if (standsGround) {
+        n.activity = 'Fighting';
+        n.utility = { kind: 'fight', targetId: threat!.id, until: this.elapsed + 8, score: 2.2 };
+      } else {
+        n.utility = { kind: 'flee', targetId: threat?.alive ? threat.id : undefined, until: this.elapsed + 6, score: 2 };
+      }
       return;
     }
     if (n.profession === 'Warden') {
       const hostile = this.hostileUntil > this.elapsed;
-      const seesPlayer = distance(n, this.player) < (n.activity === 'Pursuing' || n.activity === 'Fighting' ? 22 : 14);
+      const pursuitRange = n.activity === 'Pursuing' || n.activity === 'Fighting' ? 22 : 14;
+      const seesPlayer = canSee(n, this.player, pursuitRange, this.hour(), this.player.skills?.stealth ?? 0, !!this.player.sneaking);
       if ((this.bounty > 0 || hostile) && seesPlayer && this.player.hp > 0) {
         n.activity = hostile ? 'Fighting' : 'Pursuing';
         this.endConversation(n);
@@ -1456,7 +1934,15 @@ export class SandboxWorld {
       return;
     }
     const cur = n.utility;
-    if (cur && cur.until > this.elapsed && this.goalValid(n, cur)) return;
+    if (cur && cur.until > this.elapsed && this.goalValid(n, cur)) {
+      const next = chooseGoal(this, n);
+      if (next.kind === cur.kind && next.targetId === cur.targetId) { cur.score = next.score; return; }
+      const immediate = next.kind === 'flee' || (next.kind === 'heal' && n.hp < n.maxHp * 0.55);
+      if (!immediate && (next.score ?? 0) <= (cur.score ?? 0.45) + 0.18) return;
+      if (n.sittingOn && next.kind !== 'sit') this.releaseSeat(n);
+      n.utility = next;
+      return;
+    }
     if (n.sittingOn && cur?.kind !== 'sit') this.releaseSeat(n);
     n.utility = chooseGoal(this, n);
   }
@@ -1465,19 +1951,40 @@ export class SandboxWorld {
     const needs = n.needs!;
     switch (g.kind) {
       case 'sleep': return needs.energy < 0.92;
-      case 'eatFood': case 'eatHome': case 'buyFood': return needs.hunger > 0.18;
-      case 'steal': { const t = g.targetId ? this.byId(g.targetId) : undefined; return !!t && t.alive && !t.carriedBy && needs.hunger > 0.3; }
-      case 'scavenge': { const t = g.targetId ? this.byId(g.targetId) : undefined; return !!t && t.alive && !t.carriedBy && !t.owner; }
+      case 'eatFood': return needs.hunger > 0.18 && !!this.firstFood(n);
+      case 'eatHome': return needs.hunger > 0.18 && (n.homeFood ?? 0) > 0;
+      case 'buyFood': return needs.hunger > 0.18 && (n.crowns ?? 0) >= 5 && this.actors.some((a) => a.kind === 'stall' && a.alive);
+      case 'steal': {
+        const t = g.targetId ? this.byId(g.targetId) : undefined;
+        return !!t && t.alive && !t.carriedBy && needs.hunger > 0.3 && (t.itemType === 'strongbox' || (!!t.owner && ['bread', 'apple', 'cheese'].includes(t.itemType ?? '')));
+      }
+      case 'scavenge': {
+        const t = g.targetId ? this.byId(g.targetId) : undefined;
+        return !!t && t.alive && !t.carriedBy && !t.owner && (t.itemType === 'pouch' || ['bread', 'apple', 'cheese', 'herb'].includes(t.itemType ?? ''));
+      }
       case 'sit': {
         const seat = g.targetId ? this.byId(g.targetId) : undefined;
-        return !!seat && seat.alive && !seat.carriedBy && (!seat.seatTakenBy || seat.seatTakenBy === n.id) && (needs.energy < 0.9 || needs.fun > 0.25);
+        const claimed = !!seat && this.actors.some((other) => other !== n && other.alive && other.utility?.kind === 'sit'
+          && other.utility.targetId === seat.id && other.utility.until > this.elapsed);
+        return !!seat && seat.alive && !seat.carriedBy && !claimed && (!seat.seatTakenBy || seat.seatTakenBy === n.id) && (needs.energy < 0.9 || needs.fun > 0.25);
       }
       case 'chat': return needs.social > 0.12 || !!n.talkingTo;
       case 'work': { const h = this.hour(), r = n.routine!; return h >= r.workStart - 0.3 && h < r.workEnd + 0.3; }
       case 'stroll': return needs.fun > 0.15;
       case 'heal': { const t = g.targetId ? this.byId(g.targetId) : undefined; return !!t && t.alive && t.hp < t.maxHp * 0.95; }
-      case 'fight': { const t = g.targetId ? this.byId(g.targetId) : undefined; return !!t && t.alive && distance(t, n) < 16; }
+      case 'fight': {
+        const t = g.targetId ? this.byId(g.targetId) : undefined;
+        const retaliation = t?.kind === 'player' && n.memory?.threatId === t.id && (n.memory.alarmUntil ?? 0) > this.elapsed;
+        return !!t && t.alive && t.hp > 0 && distance(t, n) < 16 && (t.kind === 'foe' || retaliation);
+      }
+      case 'castBolt': {
+        const t = g.targetId ? this.byId(g.targetId) : undefined;
+        return !!t && t.alive && t.kind === 'foe' && (n.spells ?? []).includes('bolt') && (n.focus ?? 0) >= SPELLS.bolt.cost;
+      }
       case 'flee': { const t = g.targetId ? this.byId(g.targetId) : undefined; return !!t && t.alive && distance(t, n) < 14; }
+      case 'confront': return !!n.homeDefenseUntil && n.homeDefenseUntil > this.elapsed;
+      case 'tavern': return (n.crowns ?? 0) >= 2 || (n.needs?.hunger ?? 0) > 0.2;
+      case 'earnFood': return (n.crowns ?? 0) < 6 && !!n.work;
       case 'investigate': return true;
       default: return false;
     }
@@ -1499,6 +2006,72 @@ export class SandboxWorld {
       case 'sleep': {
         const d = go(n.home!, 1.7, 0.5);
         n.activity = d <= 0.9 ? 'Sleeping' : 'Heading home';
+        const house = this.houseFor(n);
+        if (house) house.doorLocked = d <= 0.9;
+        break;
+      }
+      case 'tavern': {
+        const tavern = this.tavern;
+        if (!tavern) { n.utility = undefined; break; }
+        const d = go({ x: tavern.x, z: tavern.z + tavern.radius + 1.15 }, 1.5, 0.7);
+        n.activity = d <= 1.4 ? 'At the tavern' : 'Heading to the tavern';
+        if (d <= 1.4) {
+          this.stopMoving(n, dt);
+          needs.social = Math.max(0, needs.social - dt * 0.025);
+          n.earnTimer = (n.earnTimer ?? 0) + dt;
+          if (g.targetId !== 'served' && n.earnTimer > 2.2) {
+            n.earnTimer = 0;
+            if ((n.crowns ?? 0) >= 3) {
+              n.crowns! -= 3;
+              needs.hunger = Math.max(0, needs.hunger - 0.32);
+              needs.fun = Math.max(0, needs.fun - 0.16);
+              n.activity = 'Eating';
+              g.targetId = 'served';
+            } else if (n.profession !== 'Warden') {
+              n.utility = { kind: 'earnFood', until: this.elapsed + 35 };
+            }
+          }
+        }
+        break;
+      }
+      case 'earnFood': {
+        if (!n.work) { n.utility = undefined; break; }
+        const d = go(n.work, 1.5, 0.7);
+        n.activity = d <= 1.2 ? 'Working for a meal' : 'Looking for work';
+        if (d <= 1.2) {
+          this.stopMoving(n, dt);
+          n.earnTimer = (n.earnTimer ?? 0) + dt;
+          if (n.earnTimer >= 5) {
+            n.earnTimer = 0;
+            n.crowns = (n.crowns ?? 0) + 5;
+            n.utility = { kind: 'buyFood', until: this.elapsed + 30 };
+          }
+        }
+        break;
+      }
+      case 'confront': {
+        const intruder = g.targetId ? this.byId(g.targetId) : undefined;
+        if (!intruder || !intruder.alive || intruder.hp <= 0 || !n.homeDefenseUntil || n.homeDefenseUntil <= this.elapsed) {
+          n.homeDefenseUntil = 0; n.utility = undefined; break;
+        }
+        const d = go(intruder, 3.2, 1.9);
+        n.activity = 'Confronting';
+        n.lookAt = intruder.id;
+        if (d <= 2.8) {
+          this.stopMoving(n, dt);
+          this.turnToward(n, angleTo(n, intruder), 7, dt);
+          if ((n.workCooldown ?? 0) <= 0) {
+            this.say(this.homeDefenseLine(n), n.name, 4);
+            if ((n.desires?.responsibility ?? 0.5) > 0.58) this.noise(n, 12);
+            n.workCooldown = 5;
+          }
+        }
+        if (distance(n, intruder) > 13) {
+          n.homeDefenseUntil = 0;
+          n.memory!.alarmUntil = 0;
+          n.utility = undefined;
+          n.activity = 'Barring the door';
+        }
         break;
       }
       case 'eatFood': case 'eatHome': {
@@ -1541,7 +2114,7 @@ export class SandboxWorld {
           if (seen.length === 0 && this.rng() * 100 < chance) {
             t.locked = 0; t.loot = [];
             n.crowns = (n.crowns ?? 0) + 12;
-            if (n.skills) n.skills.lockpick += 4;
+            this.trainSkill(n, 'lockpick', 4);
           } else if (seen.length) this.caughtStealing(n, seen);
           n.utility = undefined;
           break;
@@ -1550,7 +2123,7 @@ export class SandboxWorld {
         this.actors = this.actors.filter((a) => a !== t);
         this.byIdCache.delete(t.id);
         this.give(n, t.itemType!, 1, !!t.owner);
-        if (n.skills) n.skills.stealth += 3;
+        this.trainSkill(n, 'stealth', 3);
         n.utility = { kind: 'eatFood', until: this.elapsed + 25 };
         break;
       }
@@ -1665,8 +2238,8 @@ export class SandboxWorld {
       }
       case 'fight': {
         const t = g.targetId ? this.byId(g.targetId) : undefined;
-        if (!t || !t.alive) { n.utility = undefined; break; }
-        const reach = 1.15 + t.radius;
+        if (!t || !t.alive || t.hp <= 0 || (t.kind !== 'foe' && !(t.kind === 'player' && n.memory?.threatId === t.id && (n.memory.alarmUntil ?? 0) > this.elapsed))) { n.utility = undefined; break; }
+        const reach = 1.15 + WEAPONS[n.weapon ?? 'fists'].reach + t.radius;
         const d = go(t, 3.4, reach * 0.8);
         n.activity = 'Fighting';
         if (d <= reach + 0.35) {
@@ -1676,6 +2249,21 @@ export class SandboxWorld {
             n.targetId = t.id;
             n.attackCooldown = 1.35;
             this.startAction(n, 'windup', 0.45);
+          }
+        }
+        break;
+      }
+      case 'castBolt': {
+        const t = g.targetId ? this.byId(g.targetId) : undefined;
+        if (!t || !t.alive || t.kind !== 'foe' || (n.focus ?? 0) < SPELLS.bolt.cost) { n.utility = undefined; break; }
+        const d = go(t, 2.2, SPELLS.bolt.range - 0.6);
+        n.activity = d <= SPELLS.bolt.range ? 'Casting' : 'Closing in';
+        if (d <= SPELLS.bolt.range) {
+          this.stopMoving(n, dt);
+          this.turnToward(n, angleTo(n, t), 5, dt);
+          if ((n.workCooldown ?? 0) <= 0) {
+            if (this.castBolt(n, t)) n.workCooldown = 2.6;
+            else n.utility = undefined;
           }
         }
         break;
@@ -1703,15 +2291,13 @@ export class SandboxWorld {
   /** Who can see this spot, allowing for a thief who knows how to move quietly. */
   private seenByOthers(at: Point, thief: Actor): Actor[] {
     const stealth = thief.skills?.stealth ?? 0;
-    const radius = 4.2 + (1 - Math.min(1, stealth / 100)) * 4.5;
+    const sneaking = !!thief.sneaking || thief.activity === 'Sneaking';
     const seen: Actor[] = [];
     for (const o of this.chars) {
       if (o === thief || !o.alive || o.hp <= 0) continue;
       if (o.kind !== 'villager' && o.kind !== 'player') continue;
       if (o.kind === 'villager' && o.activity === 'Sleeping') continue;
-      const d = distance(o, at);
-      if (d > radius) continue;
-      if (d < 3 || Math.abs(angleDelta(o.facing, angleTo(o, at))) < 1.9) seen.push(o);
+      if (canSee(o, at, 8.7, this.hour(), stealth, sneaking)) seen.push(o);
     }
     return seen;
   }
@@ -1728,12 +2314,11 @@ export class SandboxWorld {
   /** A villager's blow, resolved when their wind-up completes. Uses the same melee rules as foes. */
   private npcStrike(n: Actor) {
     const t = n.targetId ? this.byId(n.targetId) : undefined;
-    if (!t || !t.alive || t.kind !== 'foe') return;
+    if (!t || !t.alive || (t.kind !== 'foe' && !(t.kind === 'player' && n.memory?.threatId === t.id && (n.memory.alarmUntil ?? 0) > this.elapsed))) return;
     if (distance(n, t) > 1.3 + WEAPONS[n.weapon ?? 'fists'].reach + t.radius) return;
     this.hurt(t, this.meleeDamage(n), n.id);
-    if (n.skills) n.skills.blade = Math.min(100, n.skills.blade + 1.5);
-    t.targetId = n.id;
-    this.alertFoe(t, n);
+    this.trainSkill(n, 'blade', 1.5);
+    if (t.kind === 'foe') { t.targetId = n.id; this.alertFoe(t, n); }
   }
 
   /** Sounds carry. Curious villagers come and look; wardens come faster. */
@@ -1741,7 +2326,7 @@ export class SandboxWorld {
     for (const n of this.chars) {
       if (n.kind !== 'villager' || !n.alive || n.activity === 'Sleeping' || n.activity === 'Fleeing') continue;
       if (distance(n, at) > radius) continue;
-      if (n.profession === 'Warden' || (n.persona?.courage ?? 0) > 0.35) {
+      if (n.profession === 'Warden' || (n.persona?.courage ?? 0) > 0.35 || (n.persona?.curiosity ?? 0) > 0.62) {
         n.utility = { kind: 'investigate', point: { x: at.x, z: at.z }, until: this.elapsed + 16 };
         n.decideIn = Math.min(n.decideIn ?? 0, 2.5);
       }
@@ -1749,16 +2334,19 @@ export class SandboxWorld {
   }
 
   // ---------------------------------------------------------------- spells & skills (shared by everyone)
+  /** Skill growth is shared by the guardian and every autonomous actor. */
+  trainSkill(actor: Actor, kind: SkillKind, amount: number) {
+    if (!actor.skills || amount <= 0) return;
+    const before = Math.floor(actor.skills[kind] / 25);
+    actor.skills[kind] = clamp(actor.skills[kind] + amount, 0, 100);
+    if (actor.kind === 'player' && Math.floor(actor.skills[kind] / 25) > before) this.notify(`Your ${kind} skill improves.`);
+  }
   skillXp(kind: SkillKind, amount: number) {
-    const p = this.player;
-    if (!p.skills) return;
-    const before = Math.floor(p.skills[kind] / 25);
-    p.skills[kind] = Math.min(100, p.skills[kind] + amount);
-    if (Math.floor(p.skills[kind] / 25) > before) this.notify(`Your ${kind} skill improves.`);
+    this.trainSkill(this.player, kind, amount);
   }
 
   castMending(caster: Actor): boolean {
-    if ((caster.focus ?? 0) < SPELLS.mending.cost) return false;
+    if ((caster.focus ?? 0) < SPELLS.mending.cost || (caster.kind !== 'foe' && !caster.spells?.includes('mending'))) return false;
     let target: Actor | undefined, worst = 1;
     for (const a of this.actors) {
       if (!a.alive || a.hp <= 0) continue;
@@ -1772,32 +2360,36 @@ export class SandboxWorld {
     target.hp = Math.min(target.maxHp, target.hp + SPELLS.mending.power * (1 + (caster.skills?.magic ?? 0) / 100));
     caster.shotAt = this.elapsed; caster.shotX = target.x; caster.shotZ = target.z;
     this.startAction(caster, 'strike', 0.35);
-    if (caster.kind === 'player') this.skillXp('magic', 6);
+    this.trainSkill(caster, 'magic', 6);
     return true;
   }
 
   castBolt(caster: Actor, target?: Actor): boolean {
     if ((caster.focus ?? 0) < SPELLS.bolt.cost) return false;
     let t = target;
-    if (!t || !t.alive) {
+    if (!t || !t.alive || !this.isHostile(caster, t) || distance(caster, t) > SPELLS.bolt.range) {
       let bd = SPELLS.bolt.range;
       for (const a of this.actors) {
         if (!a.alive || a.hp <= 0) continue;
-        const hostile = caster.faction === 'wild' ? a.kind === 'player' : a.kind === 'foe';
-        if (!hostile) continue;
+        if (!this.isHostile(caster, a)) continue;
         const d = distance(a, caster);
         if (d < bd) { bd = d; t = a; }
       }
     }
-    if (!t) return false;
+    if (!t || !t.alive || !this.isHostile(caster, t) || distance(caster, t) > SPELLS.bolt.range) return false;
     caster.focus! -= SPELLS.bolt.cost;
     caster.facing = angleTo(caster, t);
     caster.shotAt = this.elapsed; caster.shotX = t.x; caster.shotZ = t.z;
     this.startAction(caster, 'strike', 0.3);
     this.hurt(t, SPELLS.bolt.power * (1 + (caster.skills?.magic ?? 0) / 120), caster.id);
     if (t.kind === 'foe') this.alertFoe(t, caster);
-    if (caster.kind === 'player') this.skillXp('magic', 5);
+    this.trainSkill(caster, 'magic', 5);
     return true;
+  }
+
+  private isHostile(caster: Actor, target: Actor) {
+    if (caster.faction === 'wild') return target.faction === 'citadel' || target.kind === 'player';
+    return target.kind === 'foe' || target.faction === 'wild';
   }
 
   /** The guardian casts with the same rules, focus and skills as any villager mage. */
@@ -1855,9 +2447,11 @@ export class SandboxWorld {
     }
     const p = this.player;
     const dp = distance(f, p);
-    const sees = p.hp > 0 && (dp < (p.sneaking ? 4.5 : 8) || (dp < (p.sneaking ? 8 : 15) && Math.abs(angleDelta(f.facing, angleTo(f, p))) < 1.1));
+    const closeSighting = p.sneaking ? dp < 4.5 : dp < 8;
+    const sees = p.hp > 0 && (closeSighting || canSee(f, p, p.sneaking ? 12 : 15, this.hour(), p.skills?.stealth ?? 0, !!p.sneaking));
     if (sees && f.intent !== 'chase' && f.intent !== 'flee') this.alertFoe(f, p);
     if (sees) { f.lastKnown = { x: p.x, z: p.z }; f.lostFor = 0; }
+    if (f.intent === 'guard' && !sees) { this.stopMoving(f, dt); return; }
     if (f.hp < f.maxHp * 0.3 && def.courage < 0.5 && dp < 12) f.intent = 'flee';
 
     if (f.intent === 'flee') {
@@ -1867,7 +2461,7 @@ export class SandboxWorld {
       return;
     }
     if (f.intent === 'chase' || f.intent === 'raid') {
-      if (f.intent === 'chase' && !sees) {
+      if (f.intent === 'chase' && !sees && !f.vendettaFor) {
         f.lostFor = (f.lostFor ?? 0) + dt;
         if ((f.lostFor ?? 0) > 3) { f.intent = 'search'; return; }
       }
@@ -2121,6 +2715,8 @@ export class SandboxWorld {
       level: this.level, xp: this.xp, weaponLevel: this.weaponLevel, flags: this.flags, quests: this.quests, tracked: this.tracked,
       wave: this.wave, waveCleared: this.waveCleared, bounty: this.bounty, standing: this.standing, nextId: this.nextId,
       echoProgress: this.echoProgress, echoSolved: this.echoSolved, respawn: this.respawn,
+      visitedLocations: this.visitedLocations, metNpcIds: this.metNpcIds,
+      deeds: this.deeds, vendettas: this.vendettas,
     })) as WorldSave;
   }
 
@@ -2137,6 +2733,51 @@ export class SandboxWorld {
     this.nextId = Number.isFinite(s.nextId) && s.nextId > 0 ? s.nextId : this.actors.length + 1000;
     this.echoProgress = s.echoProgress ?? 0; this.echoSolved = !!s.echoSolved;
     this.respawn = s.respawn ?? this.respawn;
+    this.visitedLocations = Array.isArray(s.visitedLocations) ? [...s.visitedLocations] : ['village'];
+    this.metNpcIds = Array.isArray(s.metNpcIds) ? [...s.metNpcIds] : [];
+    this.deeds = Array.isArray(s.deeds) ? s.deeds : [];
+    this.vendettas = Array.isArray(s.vendettas) ? s.vendettas : [];
+    if (!this.actors.some((a) => a.kind === 'tavern' && a.alive)) {
+      this.add('tavern', 'The Kettle & Crown', TAVERN_POINT.x, TAVERN_POINT.z, {
+        radius: 2.15, height: 4.8, solid: true, faction: 'citadel', desc: STATIC_DESC.tavern,
+      });
+      this.add('table', 'Tavern table', TAVERN_POINT.x, TAVERN_POINT.z + 2.7, { radius: 0.8, height: 0.9, surface: 0.9, desc: 'A scarred table, ringed with old cup marks.' });
+      this.spawnItem('stool', TAVERN_POINT.x - 0.85, TAVERN_POINT.z + 2.7, 0, 'tavern');
+      this.spawnItem('stool', TAVERN_POINT.x + 0.85, TAVERN_POINT.z + 2.7, 0, 'tavern');
+    }
+    const houses = this.actors.filter((a) => a.kind === 'house' && a.alive);
+    for (const house of houses) house.residents ??= [];
+    for (const name of ['Tobin', 'Bran']) {
+      const relative = this.npc(name);
+      if (relative) relative.familyId ??= 'marlowe';
+    }
+    for (const site of DUNGEON_SITES) {
+      if (!this.actors.some((a) => a.kind === 'dungeon' && a.locationId === site.id)) {
+        this.add('dungeon', site.name, site.point.x, site.point.z, {
+          radius: 1.3, height: 3.6, solid: true, locationId: site.id,
+          desc: `A dark entrance into ${site.name.toLowerCase()}. The stone around it is older than the road.`,
+        });
+      }
+    }
+    for (const name of ['Tobin', 'Bran']) {
+      const owner = this.npc(name);
+      if (owner?.home && !this.actors.some((a) => a.kind === 'item' && a.itemType === 'candle' && a.owner === name)) {
+        this.spawnItem('candle', owner.home.x + 1, owner.home.z + 0.8, 0, name);
+      }
+    }
+    for (const npc of this.actors.filter((a) => a.kind === 'villager' && a.alive)) {
+      if (npc.routine && !npc.packages) npc.packages = makePackages(npc.routine, npc.profession ?? '');
+      if (!npc.desires) npc.desires = makeDesires(this.rng, npc.profession ?? '', npc.persona);
+      if (!npc.houseId && npc.home && houses.length) {
+        const house = houses.reduce((best, candidate) => distance(candidate, npc.home!) < distance(best, npc.home!) ? candidate : best, houses[0]);
+        npc.houseId = house.id;
+      }
+      const house = npc.houseId ? this.byId(npc.houseId) : undefined;
+      if (house?.kind === 'house') {
+        house.residents ??= [];
+        if (!house.residents.includes(npc.id)) house.residents.push(npc.id);
+      }
+    }
     // Raids in progress do not survive a reload; everything else is exactly as it was left.
     for (const a of this.actors) if (a.kind === 'foe' && a.intent === 'raid') { a.alive = false; a.solid = false; }
     this.reindex();

@@ -2,7 +2,7 @@
 export type ItemType =
   | 'apple' | 'bread' | 'cheese' | 'book' | 'ledger' | 'pot' | 'jug' | 'barrel' | 'crate' | 'bucket'
   | 'hammer' | 'candle' | 'pouch' | 'herb' | 'log' | 'stoneChunk' | 'draught' | 'stool' | 'basket' | 'lantern'
-  | 'tomeBolt' | 'tomeMend' | 'lockpicks' | 'strongbox';
+  | 'tomeBolt' | 'tomeMend' | 'lockpicks' | 'strongbox' | 'familyLocket' | 'mercenaryWrit';
 
 export interface ItemDef {
   name: string;
@@ -56,4 +56,6 @@ export const ITEMS: Record<ItemType, ItemDef> = {
   },
   lockpicks: { name: 'Lockpicks', desc: 'Slim steel, oiled and ready.', value: 6, radius: 0.1, mass: 0.1, height: 0.05, take: true },
   strongbox: { name: 'Iron-banded strongbox', desc: 'Heavy, and locked.', value: 0, radius: 0.36, mass: 9, height: 0.42, take: false },
+  familyLocket: { name: 'Marlowe family locket', desc: 'A small silver locket engraved with two names.', value: 18, radius: 0.11, mass: 0.1, height: 0.06, take: true, read: 'Inside, beneath a faded sketch, is a note: "For the ones who always find their way home."' },
+  mercenaryWrit: { name: 'Mercenary writ', desc: 'A folded order sealed with black wax.', value: 0, radius: 0.16, mass: 0.1, height: 0.025, take: true, read: 'The writ names Tobin Marlowe and bears the mark of a hired company. Someone paid them to hunt the guardian.' },
 };

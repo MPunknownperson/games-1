@@ -3,7 +3,6 @@ import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { audio } from './engine/audio';
 import { LogoMark } from './ui/Icons';
 import { ITEMS, type ItemType } from './world/items';
-import { QUESTS } from './world/story';
 import { BUILDINGS, SandboxWorld, type HudView, type StructureKind, type WorldSave } from './world/simulation';
 import { WorldRenderer } from './world/renderer';
 
@@ -467,16 +466,29 @@ function Journal({ world, onChange }: { world: SandboxWorld; onChange: () => voi
     <div className="journal">
       <aside>
         <h4>Underway</h4>
-        {active.map((id) => <button key={id} className={id === sel ? 'on' : ''} onClick={() => setSel(id)}>{QUESTS[id].title}{world.tracked === id && <small>followed</small>}</button>)}
+        {active.map((id) => <button key={id} className={id === sel ? 'on' : ''} onClick={() => setSel(id)}>{world.questTitle(id)}{world.tracked === id && <small>followed</small>}</button>)}
         {done.length > 0 && <h4>Finished</h4>}
-        {done.map((id) => <button key={id} className={`done ${id === sel ? 'on' : ''}`} onClick={() => setSel(id)}>{QUESTS[id].title}</button>)}
+        {done.map((id) => <button key={id} className={`done ${id === sel ? 'on' : ''}`} onClick={() => setSel(id)}>{world.questTitle(id)}</button>)}
       </aside>
       {q && (
         <article>
-          <h2>{QUESTS[sel].title}</h2>
+          <h2>{world.questTitle(sel)}</h2>
           <p className="entry">{world.journalText(sel)}</p>
           {q.log.length > 1 && <div className="earlier">{q.log.slice(0, -1).reverse().map((t, i) => <p key={i}>{t}</p>)}</div>}
           {q.status === 'active' && world.tracked !== sel && <button className="text-btn" onClick={() => { world.tracked = sel; onChange(); }}>Follow this on the compass</button>}
+          {world.deeds.length > 0 && (
+            <div className="earlier deeds">
+              <h4>Deeds remembered</h4>
+              {world.deeds.slice(-4).reverse().map((deed) => {
+                const kin = deed.inheritedBy ? world.byId(deed.inheritedBy)?.name : undefined;
+                const reaction = deed.kind === 'trespass'
+                  ? 'The household woke, and the wardens were called.'
+                  : kin ? `${kin} inherited the estate${deed.inheritedCrowns ? ` (${deed.inheritedCrowns} crowns)` : ''} and hired blades for the reckoning.`
+                    : 'The village remembers, even when no one names it.';
+                return <p key={deed.id}><strong>{deed.kind.toUpperCase()}</strong> at {deed.locationName} &middot; {reaction}</p>;
+              })}
+            </div>
+          )}
         </article>
       )}
     </div>
@@ -546,7 +558,11 @@ function WorldMap({ world }: { world: SandboxWorld }) {
   const s = (n: number) => ((n + 90) / 180) * 600;
   const p = world.player;
   const q = world.questTarget();
-  const places: [string, number, number][] = [['The Citadel', 0, -8], ['Storehouse', -31, 8], ['Old mill', -44, 36], ['Watch post', 3, 28], ['Echo stones', 27, -19], ['Standing stones', -11, 7]];
+  const places: [string, number, number][] = [['The Citadel', 0, -8], ['The Kettle & Crown', -5.4, -4.6], ['Storehouse', -31, 8], ['Watch post', 3, 28], ['Echo stones', 27, -19], ['Standing stones', -11, 7]];
+  for (const dungeon of world.actors.filter((a) => a.kind === 'dungeon')) {
+    const explored = !!dungeon.locationId && world.visitedLocations.includes(dungeon.locationId);
+    places.push([explored ? dungeon.name : 'Unexplored ruin', dungeon.x, dungeon.z]);
+  }
   for (const c of world.actors.filter((a) => a.kind === 'camp' && a.alive)) places.push([c.faction === 'wild' ? c.name : 'Field camp', c.x, c.z]);
   return (
     <svg className="map" viewBox="0 0 600 600" role="img" aria-label="Map of the First Meadow">

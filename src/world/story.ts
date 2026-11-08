@@ -8,6 +8,21 @@ export interface QuestStage {
   target?: (w: SandboxWorld) => Point | undefined;
   update?: (w: SandboxWorld) => string | undefined;
 }
+export interface DynamicQuestData {
+  kind: 'rescue';
+  patronId: string;
+  captiveId: string;
+  captiveName: string;
+  dungeonId: string;
+  dungeonName: string;
+  dungeonActorId: string;
+  point: Point;
+  originalPoint: Point;
+  reward: number;
+  guardCount: number;
+  approach: string;
+  rescued?: boolean;
+}
 export interface QuestDef {
   id: string;
   title: string;
@@ -229,6 +244,69 @@ export const QUESTS: Record<string, QuestDef> = {
       },
     },
   },
+
+  rescue: {
+    id: 'rescue',
+    title: 'A Favor Repaid',
+    stages: {
+      travel: {
+        journal: (w) => {
+          const data = w.quests.rescue?.data;
+          return data ? `${data.captiveName} was taken to ${data.dungeonName}. ${data.approach} Find the entrance before the trail goes cold.` : 'Someone has gone missing beyond the village roads.';
+        },
+        target: (w) => {
+          const data = w.quests.rescue?.data;
+          const door = data ? w.byId(data.dungeonActorId) : undefined;
+          return door ? at(door) : data?.point;
+        },
+        update: (w) => {
+          const data = w.quests.rescue?.data;
+          const door = data ? w.byId(data.dungeonActorId) : undefined;
+          return door && dist(w.player, door) < 8 ? 'free' : undefined;
+        },
+      },
+      free: {
+        journal: (w) => {
+          const data = w.quests.rescue?.data;
+          return data ? `${data.captiveName} is being held near the entrance to ${data.dungeonName}. Get close enough to speak and free them.` : 'Find the captive and bring them home.';
+        },
+        target: (w) => {
+          const data = w.quests.rescue?.data;
+          return at(data ? w.byId(data.captiveId) : undefined);
+        },
+        update: (w) => w.quests.rescue?.data?.rescued ? 'report' : undefined,
+      },
+      report: {
+        journal: (w) => {
+          const data = w.quests.rescue?.data;
+          return data ? `${data.captiveName} is safe and following you. Return to the person who asked for help.` : 'Return to the person who asked for help.';
+        },
+        target: (w) => {
+          const data = w.quests.rescue?.data;
+          return at(data ? w.byId(data.patronId) : undefined);
+        },
+      },
+    },
+    talk: (w, npc, stage) => {
+      const state = w.quests.rescue;
+      const data = state?.data;
+      if (!state && w.canGenerateRescue(npc)) return [opt('rescue-accept', 'Have you heard of anyone missing?', (world, patron) => {
+        if (!world.generateRescueQuest(patron)) return { line: 'Not yet. I need to know who has gone missing and where they were taken.' };
+        const quest = world.quests.rescue?.data;
+        return { line: quest ? `${quest.captiveName} trusted you, and you returned that trust. They were taken to ${quest.dungeonName}. ${quest.approach}` : 'Someone has gone missing. Find them before the trail goes cold.' };
+      })];
+      if (!data || state?.status !== 'active') return [];
+      if (stage === 'free' && npc.id === data.captiveId) return [opt('rescue-free', 'I came to bring you home.', (world, captive) => {
+        world.rescueCaptive(captive);
+        return { line: `I knew you would come. Let us get back to ${world.byId(data.patronId)?.name ?? 'the village'}.`, end: true };
+      })];
+      if (stage === 'report' && npc.id === data.patronId) return [opt('rescue-report', `${data.captiveName} is safe.`, (world, patron) => {
+        world.finishRescueQuest(patron);
+        return { line: `You brought ${data.captiveName} back. I will remember what you did for us.`, end: true };
+      })];
+      return [];
+    },
+  },
 };
 
 const WORK: Record<string, string> = {
@@ -243,12 +321,14 @@ const WORK: Record<string, string> = {
   Apprentice: 'Mara is teaching me the light. Mostly I sweep.',
   Smith: 'That iron blade Tobin sells is mine. Worth every crown, and you will feel it.',
   Gardener: 'Everything here grows if you leave it be long enough. Even trouble.',
-  Baker: 'Bread at dawn, bread at dusk. The watch eats more than anyone.',
+  Baker: 'Bread at dawn, bread at dusk. Tobin is my brother; he keeps the books, I keep the ovens. The watch eats more than anyone.',
   Scout: "Tobin's carts never get raided. Not once. Ever wonder why? I would love a look at that ledger of his.",
 };
 
 function newsFor(w: SandboxWorld, npc: Actor): string {
   const m = npc.memory!;
+  const murder = m.rumors.find((r) => r.startsWith('murder:'));
+  if (murder) return `${murder.slice(7)} was killed. Their family has put a price on the guardian's head. Keep your distance.`;
   const thief = m.rumors.find((r) => r.startsWith('thief:'));
   if (thief) return `Have you heard? ${thief.slice(6)} was caught stealing, bold as brass. The wardens fined them on the spot.`;
   if (m.rumors.includes('crime')) return "People are saying you've been taking what isn't yours. I hope that's just talk.";
@@ -270,6 +350,7 @@ export function greetingFor(w: SandboxWorld, npc: Actor): string {
   if (m.alarmUntil > w.elapsed) return 'Stay back! I saw what you did.';
   if (m.opinion < -30) return per && per.temper < 0.35 ? 'What. Do. You. Want?' : 'What do you want?';
   if (per && per.kindness > 0.72 && m.opinion > 5) return 'Guardian. Always a welcome sight.';
+  if (m.opinion >= 40) return 'There you are, friend. You know what is yours here; take only what you need.';
   if (per && per.greed > 0.75) return 'Guardian. Buying, or just looking?';
   const h = w.hour();
   const time = h < 12 ? 'Morning' : h < 18 ? 'Afternoon' : 'Evening';

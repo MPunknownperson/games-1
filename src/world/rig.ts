@@ -10,7 +10,7 @@ export const BONES: BoneName[] = ['hips', 'spine', 'chest', 'neck', 'head', 'lUp
 
 export type AnimState =
   | 'idle' | 'walk' | 'run' | 'jump' | 'fall' | 'land' | 'attack1' | 'attack2' | 'attack3' | 'roll' | 'hurt' | 'dead'
-  | 'gather' | 'carry' | 'carryWalk' | 'throw' | 'talk' | 'sit' | 'sleep' | 'work' | 'tend' | 'cheer' | 'pickup' | 'windup' | 'strike' | 'sneak';
+  | 'gather' | 'carry' | 'carryWalk' | 'throw' | 'talk' | 'sit' | 'sleep' | 'work' | 'tend' | 'cheer' | 'pickup' | 'windup' | 'strike' | 'sneak' | 'captured';
 
 export interface RigStyle {
   coat: string; trim: string; skin: string; pants: string; hair: string; boots?: string;
@@ -150,15 +150,15 @@ function add(b: BoneName, x: number, y = 0, z = 0) { const i = IDX[b]; target[i]
 const clamp01 = (n: number) => Math.max(0, Math.min(1, n));
 const ease = (n: number) => n * n * (3 - 2 * n);
 
-function gait(ph: number, leg: number, knee: number, arm: number) {
+function gait(ph: number, leg: number, knee: number, arm: number, blend = 1) {
   const s = Math.sin(ph), c = Math.cos(ph);
-  set('lThigh', -s * leg); set('rThigh', s * leg);
-  set('lShin', Math.max(0, c) * knee + 0.06); set('rShin', Math.max(0, -c) * knee + 0.06);
-  set('lFoot', s * leg * 0.4); set('rFoot', -s * leg * 0.4);
-  set('lUpperArm', s * arm, 0, 0.06); set('rUpperArm', -s * arm, 0, -0.06);
-  set('lForearm', -0.25 - arm * 0.35); set('rForearm', -0.25 - arm * 0.35);
-  add('chest', 0, s * 0.12, 0);
-  add('hips', 0, -s * 0.08, 0);
+  set('lThigh', -s * leg * blend); set('rThigh', s * leg * blend);
+  set('lShin', (Math.max(0, c) * knee + 0.06) * blend); set('rShin', (Math.max(0, -c) * knee + 0.06) * blend);
+  set('lFoot', s * leg * 0.4 * blend); set('rFoot', -s * leg * 0.4 * blend);
+  set('lUpperArm', s * arm * blend, 0, 0.06 * blend); set('rUpperArm', -s * arm * blend, 0, -0.06 * blend);
+  set('lForearm', (-0.25 - arm * 0.35) * blend); set('rForearm', (-0.25 - arm * 0.35) * blend);
+  add('chest', 0, s * 0.12 * blend, 0);
+  add('hips', 0, -s * 0.08 * blend, 0);
 }
 
 export interface AnimContext { phase: number; actionT: number; speed: number }
@@ -175,19 +175,19 @@ function pose(state: AnimState, t: number, c: AnimContext): number {
       set('lThigh', 0, 0, 0.03); set('rThigh', 0, 0, -0.03);
       break;
     case 'walk':
-      gait(c.phase, 0.55, 0.65, 0.42); set('chest', 0.03, target[IDX.chest + 1]); hy = -Math.abs(Math.sin(c.phase)) * 0.03;
+      gait(c.phase, 0.55, 0.65, 0.42, clamp01(c.speed / 2.5)); set('chest', 0.03, target[IDX.chest + 1]); hy = -Math.abs(Math.sin(c.phase)) * 0.03 * clamp01(c.speed / 2.5);
       break;
     case 'run':
-      gait(c.phase, 0.95, 1.2, 0.85); add('spine', 0.22); add('head', -0.14); set('lForearm', -1.2); set('rForearm', -1.2);
+      gait(c.phase, 0.95, 1.2, 0.85, clamp01(c.speed / 6)); add('spine', 0.22); add('head', -0.14); set('lForearm', -1.2); set('rForearm', -1.2);
       hy = -Math.abs(Math.sin(c.phase)) * 0.07 + 0.02;
       break;
     case 'carry': case 'carryWalk':
-      if (state === 'carryWalk') gait(c.phase, 0.42, 0.5, 0);
+      if (state === 'carryWalk') gait(c.phase, 0.42, 0.5, 0, clamp01(c.speed / 2.5));
       set('lUpperArm', -1.15, 0, -0.28); set('rUpperArm', -1.15, 0, 0.28);
       set('lForearm', -0.55); set('rForearm', -0.55); add('spine', -0.08);
       break;
     case 'sneak':
-      gait(c.phase, 0.32, 0.5, 0.12);
+      gait(c.phase, 0.32, 0.5, 0.12, clamp01(c.speed / 1.8));
       set('spine', 0.5); set('chest', 0.12); set('head', -0.3);
       set('lForearm', -0.7); set('rForearm', -0.7);
       hy = -0.16;
@@ -235,6 +235,12 @@ function pose(state: AnimState, t: number, c: AnimContext): number {
       break;
     case 'dead':
       set('hips', -1.45); hy = -0.74; set('lUpperArm', 0, 0, 1.2); set('rUpperArm', 0, 0, -1.3); set('head', 0, 0.4); set('lThigh', -0.15); set('rThigh', 0.1);
+      break;
+    case 'captured':
+      set('spine', 0.28); set('chest', 0.1); set('head', 0.2, Math.sin(t * 0.7) * 0.08);
+      set('lUpperArm', -1.35, 0, 0.32); set('rUpperArm', -1.35, 0, -0.32);
+      set('lForearm', -1.15); set('rForearm', -1.15); set('lHand', -0.2); set('rHand', -0.2);
+      set('lThigh', -0.1); set('rThigh', 0.1); hy = -0.04;
       break;
     case 'gather': {
       const cyc = c.actionT > 0 ? clamp01(c.actionT / 0.95) : (t * 1.1) % 1;
@@ -301,8 +307,10 @@ export function animateRig(rig: Rig, state: AnimState, t: number, dt: number, c:
   const snappy = state === 'roll' || state.startsWith('attack') || state === 'strike' || state === 'throw';
   const k = state === 'roll' ? 1 : 1 - Math.exp(-dt * (snappy ? 26 : 12));
   const cur = rig.current;
-  if (state !== 'roll' && Math.abs(cur[0]) > Math.PI) cur[0] = Math.atan2(Math.sin(cur[0]), Math.cos(cur[0]));
-  for (let i = 0; i < cur.length; i++) cur[i] += (target[i] - cur[i]) * k;
+  for (let i = 0; i < cur.length; i++) {
+    if (state === 'roll') cur[i] = target[i];
+    else cur[i] += Math.atan2(Math.sin(target[i] - cur[i]), Math.cos(target[i] - cur[i])) * k;
+  }
   rig.hipsY += (hy - rig.hipsY) * (state === 'roll' ? 1 : k);
   for (let b = 0; b < BONES.length; b++) rig.bones[BONES[b]].rotation.set(cur[b * 3], cur[b * 3 + 1], cur[b * 3 + 2]);
   rig.bones.hips.position.y = rig.hipsBase + rig.hipsY;
