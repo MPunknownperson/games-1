@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
 import { SandboxWorld, type Actor } from '../src/world/simulation';
+import { DUNGEON_SITES } from '../src/world/narrative';
+import { activePackage } from '../src/world/packages';
+import { animateRig, buildRig } from '../src/world/rig';
+import { canSee, chooseGoal } from '../src/world/vivid';
 
 const tests: [string, () => void][] = [];
 const test = (name: string, fn: () => void) => tests.push([name, fn]);
@@ -89,6 +93,19 @@ test('objects carried elsewhere stay exactly where they were left, across saves'
   assert.deepEqual({ x: restored.x, y: restored.y, z: restored.z }, left);
 });
 
+test('narrative: older saves gain new dungeon sites and family links without losing progress', () => {
+  const w = new SandboxWorld(6);
+  const old = w.snapshot();
+  old.actors = old.actors.filter((a) => a.kind !== 'dungeon' && !(a.kind === 'item' && a.itemType === 'candle' && (a.owner === 'Tobin' || a.owner === 'Bran')));
+  old.visitedLocations = undefined; old.metNpcIds = undefined;
+  old.flags.keepProgress = true;
+  const restored = new SandboxWorld(w.seed, old);
+  assert.equal(restored.flags.keepProgress, true);
+  assert.equal(restored.actors.filter((a) => a.kind === 'dungeon').length, DUNGEON_SITES.length);
+  assert.ok(restored.npc('Tobin')!.familyId && restored.npc('Bran')!.familyId);
+  assert.ok(restored.actors.some((a) => a.itemType === 'candle' && a.owner === 'Tobin'));
+});
+
 test('a looted room keeps its scattered contents when you return', () => {
   const w = new SandboxWorld(5);
   w.flags.test = 1;
@@ -147,6 +164,174 @@ test('theft is a crime only when someone sees it', () => {
   assert.equal(w2.bounty, 0);
   assert.equal(w2.pack.ledger, 1);
 });
+
+test('narrative: a bonded, encountered villager can trigger a tailored rescue quest', () => {
+  const w = new SandboxWorld(83);
+  const mara = w.npc('Mara')!, bran = w.npc('Bran')!;
+  w.metNpcIds.push(mara.id, bran.id);
+  w.adjustOpinion(mara, 30); w.adjustOpinion(bran, 24);
+  w.player.skills!.stealth = 40;
+  assert.equal(w.canGenerateRescue(mara), true);
+  assert.equal(w.generateRescueQuest(mara), true);
+  const quest = w.quests.rescue!, data = quest.data!;
+  assert.equal(data.captiveId, bran.id, "the quest ignored the player's relationship");
+  assert.ok(DUNGEON_SITES.some((site) => site.id === data.dungeonId), 'the target is not a dungeon');
+  assert.ok(!w.visitedLocations.includes(data.dungeonId), 'the quest chose an already explored site');
+  assert.match(data.approach, /stealth/i, 'the objective did not use the player skill profile');
+  assert.equal(bran.capturedFor, 'rescue');
+  assert.equal(w.questTitle('rescue').includes(data.dungeonName), true);
+  const restored = save(w);
+  assert.deepEqual(restored.quests.rescue!.data, data, 'generated objective did not survive a save');
+  assert.ok(restored.metNpcIds.includes(bran.id));
+
+  const door = w.byId(data.dungeonActorId)!;
+  w.player.x = door.x - 7; w.player.z = door.z;
+  tick(w, 0.6);
+  assert.equal(w.questStage('rescue'), 'free', 'reaching the chosen dungeon did not advance the quest');
+  assert.ok(w.visitedLocations.includes(data.dungeonId), 'exploration history did not record the dungeon');
+  face(w, bran, 0.02);
+  w.interact();
+  assert.ok(w.dialogueView()!.options.some((option) => option.id === 'rescue-free'));
+  w.choose('rescue-free');
+  assert.equal(w.questStage('rescue'), 'report');
+  assert.equal(bran.followingPlayer, true);
+  face(w, mara);
+  w.interact(); w.choose('rescue-report');
+  assert.equal(w.quests.rescue!.status, 'done');
+  assert.equal(w.pack.familyLocket, 1);
+});
+
+test('relationships let a trusted guardian take low-value goods from a home', () => {
+  const w = new SandboxWorld(89);
+  const tobin = w.npc('Tobin')!;
+  tobin.memory!.opinion = 45;
+  const candle = w.spawnItem('candle', tobin.home!.x + 1, tobin.home!.z + 0.8, 0, tobin.name);
+  assert.equal(w.isTrustedHouseholdItem(candle), true);
+  face(w, candle, 0.02);
+  assert.equal(w.hud().prompt?.crime, false);
+  w.interact();
+  assert.equal(w.bounty, 0);
+  assert.equal(w.pack.candle, 1);
+
+  tobin.memory!.opinion = 0;
+  const apple = w.spawnItem('apple', tobin.home!.x + 0.8, tobin.home!.z + 0.5, 0, tobin.name);
+  assert.equal(w.isTrustedHouseholdItem(apple), false, 'a stranger got the household privilege');
+});
+
+test('relationships: killing the shopkeeper sends a family vendetta after the guardian', () => {
+  const w = new SandboxWorld(97);
+  const tobin = w.npc('Tobin')!, bran = w.npc('Bran')!;
+  tobin.crowns = 48; bran.crowns = 3;
+  w.player.x = tobin.x; w.player.z = tobin.z + 2;
+  w.hurt(tobin, 120, w.player.id);
+  assert.equal(tobin.alive, false);
+  assert.ok(bran.memory!.rumors.includes('murder:Tobin'));
+  assert.ok(bran.memory!.opinion < 0);
+  assert.equal(bran.crowns, 51, 'the estate did not pass to next of kin');
+  const deed = w.deeds.find((d) => d.kind === 'murder' && d.victimId === tobin.id);
+  assert.ok(deed, 'the murder was not recorded as a world deed');
+  assert.equal(deed!.locationName, 'First Meadow');
+  assert.equal(deed!.inheritedBy, bran.id);
+  assert.equal(deed!.inheritedCrowns, 48);
+  const vendetta = w.vendettas.find((v) => v.victimId === tobin.id);
+  assert.ok(vendetta, 'no delayed family vendetta was scheduled');
+  assert.equal(vendetta!.contractorId, bran.id);
+  const hunters = w.actors.filter((a) => a.kind === 'foe' && a.vendettaFor === tobin.id);
+  assert.equal(hunters.length, 2);
+  assert.ok(hunters.every((hunter) => hunter.intent === 'chase' && hunter.targetId === w.player.id));
+  w.hurt(hunters[0], 200, w.player.id);
+  assert.ok(w.actors.some((a) => a.itemType === 'mercenaryWrit'), 'the hired company left no evidence');
+
+  const ambushers = () => w.actors.filter((a) => a.kind === 'foe' && a.alive && a.vendettaFor === tobin.id).length;
+  const before = ambushers();
+  w.player.x = 60; w.player.z = 60;
+  for (let i = 0; i < 600; i++) w.update(0.05);
+  assert.equal(vendetta!.triggered, true, 'the wilderness ambush never triggered');
+  assert.ok(ambushers() > before, 'no hired thugs appeared in the wilds');
+  const restored = save(w);
+  assert.ok(restored.deeds.some((d) => d.victimId === tobin.id));
+  assert.ok(restored.vendettas.some((v) => v.victimId === tobin.id && v.triggered));
+});
+
+test('AI packages: the smith forges, takes a midday tavern meal and locks the house at night', () => {
+  const w = new SandboxWorld(101);
+  const sera = w.npc('Sera')!;
+  assert.ok(sera.packages && sera.packages.length >= 4);
+  assert.equal(activePackage(sera.packages, 8)?.kind, 'work');
+  assert.equal(activePackage(sera.packages, 12)?.target, 'tavern');
+  assert.equal(activePackage(sera.packages, 23)?.kind, 'home');
+  assert.equal(w.activePackageFor(sera, 12)?.id, 'midday-meal');
+  const house = w.houseFor(sera)!;
+  assert.equal(house.kind, 'house');
+  assert.ok(house.residents!.includes(sera.id));
+  assert.equal(w.houseLocked(house), false);
+
+  sera.needs = { energy: 0.9, hunger: 0.62, social: 0.2, fun: 0 };
+  sera.crowns = 20; sera.items = {}; sera.homeFood = 0;
+  sera.x = 0; sera.z = 4; sera.decideIn = 0; sera.utility = undefined;
+  w.elapsed = (12 - 8) * 30;
+  tick(w, 0.2);
+  assert.equal(sera.utility?.kind, 'tavern', 'the midday package did not pull the smith toward the tavern');
+  tick(w, 30);
+  assert.equal(sera.crowns, 17, 'the tavern meal was not paid for');
+  assert.ok(sera.needs!.hunger < 0.45, 'the meal did not satisfy hunger');
+
+  w.elapsed = (23 - 8) * 30;
+  sera.x = sera.home!.x; sera.z = sera.home!.z; sera.utility = { kind: 'sleep', until: w.elapsed + 40 };
+  tick(w, 1);
+  assert.equal(w.houseLocked(house), true, 'the household did not lock up at night');
+});
+
+test('AI desires: responsibility decides between earning a meal, stealing, or enduring hunger', () => {
+  const w = new SandboxWorld(103);
+  const base = (name: string) => {
+    const npc = w.npc(name)!;
+    npc.needs = { energy: 0.9, hunger: 0.98, social: 0, fun: 0 };
+    npc.items = {}; npc.homeFood = 0; npc.crowns = 0;
+    npc.persona!.honesty = 0.22;
+    npc.utility = undefined;
+    w.elapsed = (10 - 8) * 30;
+    return npc;
+  };
+  const iona = base('Iona');
+  iona.desires = { responsibility: 0.92, aggression: 0.2, confidence: 0.8 };
+  assert.equal(chooseGoal(w, iona).kind, 'earnFood', 'a responsible person did not seek honest work');
+  iona.desires = { responsibility: 0.12, aggression: 0.35, confidence: 0.3 };
+  assert.equal(chooseGoal(w, iona).kind, 'steal', 'a desperate, irresponsible person did not consider theft');
+  iona.desires = { responsibility: 0.9, aggression: 0.05, confidence: 0.05 };
+  iona.work = undefined;
+  const endured = chooseGoal(w, iona);
+  assert.ok(!['earnFood', 'eatFood', 'eatHome', 'buyFood', 'steal'].includes(endured.kind), 'food appeared from nowhere');
+});
+
+test('home invasion: a barred door wakes the owner and brings a shouted confrontation', () => {
+  const w = new SandboxWorld(107);
+  const sera = w.npc('Sera')!;
+  const house = w.houseFor(sera)!;
+  w.elapsed = (23 - 8) * 30;
+  sera.x = sera.home!.x; sera.z = sera.home!.z;
+  sera.utility = { kind: 'sleep', until: w.elapsed + 60 };
+  sera.activity = 'Sleeping';
+  sera.doorLocked = true;
+  for (const v of w.actors.filter((a) => a.kind === 'villager' && a !== sera)) {
+    v.x = 70; v.z = -70; v.utility = { kind: 'idle', until: 1e9 }; v.decideIn = 1e6;
+  }
+  w.player.x = house.x; w.player.z = house.z + house.radius + 2.3; w.player.facing = Math.PI;
+  assert.equal(w.houseLocked(house), true);
+  assert.equal(w.attemptHouseEntry(house), true);
+  assert.equal(sera.activity, 'Confronting');
+  assert.ok((sera.homeDefenseUntil ?? 0) > w.elapsed, 'the owner was not jolted awake');
+  assert.ok((sera.memory?.alarmUntil ?? 0) > w.elapsed);
+  assert.ok(w.deeds.some((d) => d.kind === 'trespass'));
+  assert.ok(w.bounty > 0);
+  const hp = w.player.hp;
+  tick(w, 8);
+  assert.equal(sera.activity, 'Confronting');
+  assert.ok(sera.utility?.kind === 'confront');
+  assert.ok(Math.hypot(sera.x - w.player.x, sera.z - w.player.z) < 8, 'the owner did not approach the intruder');
+  assert.equal(w.player.hp, hp, 'the confrontation should be a warning, not an execution');
+});
+
 
 test("Tobin's ledger branches on what you do with it", () => {
   const start = () => {
@@ -273,6 +458,35 @@ test('vivid: villagers are generated with unique temperaments, routines and capa
   assert.ok(new Set(villagers.map((v) => v.routine!.bedtime.toFixed(2))).size > 5, 'routines repeat');
   assert.ok(villagers.every((v) => v.attrs && v.skills && v.routine));
   assert.ok((a.npc('Alden')!.skills!.blade) > (a.npc('Lark')!.skills!.blade), 'the warden should out-fight the herbalist');
+  assert.ok(villagers.every((v) => typeof v.persona!.curiosity === 'number' && typeof v.persona!.patience === 'number' && typeof v.persona!.loyalty === 'number'));
+});
+
+test('vivid: perception changes with facing, stealth and darkness', () => {
+  const w = new SandboxWorld(23);
+  const watcher = w.npc('Tobin')!;
+  watcher.x = 0; watcher.z = 0; watcher.facing = 0;
+  assert.equal(canSee(watcher, { x: 0, z: 8 }, 13, 12), true, 'the watcher missed someone ahead');
+  assert.equal(canSee(watcher, { x: 0, z: -6 }, 13, 12), false, 'the watcher saw through the back of their head');
+  assert.equal(canSee(watcher, { x: 0, z: 8 }, 13, 12, 100, true), false, 'a skilled crouching target was detected too easily');
+  assert.equal(canSee(watcher, { x: 0, z: 11 }, 13, 23), false, 'night did not reduce sight range');
+});
+
+test('vivid: urgent hunger can replace a valid work goal without inventing food', () => {
+  const w = new SandboxWorld(17);
+  w.elapsed = (10 - 8) * 30;
+  const iona = w.npc('Iona')!;
+  iona.needs = { energy: 0.9, hunger: 0.99, social: 0, fun: 0 };
+  iona.items = { bread: 1 };
+  iona.utility = { kind: 'work', until: w.elapsed + 60, score: 0.5 };
+  iona.decideIn = 0;
+  w.update(0.05);
+  assert.equal(iona.utility?.kind, 'eatFood', 'the work goal was not interrupted by hunger');
+
+  const ellis = w.npc('Ellis')!;
+  ellis.needs = { energy: 0.9, hunger: 0.99, social: 0, fun: 0 };
+  ellis.items = {}; ellis.homeFood = 0; ellis.crowns = 0; ellis.persona!.honesty = 1; ellis.persona!.greed = 0;
+  const goal = chooseGoal(w, ellis);
+  assert.ok(!['eatFood', 'eatHome', 'buyFood', 'steal'].includes(goal.kind), `chose an unavailable meal: ${goal.kind}`);
 });
 
 test('vivid: a hungry, penniless, dishonest villager steals when nobody is watching', () => {
@@ -331,6 +545,7 @@ test('vivid: two villagers, one stool — one sits, the other finds something el
   tick(w, 30);
   const sitting = pair.filter((v) => v.sittingOn === stool.id);
   assert.equal(sitting.length, 1, `expected one seated villager, got ${sitting.length}`);
+  assert.ok(pair.filter((v) => v.utility?.kind === 'sit' && v.utility.targetId === stool.id).length <= 1, 'two villagers reserved the same stool');
   const other = pair.find((v) => v !== sitting[0])!;
   assert.notEqual(other.activity, 'Sitting');
   assert.notEqual(other.sittingOn, stool.id);
@@ -345,6 +560,25 @@ test('vivid: the apprentice heals the wounded with the same spell system the gua
   rhea.needs!.hunger = 0; rhea.needs!.social = 0; rhea.needs!.fun = 0; rhea.needs!.energy = 0.9;
   tick(w, 12);
   assert.ok(mara.hp > mara.maxHp * 0.3, `Mara was not healed (${mara.hp})`);
+});
+
+test('vivid: a mage chooses the shared bolt spell when a foe is in range', () => {
+  const w = new SandboxWorld(29);
+  const rhea = w.npc('Rhea')!;
+  const foe = w.actors.find((a) => a.kind === 'foe')!;
+  w.player.x = -70; w.player.z = -70;
+  for (const v of w.actors.filter((a) => a.kind === 'villager' && a !== rhea)) {
+    v.x = 70; v.z = -70; v.utility = { kind: 'idle', until: 1e9 }; v.decideIn = 1e6;
+  }
+  rhea.x = 40; rhea.z = 40; rhea.facing = 0; rhea.vx = rhea.vz = 0;
+  rhea.needs = { energy: 0.9, hunger: 0, social: 0, fun: 0 };
+  rhea.utility = undefined; rhea.decideIn = 0;
+  foe.x = 40; foe.z = 46; foe.facing = Math.PI; foe.intent = 'forage'; foe.targetId = undefined;
+  const hp = foe.hp, focus = rhea.focus!, magic = rhea.skills!.magic;
+  tick(w, 1.2);
+  assert.ok(foe.hp < hp, 'the mage did not attack with a spell');
+  assert.ok(rhea.focus! < focus, 'the NPC spent no shared focus');
+  assert.ok(rhea.skills!.magic > magic, 'the NPC learned no magic from casting');
 });
 
 test('vivid: the guardian learns spells from books and casts them with shared rules', () => {
@@ -466,6 +700,58 @@ test('vivid: everyone hits with the same formula, and the weapon in hand matters
   w.stock.gold = 500; w.buy('blade');
   assert.equal(p.weapon, 'blade');
   assert.ok(w.meleeDamage(p) > bare, 'the iron blade changed nothing');
+});
+
+test('vivid: shared skill training caps player and NPC values identically', () => {
+  const w = new SandboxWorld(41);
+  const p = w.player, lark = w.npc('Lark')!;
+  p.skills!.guard = 98; lark.skills!.guard = 98;
+  w.trainSkill(p, 'guard', 5); w.trainSkill(lark, 'guard', 5);
+  assert.equal(p.skills!.guard, 100);
+  assert.equal(lark.skills!.guard, 100);
+});
+
+test('vivid: the guardian agility attribute changes movement speed', () => {
+  const travel = (agility: number) => {
+    const w = new SandboxWorld(59);
+    const p = w.player;
+    p.x = 70; p.z = -70; p.attrs!.agility = agility;
+    w.input = { x: 1, z: 0, sprint: false };
+    tick(w, 1);
+    return p.x - 70;
+  };
+  assert.ok(travel(10) > travel(2) + 0.1, 'agility did not affect player movement');
+});
+
+test('vivid: a brave, loyal villager can retaliate with the shared melee system', () => {
+  const w = new SandboxWorld(53);
+  const mara = w.npc('Mara')!, p = w.player;
+  p.x = 40; p.z = 40; p.hp = p.maxHp;
+  mara.x = 40; mara.z = 42; mara.vx = mara.vz = 0;
+  mara.persona!.courage = 1; mara.persona!.loyalty = 1;
+  mara.needs = { energy: 0.9, hunger: 0, social: 0, fun: 0 };
+  mara.utility = undefined; mara.decideIn = 0;
+  for (const v of w.actors.filter((a) => a.kind === 'villager' && a !== mara)) {
+    v.x = 70; v.z = -70; v.utility = { kind: 'idle', until: 1e9 }; v.decideIn = 1e6;
+  }
+  const hp = p.hp;
+  w.hurt(mara, 5, p.id);
+  tick(w, 4);
+  assert.equal(mara.memory!.threatId, p.id, 'the attack was not remembered');
+  assert.ok(p.hp < hp, 'the brave villager never struck back');
+  assert.ok((mara.skills!.blade ?? 0) > 0, 'the villager did not improve the shared blade skill');
+});
+
+test('engine: locomotion blends with speed and captured NPCs have a stable pose', () => {
+  const rig = buildRig({ coat: '#52604a', trim: '#b8a171', skin: '#c99470', pants: '#38342f', hair: '#30251f' });
+  animateRig(rig, 'walk', 0.8, 0.05, { phase: 1.4, actionT: 0, speed: 0.45 });
+  const shortStride = rig.bones.lThigh.rotation.x;
+  animateRig(rig, 'walk', 0.8, 0.05, { phase: 1.4, actionT: 0, speed: 2.5 });
+  const fullStride = rig.bones.lThigh.rotation.x;
+  assert.ok(Math.abs(fullStride) > Math.abs(shortStride), 'walking stride did not respond to speed');
+  animateRig(rig, 'captured', 1.1, 0.05, { phase: 0, actionT: 0, speed: 0 });
+  assert.ok(rig.bones.lUpperArm.rotation.x < 0, 'captured pose did not bind the arms forward');
+  assert.ok(Object.values(rig.bones).every((bone) => Number.isFinite(bone.rotation.x + bone.rotation.y + bone.rotation.z)));
 });
 
 test('vivid: a worker whose spot is occupied works beside it instead of freezing', () => {
