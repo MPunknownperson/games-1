@@ -21,8 +21,10 @@ kbd { font-family: var(--sans); }
 
 .shell { position: relative; width: 100%; height: 100%; overflow: hidden; user-select: none; }
 .view { position: absolute; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
-.world-fallback { position: absolute; inset: 0; background: linear-gradient(rgba(14, 17, 14, 0.24), rgba(14, 17, 14, 0.44)), url('/images/meadow-preview.jpg') center / cover; pointer-events: none; opacity: 1; transition: opacity 0.65s ease; }
+.world-fallback { position: absolute; inset: 0; background: #151a16 center / cover; pointer-events: none; opacity: 1; transition: opacity 0.65s ease; }
 .world-fallback.is-hidden { opacity: 0; }
+.world-fallback.recovering { opacity: 1; transition: none; }
+.graphics-recovery { position: absolute; right: 28px; bottom: 28px; margin: 0; font: 16px var(--serif); color: var(--ink); text-shadow: var(--shadow); }
 .mode-play .view { cursor: none; }
 .fatal { position: absolute; inset: 0; display: grid; place-content: center; text-align: center; background: #151a16; font-family: var(--serif); }
 

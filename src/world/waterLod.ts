@@ -33,8 +33,8 @@ export function waterGeometry(radius: number, segments: number, rings: number) {
 
 export class WaterLod {
   readonly group = new THREE.Group();
-  readonly normalMap: THREE.CanvasTexture;
-  private layers: { high: THREE.Mesh; low: THREE.Mesh; highMaterial: THREE.MeshPhongMaterial; lowMaterial: THREE.MeshPhongMaterial; fade: number }[] = [];
+  normalMap: THREE.Texture;
+  private layers: { high: THREE.Mesh; highMaterial: THREE.MeshPhongMaterial }[] = [];
   private geometries: THREE.BufferGeometry[] = [];
   private time = 0;
 
@@ -56,43 +56,38 @@ export class WaterLod {
     this.normalMap.repeat.set(3, 3);
     for (const body of WATER_BODIES) {
       const highGeometry = waterGeometry(body.radius, 96, 4);
-      const lowGeometry = waterGeometry(body.radius, 24, 1);
-      this.geometries.push(highGeometry, lowGeometry);
+      this.geometries.push(highGeometry);
       const common = { color: '#4b7480', specular: '#879da3', shininess: 55, normalMap: this.normalMap,
         transparent: true, depthWrite: false, side: THREE.DoubleSide } as const;
-      const highMaterial = new THREE.MeshPhongMaterial({ ...common, opacity: 0 });
-      const lowMaterial = new THREE.MeshPhongMaterial({ ...common, opacity: 0.78 });
+      const highMaterial = new THREE.MeshPhongMaterial({ ...common, opacity: 0.82 });
       const high = new THREE.Mesh(highGeometry, highMaterial);
-      const low = new THREE.Mesh(lowGeometry, lowMaterial);
       high.position.set(body.x, 0, body.z);
-      low.position.set(body.x, 0, body.z);
-      high.renderOrder = 2; low.renderOrder = 1;
-      high.visible = false;
-      this.group.add(low, high);
-      this.layers.push({ high, low, highMaterial, lowMaterial, fade: 0 });
+      this.group.add(high);
+      this.layers.push({ high, highMaterial });
     }
   }
 
-  update(camera: { x: number; z: number }, dt: number) {
+  update(_camera: { x: number; z: number }, dt: number) {
     this.time += Math.max(0, dt);
     this.normalMap.offset.set(this.time * 0.007 % 1, this.time * 0.005 % 1);
-    for (const [i, body] of WATER_BODIES.entries()) {
-      const layer = this.layers[i];
-      const distance = Math.hypot(camera.x - body.x, camera.z - body.z);
-      const target = distance < 48 ? 1 : 0;
-      layer.fade = Math.max(0, Math.min(1, layer.fade + Math.sign(target - layer.fade) * Math.min(1 / 8, dt * 2.5)));
-      layer.highMaterial.opacity = layer.fade * 0.82;
-      layer.lowMaterial.opacity = (1 - layer.fade) * 0.78;
-      layer.high.visible = layer.fade > 0.005;
-      layer.low.visible = layer.fade < 0.995;
-    }
+  }
+
+  setNormalMap(texture: THREE.Texture) {
+    const previous = this.normalMap;
+    texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
+    texture.repeat.copy(previous.repeat);
+    texture.offset.copy(previous.offset);
+    texture.colorSpace = THREE.NoColorSpace;
+    this.normalMap = texture;
+    for (const layer of this.layers) { layer.highMaterial.normalMap = texture; layer.highMaterial.needsUpdate = true; }
+    previous.dispose();
   }
 
   get highDetailCount() { return this.layers.filter((layer) => layer.high.visible).length; }
-  get lowDetailCount() { return this.layers.filter((layer) => layer.low.visible).length; }
+  get lowDetailCount() { return 0; }
   dispose() {
     for (const geometry of this.geometries) geometry.dispose();
-    for (const layer of this.layers) { layer.highMaterial.dispose(); layer.lowMaterial.dispose(); }
+    for (const layer of this.layers) layer.highMaterial.dispose();
     this.normalMap.dispose();
   }
 }

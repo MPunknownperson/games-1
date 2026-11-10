@@ -6,6 +6,8 @@ import { ITEMS, type ItemType } from './world/items';
 import { BUILDINGS, SandboxWorld, type HudView, type StructureKind, type WorldSave } from './world/simulation';
 import { WorldRenderer } from './world/renderer';
 import { EXTERIOR_SPACE } from './world/cells';
+import { MEADOW_PREVIEW } from './world/previewAsset';
+import { exportChoreographyState, initializeChoreography } from './world/choreography';
 
 const SAVE_KEY = 'preserve-everything-world-v2';
 type Mode = 'title' | 'loading' | 'intro' | 'play';
@@ -40,6 +42,7 @@ export default function App() {
   const [menu, setMenu] = useState<Tab | null>(null);
   const [hud, setHud] = useState<HudView>(() => world.hud());
   const [error, setError] = useState('');
+  const [graphicsLost, setGraphicsLost] = useState(false);
   const [canvasVisible, setCanvasVisible] = useState(false);
   const [muted, setMuted] = useState(false);
   const [showControls, setShowControls] = useState(false);
@@ -50,9 +53,12 @@ export default function App() {
   const rendererRef = useRef<WorldRenderer | null>(null);
   const keys = useRef(new Set<string>());
   const stick = useRef({ x: 0, y: 0 });
+  const touchBlock = useRef(false);
   const modeRef = useRef(mode);
   const menuRef = useRef(menu);
   const dialogueRef = useRef(false);
+  const intentionalUnlockRef = useRef(false);
+  const graphicsLostRef = useRef(false);
   const fpsRef = useRef(0);
   const revealFramesRef = useRef(0);
   const revealStartedRef = useRef(0);
@@ -63,6 +69,21 @@ export default function App() {
   menuRef.current = menu;
   dialogueRef.current = !!hud.dialogue;
 
+  const setMenuNow = (next: Tab | null) => {
+    menuRef.current = next;
+    if (next) { keys.current.clear(); touchBlock.current = false; }
+    setMenu(next);
+  };
+  const releasePointer = () => {
+    if (!canvasRef.current || document.pointerLockElement !== canvasRef.current) return;
+    intentionalUnlockRef.current = true;
+    document.exitPointerLock?.();
+  };
+
+  useEffect(() => {
+    if (import.meta.env.DEV && new URLSearchParams(window.location.search).has('theatre')) void initializeChoreography();
+  }, []);
+
   // ---------------------------------------------------------------- renderer & loop
   useEffect(() => {
     if (!rendererRequested) return;
@@ -71,6 +92,23 @@ export default function App() {
     let r: WorldRenderer;
     try { r = new WorldRenderer(canvas, worldRef.current); } catch { setError('This browser could not start WebGL, which the world needs to render.'); return; }
     rendererRef.current = r;
+    const onContextLost = (event: Event) => {
+      event.preventDefault();
+      graphicsLostRef.current = true;
+      keys.current.clear();
+      stick.current = { x: 0, y: 0 };
+      touchBlock.current = false;
+      setGraphicsLost(true);
+    };
+    const onContextRestored = () => {
+      try {
+        r.restoreContext();
+        graphicsLostRef.current = false;
+        setGraphicsLost(false);
+      } catch { setError('Graphics could not be restored. Reload the page to try again.'); }
+    };
+    canvas.addEventListener('webglcontextlost', onContextLost);
+    canvas.addEventListener('webglcontextrestored', onContextRestored);
     if (import.meta.env.DEV) {
       (window as unknown as { __world: SandboxWorld; __renderer: WorldRenderer }).__world = worldRef.current;
       (window as unknown as { __renderer: WorldRenderer }).__renderer = r;
@@ -84,6 +122,7 @@ export default function App() {
       last = now;
       const dt = Math.min(0.05, frameTime);
       const m = modeRef.current;
+      if (graphicsLostRef.current) { raf = requestAnimationFrame(tick); return; }
       if (m === 'play' && revealStartedRef.current === 0) revealStartedRef.current = now;
       if (m === 'title') { raf = requestAnimationFrame(tick); return; }
       if (m === 'loading') {
@@ -107,7 +146,7 @@ export default function App() {
         const fwd = Number(k.has('w')) - Number(k.has('s')) - stick.current.y;
         const strafe = Number(k.has('d')) - Number(k.has('a')) + stick.current.x;
         const f = r.forward();
-        activeWorld.input = { x: f.x * fwd - f.z * strafe, z: f.z * fwd + f.x * strafe, sprint: k.has('shift') };
+        activeWorld.input = { x: f.x * fwd - f.z * strafe, z: f.z * fwd + f.x * strafe, sprint: k.has('shift'), block: k.has('q') || touchBlock.current };
         if (k.has('arrowleft')) r.orbit(-dt * 700, 0);
         if (k.has('arrowright')) r.orbit(dt * 700, 0);
         // Fixed-size sub-steps keep the world running at real speed even when frames are slow.
@@ -154,7 +193,7 @@ export default function App() {
         const h = activeWorld.hud();
         const key = JSON.stringify(h);
         if (key !== lastHud) {
-          if (h.dialogue && !dialogueRef.current) document.exitPointerLock?.();
+          if (h.dialogue && !dialogueRef.current) { touchBlock.current = false; releasePointer(); }
           lastHud = key;
           setHud(h);
         }
@@ -167,6 +206,8 @@ export default function App() {
     return () => {
       cancelAnimationFrame(raf);
       window.removeEventListener('pagehide', leave);
+      canvas.removeEventListener('webglcontextlost', onContextLost);
+      canvas.removeEventListener('webglcontextrestored', onContextRestored);
       r.dispose();
       rendererRef.current = null;
     };
@@ -186,7 +227,9 @@ export default function App() {
     const onLock = () => {
       const isLocked = document.pointerLockElement === canvas;
       setLocked(isLocked);
-      if (!isLocked && modeRef.current === 'play' && !menuRef.current && !dialogueRef.current) setMenu('system');
+      if (isLocked) { intentionalUnlockRef.current = false; return; }
+      if (intentionalUnlockRef.current) { intentionalUnlockRef.current = false; return; }
+      if (modeRef.current === 'play' && !menuRef.current && !worldRef.current.dialogue) setMenuNow('system');
     };
     const onMove = (e: MouseEvent) => {
       if (document.pointerLockElement === canvas) rendererRef.current?.orbit(e.movementX, e.movementY);
@@ -203,7 +246,7 @@ export default function App() {
       if (key === 'tab' || key === ' ' || key.startsWith('arrow')) e.preventDefault();
       if (mode === 'intro') { skipIntro(); return; }
       if (mode !== 'play') return;
-      if (menu) { if (key === 'escape' || key === 'tab') setMenu(null); return; }
+      if (menu) { if (key === 'escape' || key === 'tab') setMenuNow(null); return; }
       const dialogue = world.dialogue;
       if (dialogue) {
         const n = Number(key);
@@ -221,12 +264,12 @@ export default function App() {
         if (key === 'escape' || key === 'b') { world.placing = null; rendererRef.current?.setGhost(null, null, false); return; }
       }
       switch (key) {
-        case 'escape': setMenu('system'); document.exitPointerLock?.(); break;
+        case 'escape': setMenuNow('system'); releasePointer(); break;
         case 'v': world.toggleSneak(); break;
         case '1': world.castSpell('mending'); break;
         case '2': world.castSpell('bolt'); break;
-        case 'tab': setMenu('journal'); document.exitPointerLock?.(); break;
-        case 'e': if (world.interact()) { document.exitPointerLock?.(); audio.uiOpen(); } else audio.tick(); break;
+        case 'tab': setMenuNow('journal'); releasePointer(); break;
+        case 'e': if (world.interact()) { if (world.dialogue) releasePointer(); audio.uiOpen(); } else audio.tick(); break;
         case 'f': world.secondary(); break;
         case 'g': world.throwHeld(); break;
         case ' ': world.jump(); break;
@@ -241,7 +284,7 @@ export default function App() {
       setHud(world.hud());
     };
     const up = (e: KeyboardEvent) => keys.current.delete(e.key.toLowerCase());
-    const blur = () => keys.current.clear();
+    const blur = () => { keys.current.clear(); touchBlock.current = false; };
     window.addEventListener('keydown', down);
     window.addEventListener('keyup', up);
     window.addEventListener('blur', blur);
@@ -304,11 +347,13 @@ export default function App() {
   }
   function toTitle() {
     writeSave(world);
+    keys.current.clear(); touchBlock.current = false;
     setHasSave(true);
-    setMenu(null);
+    setMenuNow(null);
     world.placing = null;
     rendererRef.current?.setGhost(null, null, false);
-    document.exitPointerLock?.();
+    modeRef.current = 'title';
+    releasePointer();
     audio.stopBgm();
     canvasShownRef.current = false;
     setCanvasVisible(false);
@@ -321,7 +366,9 @@ export default function App() {
     <main className={`shell mode-${mode}`} onContextMenu={(e) => e.preventDefault()}>
       <canvas ref={canvasRef} className="view" onMouseDown={onCanvasDown}
         onWheel={(e) => { if (mode === 'play') rendererRef.current?.zoom(e.deltaY * 0.006); }} />
-      <div className={`world-fallback ${canvasVisible && mode === 'play' ? 'is-hidden' : ''}`} aria-hidden="true" />
+      <div className={`world-fallback ${canvasVisible && mode === 'play' && !graphicsLost ? 'is-hidden' : ''} ${graphicsLost ? 'recovering' : ''}`}
+        style={{ backgroundImage: `linear-gradient(rgba(14, 17, 14, 0.24), rgba(14, 17, 14, 0.44)), url("${MEADOW_PREVIEW}")` }} aria-hidden="true" />
+      {graphicsLost && !error && <p className="graphics-recovery" role="status">Restoring graphics...</p>}
       {error && <div className="fatal"><h2>The world could not be drawn</h2><p>{error}</p></div>}
 
       {mode === 'title' && !error && (
@@ -380,7 +427,7 @@ export default function App() {
           {hud.placing && <Plans world={world} kind={hud.placing} />}
           {hud.dialogue && <Dialogue world={world} onChange={refresh} />}
           {!locked && !touch && !hud.dialogue && !menu && !hud.defeated && <p className="hint-click">Click to take control</p>}
-          {touch && !menu && !hud.dialogue && <TouchControls world={world} stick={stick} rendererRef={rendererRef} onChange={refresh} />}
+          {touch && !menu && !hud.dialogue && <TouchControls world={world} stick={stick} blockRef={touchBlock} rendererRef={rendererRef} onChange={refresh} />}
           {hud.defeated && !menu && (
             <div className="fallen">
               <p>You have fallen.</p>
@@ -388,7 +435,7 @@ export default function App() {
             </div>
           )}
           {menu && (
-            <Menu tab={menu} setTab={setMenu} world={world} onChange={refresh} muted={muted} onToggleSound={toggleSound} onQuit={toTitle}
+            <Menu tab={menu} setTab={setMenuNow} world={world} onChange={refresh} muted={muted} onToggleSound={toggleSound} onQuit={toTitle}
               onSave={() => { writeSave(world); setHasSave(true); }} fps={fpsRef} rendererRef={rendererRef} />
           )}
         </>
@@ -491,7 +538,7 @@ function Dialogue({ world, onChange }: { world: SandboxWorld; onChange: () => vo
   );
 }
 
-function TouchControls({ world, stick, rendererRef, onChange }: { world: SandboxWorld; stick: React.MutableRefObject<{ x: number; y: number }>; rendererRef: React.RefObject<WorldRenderer | null>; onChange: () => void }) {
+function TouchControls({ world, stick, blockRef, rendererRef, onChange }: { world: SandboxWorld; stick: React.MutableRefObject<{ x: number; y: number }>; blockRef: React.MutableRefObject<boolean>; rendererRef: React.RefObject<WorldRenderer | null>; onChange: () => void }) {
   const origin = useRef<{ x: number; y: number; id: number } | null>(null);
   const look = useRef<{ x: number; y: number; id: number } | null>(null);
   const [knob, setKnob] = useState({ x: 0, y: 0 });
@@ -523,6 +570,8 @@ function TouchControls({ world, stick, rendererRef, onChange }: { world: Sandbox
         <button onClick={() => { world.secondary(); onChange(); }}>Lift</button>
         <button onClick={() => { world.jump(); onChange(); }}>Jump</button>
         <button onClick={() => { world.dodge(); onChange(); }}>Roll</button>
+        <button aria-label="Hold to block" onPointerDown={(e) => { e.currentTarget.setPointerCapture(e.pointerId); blockRef.current = true; }}
+          onPointerUp={() => { blockRef.current = false; }} onPointerCancel={() => { blockRef.current = false; }}>Block</button>
       </div>
     </div>
   );
@@ -712,8 +761,16 @@ function SystemPage({ world, onQuit, onSave, muted, onToggleSound, setTab, fps, 
         <section><h4>Controls</h4><ControlsList /></section>
         <section>
           <h4>Engine</h4>
-          <p className="stats">{(() => { const s = world.stats(); const r = rendererRef.current?.info(); const cells = world.currentSpace === EXTERIOR_SPACE ? `${world.streamer.loadedCells.size} active / ${r?.bufferedCells ?? 0} buffered` : world.interiorName(); return `${fps.current} fps · ${r?.calls ?? 0} draw calls · ${r?.precombinedRefs ?? 0} precombined · ${r?.terrainDraws ?? 0} terrain draws · ${cells} · ${r?.worker ? 'background stream' : 'fallback stream'} · ${s.actors} actors · ${s.items} objects (${s.awake} moving) · ${s.colliders} colliders`; })()}</p>
+          <p className="stats">{(() => { const s = world.stats(); const r = rendererRef.current?.info(); const cells = world.currentSpace === EXTERIOR_SPACE ? `${world.streamer.loadedCells.size} active / ${r?.bufferedCells ?? 0} buffered` : world.interiorName(); return `${fps.current} fps · ${r?.calls ?? 0} draw calls · ${r?.precombinedRefs ?? 0} precombined · ${r?.terrainDraws ?? 0} terrain draws · ${cells} · ${r?.worker ? 'background stream' : 'fallback stream'} · ${r?.navigation === 'ready' ? 'Recast navigation' : 'navigation fallback'} · ${r?.crowdAgents ?? 0} crowd agents · ${r?.bvhInstances ?? 0} BVH bodies / ${r?.bvhGeometries ?? 0} BVH meshes · Rapier ${r?.physicsBackend ?? 'none'} · ozz ${r?.animationRuntime ?? 'idle'} (${r?.ozzRigs ?? 0} rigs) · Theatre ${r?.choreography ?? 'idle'} · ${r?.gpuCompressedTextures ?? 0} GPU-compressed textures · ${s.actors} actors · ${s.items} objects (${s.awake} moving) · ${s.colliders} colliders`; })()}</p>
           <div className="dev">
+            {import.meta.env.DEV && <button onClick={() => { const url = new URL(window.location.href); url.searchParams.set('theatre', '1'); window.open(url.href, '_blank', 'noopener'); }}>Open timeline editor</button>}
+            {import.meta.env.DEV && new URLSearchParams(window.location.search).has('theatre') && <button onClick={() => {
+              void exportChoreographyState().then((state) => {
+                const url = URL.createObjectURL(new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' }));
+                const link = document.createElement('a'); link.href = url; link.download = 'choreography.json'; link.click();
+                window.setTimeout(() => URL.revokeObjectURL(url), 0);
+              }).catch((error: unknown) => setLines([error instanceof Error ? error.message : 'Timeline export failed.']));
+            }}>Export choreography JSON</button>}
             <button onClick={() => { const issues = world.verify(); setLines(issues.length ? issues.map((i) => `${i.rule}: ${i.detail}`) : ['All world invariants hold.']); }}>Verify world</button>
             <button onClick={() => { const r = world.autoRepair(); setLines(r.fixes.length || r.remaining.length ? [...r.fixes, ...r.remaining.map((i) => `Needs attention: ${i.detail}`)] : ['Nothing to repair.']); onChange(); }}>Auto-repair</button>
             <button onClick={() => { world.stock.wood += 10; world.stock.stone += 10; world.stock.gold += 100; onChange(); setLines(['Added 10 timber, 10 stone and 100 crowns.']); }}>Grant supplies</button>
@@ -728,7 +785,7 @@ function SystemPage({ world, onQuit, onSave, muted, onToggleSound, setTab, fps, 
 function ControlsList() {
   const rows: [string, string][] = [
     ['W A S D', 'Move'], ['Mouse', 'Look (click the world to take control)'], ['Shift', 'Run'], ['Space', 'Jump'], ['Left click', 'Strike, or throw what you hold'],
-    ['Right click / C', 'Roll'], ['E', 'Talk, take, use, sit'], ['F', 'Lift or set down; look closer'], ['G', 'Throw'], ['V', 'Crouch and move quietly'], ['1 / 2', 'Cast Mending / Spark bolt, once learned'], ['B', 'Building plans'], ['Tab', 'Journal'], ['Esc', 'Pause'],
+    ['Right click / C', 'Roll'], ['Q (hold)', 'Block incoming attacks'], ['E', 'Talk, take, use, sit'], ['F', 'Lift or set down; look closer'], ['G', 'Throw'], ['V', 'Crouch and move quietly'], ['1 / 2', 'Cast Mending / Spark bolt, once learned'], ['B', 'Building plans'], ['Tab', 'Journal'], ['Esc', 'Pause'],
   ];
   return <dl className="controls">{rows.map(([k, v]) => <div key={k}><dt>{k}</dt><dd>{v}</dd></div>)}</dl>;
 }

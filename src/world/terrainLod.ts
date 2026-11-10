@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { prepareMeshBVH } from './meshAcceleration';
 
 export const TERRAIN_LOD_LEVELS = [4, 8, 16, 32] as const;
 export type TerrainLodLevel = typeof TERRAIN_LOD_LEVELS[number];
@@ -15,21 +16,11 @@ export function terrainHeight(x: number, z: number) {
   return fade * Math.max(0, 12 + 7 * Math.sin(x * 0.035) * Math.cos(z * 0.027) + 5 * Math.sin(z * 0.023));
 }
 
-export function selectTerrainTiles(camera: { x: number; z: number }): TerrainTile[] {
+export function selectTerrainTiles(_camera: { x: number; z: number }): TerrainTile[] {
   const result: TerrainTile[] = [];
-  const visit = (x: number, z: number, size: number) => {
-    const dx = camera.x - clamp(camera.x, x, x + size);
-    const dz = camera.z - clamp(camera.z, z, z + size);
-    const distance = Math.hypot(dx, dz);
-    if (size > 64 && distance < size * 0.8) {
-      const half = size / 2;
-      for (const ox of [0, half]) for (const oz of [0, half]) visit(x + ox, z + oz, half);
-      return;
-    }
-    const level: TerrainLodLevel = distance < 80 ? 32 : distance < 150 ? 16 : distance < 230 ? 8 : 4;
-    result.push({ x, z, size, level });
-  };
-  visit(-256, -256, 512);
+  for (let x = -256; x < 256; x += 64) for (let z = -256; z < 256; z += 64) {
+    result.push({ x, z, size: 64, level: 32 });
+  }
   return result;
 }
 
@@ -39,7 +30,7 @@ export function terrainTileGeometry(tile: TerrainTile): THREE.BufferGeometry {
   ].map(([x, z]) => Math.hypot(x, z) <= 105);
   const flat = corners.every(Boolean);
   if (flat) return new THREE.BufferGeometry();
-  const n = corners.some(Boolean) ? Math.min(16, tile.level) : tile.level;
+  const n = tile.level;
   const positions: number[] = [], uvs: number[] = [], indices: number[] = [];
   const addVertex = (x: number, z: number, drop = 0) => {
     positions.push(x, terrainHeight(x, z) + 0.012 - drop, z);
@@ -83,13 +74,14 @@ export class TerrainLod {
   private nextGeometries: THREE.BufferGeometry[] = [];
   private tiles = new Map<string, THREE.BufferGeometry>();
   private pending: TerrainTile[] = [];
-  private waitingLevels: TerrainLodLevel[] = [];
+  private waitingGroups: TerrainTile[][] = [];
   private selected: TerrainTile[] = [];
   private signature = '';
   private material: THREE.MeshBasicMaterial;
 
   constructor(texture: THREE.Texture) {
-    this.material = new THREE.MeshBasicMaterial({ map: texture, color: '#93a58a', side: THREE.DoubleSide, fog: true });
+    this.material = new THREE.MeshBasicMaterial({ map: texture, color: '#93a58a', side: THREE.DoubleSide, fog: true,
+      polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 });
   }
 
   update(camera: { x: number; z: number }) {
@@ -99,7 +91,14 @@ export class TerrainLod {
       this.signature = signature;
       this.selected = selected;
       this.pending = selected.filter((t) => !this.tiles.has(`${t.x}:${t.z}:${t.size}:${t.level}`));
-      this.waitingLevels = [...TERRAIN_LOD_LEVELS];
+      const groups = new Map<string, TerrainTile[]>();
+      for (const tile of selected) {
+        const key = `${Math.floor((tile.x + 256) / 128)}:${Math.floor((tile.z + 256) / 128)}`;
+        const group = groups.get(key) ?? [];
+        group.push(tile);
+        groups.set(key, group);
+      }
+      this.waitingGroups = [...groups.values()];
       this.nextGeometries.forEach((g) => g.dispose());
       this.nextGeometries = [];
       this.next = new THREE.Group();
@@ -111,18 +110,17 @@ export class TerrainLod {
       this.tiles.set(`${tile.x}:${tile.z}:${tile.size}:${tile.level}`, terrainTileGeometry(tile));
       built++;
     }
-    if (this.pending.length || !this.waitingLevels.length) return;
-    const level = this.waitingLevels.shift()!;
-    const tiles = this.selected.filter((tile) => tile.level === level);
+    if (this.pending.length || !this.waitingGroups.length) return;
+    const tiles = this.waitingGroups.shift()!;
     if (tiles.length) {
       const parts = tiles.map((tile) => this.tiles.get(`${tile.x}:${tile.z}:${tile.size}:${tile.level}`)!)
         .filter((geometry) => !!geometry.getAttribute('position'));
       if (parts.length) {
         const geometry = mergeGeometries(parts, false);
-        if (geometry) { geometry.computeBoundingSphere(); this.nextGeometries.push(geometry); this.next.add(new THREE.Mesh(geometry, this.material)); }
+        if (geometry) { geometry.computeBoundingSphere(); prepareMeshBVH(geometry); this.nextGeometries.push(geometry); this.next.add(new THREE.Mesh(geometry, this.material)); }
       }
     }
-    if (this.waitingLevels.length) return;
+    if (this.waitingGroups.length) return;
     if (this.current) this.group.remove(this.current);
     this.currentGeometries.forEach((g) => g.dispose());
     this.currentGeometries = this.nextGeometries;
@@ -133,7 +131,13 @@ export class TerrainLod {
 
   get tileCount() { return this.selected.length; }
   get drawCalls() { return this.current?.children.length ?? 0; }
+  get bvhCount() { return this.currentGeometries.filter((geometry) => !!geometry.boundsTree).length; }
   get ready() { return !!this.current; }
+
+  setTexture(texture: THREE.Texture) {
+    this.material.map = texture;
+    this.material.needsUpdate = true;
+  }
 
   dispose() {
     this.currentGeometries.forEach((g) => g.dispose());

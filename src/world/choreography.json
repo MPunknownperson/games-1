@@ -1,0 +1,1143 @@
+{
+  "definitionVersion": "0.4.0",
+  "revisionHistory": [
+    "preserve-choreography-v1"
+  ],
+  "sheetsById": {
+    "Attack One": {
+      "staticOverrides": {
+        "byObject": {
+          "Timing": {
+            "windup": 0.2,
+            "recovery": 0.28,
+            "shakeScale": 0.055
+          }
+        }
+      },
+      "sequence": {
+        "subUnitsPerUnit": 60,
+        "length": 0.48000000000000004,
+        "type": "PositionalSequence",
+        "tracksByObject": {
+          "Motion": {
+            "trackData": {
+              "windup": {
+                "type": "BasicKeyframedTrack",
+                "__debugName": "Motion:[\"windup\"]",
+                "keyframes": [
+                  {
+                    "id": "windup-0",
+                    "position": 0,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  },
+                  {
+                    "id": "windup-1",
+                    "position": 0.18000000000000002,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 1
+                  },
+                  {
+                    "id": "windup-2",
+                    "position": 0.48000000000000004,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  }
+                ]
+              },
+              "strike": {
+                "type": "BasicKeyframedTrack",
+                "__debugName": "Motion:[\"strike\"]",
+                "keyframes": [
+                  {
+                    "id": "strike-0",
+                    "position": 0,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  },
+                  {
+                    "id": "strike-1",
+                    "position": 0.18000000000000002,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  },
+                  {
+                    "id": "strike-2",
+                    "position": 0.3176,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 1
+                  },
+                  {
+                    "id": "strike-3",
+                    "position": 0.48000000000000004,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  }
+                ]
+              },
+              "effect": {
+                "type": "BasicKeyframedTrack",
+                "__debugName": "Motion:[\"effect\"]",
+                "keyframes": [
+                  {
+                    "id": "effect-0",
+                    "position": 0,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  },
+                  {
+                    "id": "effect-1",
+                    "position": 0.18000000000000002,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  },
+                  {
+                    "id": "effect-2",
+                    "position": 0.225,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 1
+                  },
+                  {
+                    "id": "effect-3",
+                    "position": 0.36,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  },
+                  {
+                    "id": "effect-4",
+                    "position": 0.48000000000000004,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  }
+                ]
+              },
+              "shake": {
+                "type": "BasicKeyframedTrack",
+                "__debugName": "Motion:[\"shake\"]",
+                "keyframes": [
+                  {
+                    "id": "shake-0",
+                    "position": 0,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  },
+                  {
+                    "id": "shake-1",
+                    "position": 0.18000000000000002,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  },
+                  {
+                    "id": "shake-2",
+                    "position": 0.225,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 1
+                  },
+                  {
+                    "id": "shake-3",
+                    "position": 0.36,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  },
+                  {
+                    "id": "shake-4",
+                    "position": 0.48000000000000004,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  }
+                ]
+              }
+            },
+            "trackIdByPropPath": {
+              "[\"windup\"]": "windup",
+              "[\"strike\"]": "strike",
+              "[\"effect\"]": "effect",
+              "[\"shake\"]": "shake"
+            }
+          }
+        }
+      }
+    },
+    "Attack Two": {
+      "staticOverrides": {
+        "byObject": {
+          "Timing": {
+            "windup": 0.2,
+            "recovery": 0.28,
+            "shakeScale": 0.07
+          }
+        }
+      },
+      "sequence": {
+        "subUnitsPerUnit": 60,
+        "length": 0.48000000000000004,
+        "type": "PositionalSequence",
+        "tracksByObject": {
+          "Motion": {
+            "trackData": {
+              "windup": {
+                "type": "BasicKeyframedTrack",
+                "__debugName": "Motion:[\"windup\"]",
+                "keyframes": [
+                  {
+                    "id": "windup-0",
+                    "position": 0,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  },
+                  {
+                    "id": "windup-1",
+                    "position": 0.18000000000000002,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 1
+                  },
+                  {
+                    "id": "windup-2",
+                    "position": 0.48000000000000004,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  }
+                ]
+              },
+              "strike": {
+                "type": "BasicKeyframedTrack",
+                "__debugName": "Motion:[\"strike\"]",
+                "keyframes": [
+                  {
+                    "id": "strike-0",
+                    "position": 0,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  },
+                  {
+                    "id": "strike-1",
+                    "position": 0.18000000000000002,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  },
+                  {
+                    "id": "strike-2",
+                    "position": 0.3176,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 1
+                  },
+                  {
+                    "id": "strike-3",
+                    "position": 0.48000000000000004,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  }
+                ]
+              },
+              "effect": {
+                "type": "BasicKeyframedTrack",
+                "__debugName": "Motion:[\"effect\"]",
+                "keyframes": [
+                  {
+                    "id": "effect-0",
+                    "position": 0,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  },
+                  {
+                    "id": "effect-1",
+                    "position": 0.18000000000000002,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  },
+                  {
+                    "id": "effect-2",
+                    "position": 0.225,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 1
+                  },
+                  {
+                    "id": "effect-3",
+                    "position": 0.36,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  },
+                  {
+                    "id": "effect-4",
+                    "position": 0.48000000000000004,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  }
+                ]
+              },
+              "shake": {
+                "type": "BasicKeyframedTrack",
+                "__debugName": "Motion:[\"shake\"]",
+                "keyframes": [
+                  {
+                    "id": "shake-0",
+                    "position": 0,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  },
+                  {
+                    "id": "shake-1",
+                    "position": 0.18000000000000002,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  },
+                  {
+                    "id": "shake-2",
+                    "position": 0.225,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 1
+                  },
+                  {
+                    "id": "shake-3",
+                    "position": 0.36,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  },
+                  {
+                    "id": "shake-4",
+                    "position": 0.48000000000000004,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  }
+                ]
+              }
+            },
+            "trackIdByPropPath": {
+              "[\"windup\"]": "windup",
+              "[\"strike\"]": "strike",
+              "[\"effect\"]": "effect",
+              "[\"shake\"]": "shake"
+            }
+          }
+        }
+      }
+    },
+    "Attack Three": {
+      "staticOverrides": {
+        "byObject": {
+          "Timing": {
+            "windup": 0.4,
+            "recovery": 0.32,
+            "shakeScale": 0.12
+          }
+        }
+      },
+      "sequence": {
+        "subUnitsPerUnit": 60,
+        "length": 0.72,
+        "type": "PositionalSequence",
+        "tracksByObject": {
+          "Motion": {
+            "trackData": {
+              "windup": {
+                "type": "BasicKeyframedTrack",
+                "__debugName": "Motion:[\"windup\"]",
+                "keyframes": [
+                  {
+                    "id": "windup-0",
+                    "position": 0,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  },
+                  {
+                    "id": "windup-1",
+                    "position": 0.36000000000000004,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 1
+                  },
+                  {
+                    "id": "windup-2",
+                    "position": 0.72,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  }
+                ]
+              },
+              "strike": {
+                "type": "BasicKeyframedTrack",
+                "__debugName": "Motion:[\"strike\"]",
+                "keyframes": [
+                  {
+                    "id": "strike-0",
+                    "position": 0,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  },
+                  {
+                    "id": "strike-1",
+                    "position": 0.36000000000000004,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  },
+                  {
+                    "id": "strike-2",
+                    "position": 0.5344,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 1
+                  },
+                  {
+                    "id": "strike-3",
+                    "position": 0.72,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  }
+                ]
+              },
+              "effect": {
+                "type": "BasicKeyframedTrack",
+                "__debugName": "Motion:[\"effect\"]",
+                "keyframes": [
+                  {
+                    "id": "effect-0",
+                    "position": 0,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  },
+                  {
+                    "id": "effect-1",
+                    "position": 0.36000000000000004,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  },
+                  {
+                    "id": "effect-2",
+                    "position": 0.42500000000000004,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 1
+                  },
+                  {
+                    "id": "effect-3",
+                    "position": 0.56,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  },
+                  {
+                    "id": "effect-4",
+                    "position": 0.72,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  }
+                ]
+              },
+              "shake": {
+                "type": "BasicKeyframedTrack",
+                "__debugName": "Motion:[\"shake\"]",
+                "keyframes": [
+                  {
+                    "id": "shake-0",
+                    "position": 0,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  },
+                  {
+                    "id": "shake-1",
+                    "position": 0.36000000000000004,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  },
+                  {
+                    "id": "shake-2",
+                    "position": 0.42500000000000004,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 1
+                  },
+                  {
+                    "id": "shake-3",
+                    "position": 0.56,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  },
+                  {
+                    "id": "shake-4",
+                    "position": 0.72,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  }
+                ]
+              }
+            },
+            "trackIdByPropPath": {
+              "[\"windup\"]": "windup",
+              "[\"strike\"]": "strike",
+              "[\"effect\"]": "effect",
+              "[\"shake\"]": "shake"
+            }
+          }
+        }
+      }
+    },
+    "Recoil": {
+      "sequence": {
+        "subUnitsPerUnit": 60,
+        "length": 0.3,
+        "type": "PositionalSequence",
+        "tracksByObject": {
+          "Motion": {
+            "trackData": {
+              "recoil": {
+                "type": "BasicKeyframedTrack",
+                "__debugName": "Motion:[\"recoil\"]",
+                "keyframes": [
+                  {
+                    "id": "recoil-0",
+                    "position": 0,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  },
+                  {
+                    "id": "recoil-1",
+                    "position": 0.08,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 1
+                  },
+                  {
+                    "id": "recoil-2",
+                    "position": 0.3,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  }
+                ]
+              }
+            },
+            "trackIdByPropPath": {
+              "[\"recoil\"]": "recoil"
+            }
+          }
+        }
+      }
+    },
+    "Cinematic": {
+      "staticOverrides": {
+        "byObject": {
+          "Camera": {
+            "x": 14,
+            "y": 16,
+            "z": 18,
+            "targetY": 2
+          }
+        }
+      },
+      "sequence": {
+        "subUnitsPerUnit": 60,
+        "length": 3.2,
+        "type": "PositionalSequence",
+        "tracksByObject": {
+          "Camera": {
+            "trackData": {
+              "x": {
+                "type": "BasicKeyframedTrack",
+                "__debugName": "Camera:[\"x\"]",
+                "keyframes": [
+                  {
+                    "id": "x-0",
+                    "position": 0,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 18
+                  },
+                  {
+                    "id": "x-1",
+                    "position": 3.2,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 12
+                  }
+                ]
+              },
+              "y": {
+                "type": "BasicKeyframedTrack",
+                "__debugName": "Camera:[\"y\"]",
+                "keyframes": [
+                  {
+                    "id": "y-0",
+                    "position": 0,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 19
+                  },
+                  {
+                    "id": "y-1",
+                    "position": 3.2,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 15
+                  }
+                ]
+              },
+              "z": {
+                "type": "BasicKeyframedTrack",
+                "__debugName": "Camera:[\"z\"]",
+                "keyframes": [
+                  {
+                    "id": "z-0",
+                    "position": 0,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 22
+                  },
+                  {
+                    "id": "z-1",
+                    "position": 3.2,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 16
+                  }
+                ]
+              },
+              "weight": {
+                "type": "BasicKeyframedTrack",
+                "__debugName": "Camera:[\"weight\"]",
+                "keyframes": [
+                  {
+                    "id": "weight-0",
+                    "position": 0,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  },
+                  {
+                    "id": "weight-1",
+                    "position": 1,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 1
+                  },
+                  {
+                    "id": "weight-2",
+                    "position": 2.2,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 1
+                  },
+                  {
+                    "id": "weight-3",
+                    "position": 3.2,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  }
+                ]
+              },
+              "shake": {
+                "type": "BasicKeyframedTrack",
+                "__debugName": "Camera:[\"shake\"]",
+                "keyframes": [
+                  {
+                    "id": "shake-0",
+                    "position": 0,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  },
+                  {
+                    "id": "shake-1",
+                    "position": 1.25,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  },
+                  {
+                    "id": "shake-2",
+                    "position": 1.5,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0.035
+                  },
+                  {
+                    "id": "shake-3",
+                    "position": 2.1,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  },
+                  {
+                    "id": "shake-4",
+                    "position": 3.2,
+                    "connectedRight": true,
+                    "handles": [
+                      0.5,
+                      1,
+                      0.5,
+                      0
+                    ],
+                    "type": "bezier",
+                    "value": 0
+                  }
+                ]
+              }
+            },
+            "trackIdByPropPath": {
+              "[\"x\"]": "x",
+              "[\"y\"]": "y",
+              "[\"z\"]": "z",
+              "[\"weight\"]": "weight",
+              "[\"shake\"]": "shake"
+            }
+          }
+        }
+      }
+    }
+  }
+}

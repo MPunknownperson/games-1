@@ -8,6 +8,5 @@ self.onmessage = (event: MessageEvent<CellJob>) => {
   self.postMessage(collisionResult, { transfer: [collision.heights.buffer, collision.bodies.buffer] });
   const visual = parseVisual(refs);
   const visualResult: CellResult = { key, revision, stage: 'visual', layer: visual };
-  self.postMessage(visualResult, { transfer: [visual.positions.buffer, visual.normals.buffer, visual.colors.buffer,
-    visual.treePositions.buffer, visual.treeUvs.buffer, visual.treeColors.buffer] });
+  self.postMessage(visualResult);
 };

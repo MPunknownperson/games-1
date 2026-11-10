@@ -25,7 +25,7 @@ export function verifyWorld(world: SandboxWorld, limit: number): VerificationIss
   }
   for (const id of ['guardian', 'citadel']) if (!ids.has(id)) issues.push({ rule: 'essential-actor', detail: `Missing ${id}` });
   for (const key of STOCK_KEYS) if (!finite(world.stock[key]) || world.stock[key] < 0) issues.push({ rule: 'stock', detail: `${key} is invalid` });
-  for (const [type, count] of Object.entries(world.pack)) if (!finite(count) || (count ?? 0) < 0) issues.push({ rule: 'pack', detail: `${type} count is invalid` });
+  for (const [type, count] of Object.entries(world.pack) as [string, number | undefined][]) if (!finite(count) || (count ?? 0) < 0) issues.push({ rule: 'pack', detail: `${type} count is invalid` });
   if (!finite(world.elapsed) || world.elapsed < 0) issues.push({ rule: 'clock', detail: 'World time is invalid' });
   if (!finite(world.nextId) || world.nextId < 1) issues.push({ rule: 'next-id', detail: 'Actor ID counter is invalid' });
   if (!finite(world.bounty) || world.bounty < 0) issues.push({ rule: 'bounty', detail: 'Bounty is invalid' });
@@ -63,7 +63,7 @@ export function repairWorld(world: SandboxWorld, limit: number): RepairReport {
   world.actors = world.actors.filter((a) => a.kind !== 'item' || !!a.itemType);
   if (world.actors.length !== before) fixes.push('Removed items with no definition');
   for (const key of STOCK_KEYS) if (!finite(world.stock[key]) || world.stock[key] < 0) { world.stock[key] = 0; fixes.push(`Repaired ${key}`); }
-  for (const [type, count] of Object.entries(world.pack)) {
+  for (const [type, count] of Object.entries(world.pack) as [string, number | undefined][]) {
     if (!finite(count) || (count ?? 0) <= 0) { delete world.pack[type as keyof typeof world.pack]; fixes.push(`Repaired ${type} in the pack`); }
   }
   if (!finite(world.elapsed) || world.elapsed < 0) { world.elapsed = 0; fixes.push('Reset world clock'); }

@@ -9,7 +9,7 @@ export interface CachedCell {
   visual?: VisualLayer;
 }
 
-/** Buffer collision synchronously, then decode visual vertices in a browser worker. */
+/** Buffer collision synchronously, then prepare reference manifests in a browser worker. */
 export class CellPreloader {
   readonly cache = new Map<string, CachedCell>();
   private worker: Worker | null = null;
@@ -18,7 +18,7 @@ export class CellPreloader {
   private buffered = new Set<string>();
   private stopped = false;
 
-  constructor(private refsFor: (key: string) => ArchiveRef[], private onVisual: (key: string) => void) {
+  constructor(private refsFor: (key: string) => ArchiveRef[]) {
     if (typeof Worker === 'undefined') return;
     try {
       this.worker = new CellWorker();
@@ -42,8 +42,7 @@ export class CellPreloader {
       if (cached?.revision === revision) continue;
       const refs = this.refsFor(key);
       const cell: CachedCell = { key, revision, collision: parseCollision(refs) };
-      if (!refs.length) cell.visual = { positions: new Float32Array(), normals: new Float32Array(), colors: new Float32Array(),
-        treePositions: new Float32Array(), treeUvs: new Float32Array(), treeColors: new Float32Array(), textureKey: 'meadow-tree-atlas' };
+      if (!refs.length) cell.visual = { fullDetailIds: [] };
       else this.queue.push({ key, revision, refs });
       this.cache.set(key, cell);
     }
@@ -83,7 +82,7 @@ export class CellPreloader {
     const cell = this.cache.get(result.key);
     if (cell && cell.revision === result.revision && this.buffered.has(result.key)) {
       if (result.stage === 'collision') cell.collision = result.layer;
-      else { cell.visual = result.layer; this.onVisual(result.key); }
+      else cell.visual = result.layer;
     }
     if (result.stage === 'visual' && this.inFlight?.key === result.key && this.inFlight.revision === result.revision) {
       this.inFlight = null;

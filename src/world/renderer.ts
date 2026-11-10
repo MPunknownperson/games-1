@@ -1,18 +1,21 @@
-// Three.js presentation of the simulation. Stable props bake into cell meshes, trees switch between
-// instanced models and billboards, and characters use skeletal rigs.
+// Three.js presentation of the simulation. Stable props bake into cell meshes, trees use
+// full-detail instancing, and characters use skeletal rigs.
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
-import { animateRig, buildRig, type AnimState, type Rig, type RigStyle } from './rig';
+import { animateRig, buildRig, disposeRig, lambert, type AnimState, type Rig, type RigStyle } from './rig';
 import { BUILDINGS, PLAYER_ID, type Actor, type ActionKind, type Point, type SandboxWorld, type StructureKind } from './simulation';
-import type { ItemType } from './items';
-import { EXTERIOR_SPACE, WORLD_UNITS_PER_CELL, cellKey } from './cells';
+import { ITEMS, type ItemType } from './items';
+import { EXTERIOR_SPACE, WORLD_UNITS_PER_CELL, cellKey, spaceOf } from './cells';
 import { CellPreloader } from './preloader';
 import { isPrecombinedStatic } from './renderBatches';
-import { parseVisual } from './cellArchive';
 import { TerrainLod } from './terrainLod';
 import { WaterLod } from './waterLod';
-import { isOccluded, occlusionPlanes } from './occlusion';
-import { screenDoorMaterial, setScreenDoorFade } from './screenDoor';
+import { CompressedTexturePack, TEXTURE_NAMES } from './compressedTextures';
+import { createBrowserNavigation } from './navigationClient';
+import { prepareMeshBVH } from './meshAcceleration';
+import type { PhysicsBackend, RagdollPartName } from './physics';
+import { attackTiming, choreographyStatus, initializeChoreography, sampleAttack, sampleCinematic } from './choreography';
+import { initializeOzz, ozzStatus } from './ozz/runtime';
 
 export type CameraMode = 'title' | 'intro' | 'play';
 
@@ -95,12 +98,12 @@ interface Visual {
   obj: THREE.Object3D; rig?: Rig; frame: number; lx: number; ly: number; lz: number; lf: number;
   isStatic: boolean; phase: number; yaw: number; glyphs?: THREE.Object3D[]; glow?: THREE.Object3D;
   shot?: THREE.Line; stump?: THREE.Object3D; main?: THREE.Object3D; weaponLevel?: number; body?: THREE.Object3D; shook?: boolean;
-  low?: THREE.Mesh; lowActive?: boolean;
+  slash?: THREE.Mesh;
   poolKey?: string; poolIndex?: number; poolAlive?: boolean;
 }
 
-interface Pool { mesh: THREE.InstancedMesh; next: number; active: number }
-interface StaticBatch { group: THREE.Group; geometries: THREE.BufferGeometry[]; refs: number }
+interface Pool { mesh: THREE.InstancedMesh; next: number; free: number[]; active: number }
+interface StaticBatch { group: THREE.Group; geometries: THREE.BufferGeometry[]; refs: number; signature: string }
 
 const angleDelta = (from: number, to: number) => {
   let d = (to - from) % (Math.PI * 2);
@@ -125,43 +128,39 @@ export class WorldRenderer {
   private rooms = new Map<string, THREE.Group>();
   private staticBatches = new Map<string, StaticBatch>();
   private pendingBatchKeys: string[] = [];
-  private batchRevision = -1;
-  private batchWindow = '';
-  private farCells = new Map<string, THREE.Group>();
-  private farFades = new Map<string, { materials: THREE.Material[]; treeMaterial?: THREE.Material;
-    startFrame: number; opacity: number; treeStartFrame: number; treeOpacity: number }>();
   private grassCells = new Map<string, THREE.InstancedMesh>();
-  private farGeometries = new Map<string, THREE.BufferGeometry>();
-  private farTreeGeometries = new Map<string, THREE.BufferGeometry>();
-  private treeFullCells = new Set<string>();
   private roomGeometries: THREE.BufferGeometry[] = [];
-  private grassTexture?: THREE.CanvasTexture;
+  private grassTexture?: THREE.Texture;
+  private pavingTexture?: THREE.Texture;
   private terrainLod?: TerrainLod;
   private waterLod?: WaterLod;
-  private treeTexture?: THREE.CanvasTexture;
-  private treeBillboardMat?: THREE.MeshLambertMaterial;
-  private farMaterial?: THREE.MeshLambertMaterial;
-  private lastLodRevision = -1;
-  private lastFarWindow = '';
-  private lastPoolWindow = '';
-  private pendingFarKeys: string[] = [];
+  private texturePack?: CompressedTexturePack;
+  private texturesReady = false;
+  private compressedTextureCount = 0;
+  private gpuCompressedTextureCount = 0;
+  private disposed = false;
+  private preferredPhysics: PhysicsBackend = new URLSearchParams(window.location.search).get('physics') === 'deterministic' ? 'deterministic' : 'simd';
   private readyCells = new Set<string>();
   private firstSceneReady = false;
+  private contextNeedsWarmup = false;
   private readyAtFrame = -1;
   private lastSpace = EXTERIOR_SPACE;
   private visuals = new Map<string, Visual>();
+  private ragdollVisuals = new Map<string, { group: THREE.Group; parts: Map<RagdollPartName, THREE.Mesh> }>();
   private pools = new Map<string, Pool>();
   private geometryCache = new Map<string, THREE.BufferGeometry>();
-  private itemTextures = new Map<ItemType, THREE.CanvasTexture>();
+  private itemTextures = new Map<ItemType, THREE.Texture>();
   private itemMaterials = new Map<ItemType, THREE.MeshStandardMaterial>();
   private preferredRatio = Math.min(window.devicePixelRatio || 1, 1.25);
-  private pixelRatio = Math.min(this.preferredRatio, 0.75);
+  private pixelRatio = Math.min(this.preferredRatio, 1);
+  private pendingPixelRatio: number | null = null;
+  private pendingResize = false;
   private slowFrames = 0;
   private fastFrames = 0;
   private renderFocus = new THREE.Vector3();
   private frustum = new THREE.Frustum();
   private projectionView = new THREE.Matrix4();
-  private occludedDecor = 0;
+  private viewSphere = new THREE.Sphere();
   private frame = 0;
   private time = 0;
   private introTime = 0;
@@ -178,6 +177,7 @@ export class WorldRenderer {
   private windowMat = new THREE.MeshLambertMaterial({ color: '#3a2f22', emissive: '#f2b25c', emissiveIntensity: 0 });
   private glowMat = new THREE.MeshLambertMaterial({ color: '#e9cf8a', emissive: '#d99a3a', emissiveIntensity: 0.8 });
   private glyphMat = new THREE.MeshBasicMaterial({ color: '#f1d68f', side: THREE.DoubleSide });
+  private slashMat = new THREE.MeshBasicMaterial({ color: '#f4dda0', transparent: true, opacity: 0, depthWrite: false, side: THREE.DoubleSide });
   private carveMat = new THREE.MeshBasicMaterial({ color: '#3c3a33', side: THREE.DoubleSide });
   private ghostOk = new THREE.MeshBasicMaterial({ color: '#cfe7c4', transparent: true, opacity: 0.45, depthWrite: false });
   private ghostBad = new THREE.MeshBasicMaterial({ color: '#e7a08f', transparent: true, opacity: 0.45, depthWrite: false });
@@ -201,7 +201,7 @@ export class WorldRenderer {
     this.renderer.toneMappingExposure = 1.05;
     this.scene.background = new THREE.Color('#c4d3c9');
     this.scene.fog = new THREE.Fog('#c4d3c9', 45, 165);
-    this.camera = new THREE.PerspectiveCamera(50, 1, 0.1, 230);
+    this.camera = new THREE.PerspectiveCamera(50, 1, 0.25, 230);
 
     this.hemi = new THREE.HemisphereLight('#e6efe2', '#5d6b52', 1.4);
     this.scene.add(this.hemi);
@@ -221,11 +221,27 @@ export class WorldRenderer {
     this.createTerrain();
     this.waterLod = new WaterLod();
     this.exteriorGroup.add(this.waterLod.group);
-    this.resizeHandler = () => this.resize();
+    if (import.meta.env.DEV && new URLSearchParams(window.location.search).has('captureTextures')) {
+      this.texturesReady = true;
+    } else {
+      try {
+        this.texturePack = new CompressedTexturePack(this.renderer);
+        void this.texturePack.load().then((textures) => {
+          if (this.disposed) { for (const texture of textures.values()) texture.dispose(); return; }
+          this.installTextures(textures);
+          this.texturesReady = true;
+        }).catch(() => { this.texturesReady = true; });
+      } catch { this.texturesReady = true; }
+    }
+    this.resizeHandler = () => { this.pendingResize = true; };
     window.addEventListener('resize', this.resizeHandler);
     this.resize();
     const p = world.player;
     this.yaw = p.facing + Math.PI;
+    void world.initializeNavigation(createBrowserNavigation);
+    void world.initializePhysics(this.preferredPhysics);
+    void initializeChoreography();
+    void initializeOzz();
   }
 
   private makePreloader() {
@@ -234,13 +250,57 @@ export class WorldRenderer {
         id: a.id, kind: a.kind, x: a.x, z: a.z, radius: a.radius, height: a.height, solid: a.solid,
         alive: a.alive, neverFade: !!a.neverFade,
       })),
-      (key) => {
-        const fade = this.farFades.get(key);
-        if (fade && ((fade.startFrame >= 0 && fade.opacity > 0)
-          || (fade.treeOpacity > 0 && fade.treeOpacity < 1))) return;
-        if (!this.pendingFarKeys.includes(key)) this.pendingFarKeys.push(key);
-      },
     );
+  }
+
+  private installTextures(textures: Map<string, THREE.Texture>) {
+    const replaceMap = (previous: THREE.Texture | undefined, next: THREE.Texture) => {
+      if (!previous) return;
+      this.scene.traverse((object) => {
+        if (!(object instanceof THREE.Mesh)) return;
+        const materials = Array.isArray(object.material) ? object.material : [object.material];
+        for (const material of materials) {
+          const mapped = material as THREE.Material & { map?: THREE.Texture | null };
+          if (mapped.map === previous) { mapped.map = next; mapped.needsUpdate = true; }
+        }
+      });
+    };
+    const grass = textures.get('grass');
+    if (grass) {
+      grass.colorSpace = THREE.SRGBColorSpace;
+      grass.wrapS = grass.wrapT = THREE.RepeatWrapping;
+      grass.repeat.set(70, 70);
+      grass.anisotropy = Math.min(4, this.renderer.capabilities.getMaxAnisotropy());
+      this.terrainLod?.setTexture(grass);
+      replaceMap(this.grassTexture, grass);
+      this.grassTexture?.dispose();
+      this.grassTexture = grass;
+    }
+    const paving = textures.get('paving');
+    if (paving) {
+      paving.colorSpace = THREE.SRGBColorSpace;
+      paving.wrapS = paving.wrapT = THREE.RepeatWrapping;
+      paving.repeat.set(4, 4);
+      replaceMap(this.pavingTexture, paving);
+      this.pavingTexture?.dispose();
+      this.pavingTexture = paving;
+    }
+    const water = textures.get('water-normal');
+    if (water) this.waterLod?.setNormalMap(water);
+    for (const type of Object.keys(ITEMS) as ItemType[]) {
+      const texture = textures.get(`item-${type}`);
+      if (!texture) continue;
+      texture.colorSpace = THREE.SRGBColorSpace;
+      texture.anisotropy = Math.min(4, this.renderer.capabilities.getMaxAnisotropy());
+      const previous = this.itemTextures.get(type);
+      const material = this.itemMaterials.get(type);
+      if (material) { material.map = texture; material.needsUpdate = true; }
+      this.itemTextures.set(type, texture);
+      previous?.dispose();
+    }
+    this.compressedTextureCount = textures.size;
+    this.gpuCompressedTextureCount = [...textures.values()].filter((texture) => texture.format !== THREE.RGBAFormat).length;
+    for (const texture of textures.values()) this.renderer.initTexture(texture);
   }
 
   // ------------------------------------------------------------------ terrain
@@ -268,29 +328,15 @@ export class WorldRenderer {
     grass.repeat.set(70, 70);
     grass.anisotropy = 4;
     this.grassTexture = grass;
-    this.farMaterial = new THREE.MeshLambertMaterial({ map: grass, color: '#a4b596' });
     this.terrainLod = new TerrainLod(grass);
     this.exteriorGroup.add(this.terrainLod.group);
-    const treeCanvas = document.createElement('canvas');
-    treeCanvas.width = treeCanvas.height = 128;
-    const tc = treeCanvas.getContext('2d')!;
-    tc.clearRect(0, 0, 128, 128);
-    tc.fillStyle = '#5a4433'; tc.fillRect(57, 70, 14, 58);
-    tc.fillStyle = '#3d5b36';
-    tc.beginPath(); tc.moveTo(64, 4); tc.lineTo(112, 87); tc.lineTo(16, 87); tc.closePath(); tc.fill();
-    tc.fillStyle = '#4c7040';
-    tc.beginPath(); tc.moveTo(64, 19); tc.lineTo(100, 78); tc.lineTo(28, 78); tc.closePath(); tc.fill();
-    this.treeTexture = new THREE.CanvasTexture(treeCanvas);
-    this.treeTexture.colorSpace = THREE.SRGBColorSpace;
-    this.treeBillboardMat = new THREE.MeshLambertMaterial({ map: this.treeTexture, vertexColors: true,
-      alphaTest: 0.3, side: THREE.DoubleSide, fog: true, depthWrite: true });
     const ground = new THREE.Mesh(new THREE.PlaneGeometry(420, 420), new THREE.MeshLambertMaterial({ map: grass }));
     ground.rotation.x = -Math.PI / 2;
     ground.receiveShadow = true;
     this.exteriorGroup.add(ground);
 
     // Worn paths between the places people actually go.
-    const pathMat = new THREE.MeshLambertMaterial({ color: '#a38e69' });
+    const pathMat = new THREE.MeshLambertMaterial({ color: '#a38e69', polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 });
     const paths: [number, number, number, number, number][] = [
       [1, 6, 2, 70, 4.2], [-6, 5, -27, 8, 3], [-27, 8, -42, 33, 2.6], [9, -2, 24, -17, 2.6], [8, 8, 22, 7, 2.4], [-4, -10, -11, -16, 2.2], [4, -10, 11, -16, 2.2],
     ];
@@ -315,7 +361,10 @@ export class WorldRenderer {
     pave.colorSpace = THREE.SRGBColorSpace;
     pave.wrapS = pave.wrapT = THREE.RepeatWrapping;
     pave.repeat.set(4, 4);
-    const plaza = new THREE.Mesh(new THREE.CircleGeometry(12.5, 48), new THREE.MeshLambertMaterial({ map: pave }));
+    this.pavingTexture = pave;
+    const plaza = new THREE.Mesh(new THREE.CircleGeometry(12.5, 48), new THREE.MeshLambertMaterial({
+      map: pave, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2,
+    }));
     plaza.rotation.x = -Math.PI / 2;
     plaza.position.set(0, 0.03, -2);
     plaza.receiveShadow = true;
@@ -382,120 +431,6 @@ export class WorldRenderer {
     }
   }
 
-  /** Far cells keep a baked silhouette and terrain texture, not per-reference meshes. */
-  private removeFarCell(key: string) {
-    const group = this.farCells.get(key);
-    if (group) this.exteriorGroup.remove(group);
-    this.farGeometries.get(key)?.dispose();
-    this.farTreeGeometries.get(key)?.dispose();
-    for (const material of this.farFades.get(key)?.materials ?? []) material.dispose();
-    this.farCells.delete(key);
-    this.farGeometries.delete(key);
-    this.farTreeGeometries.delete(key);
-    this.farFades.delete(key);
-  }
-
-  private rebuildFarCells() {
-    const windowKey = [...this.world.streamer.bufferedCells].join('|');
-    if (this.lastLodRevision !== this.world.renderRevision || windowKey !== this.lastFarWindow) {
-      this.lastLodRevision = this.world.renderRevision;
-      this.lastFarWindow = windowKey;
-      this.pendingFarKeys = [...this.world.streamer.bufferedCells].filter((key) => key.startsWith('exterior:'));
-      this.pendingFarKeys.sort((a, b) => {
-        const priority = (key: string) => {
-          const [, cx, cz] = key.split(':');
-          const dx = (Number(cx) + 0.5) * WORLD_UNITS_PER_CELL - this.world.player.x;
-          const dz = (Number(cz) + 0.5) * WORLD_UNITS_PER_CELL - this.world.player.z;
-          return (this.world.streamer.loadedCells.has(key) ? -1e6 : 0) + dx * dx + dz * dz;
-        };
-        return priority(a) - priority(b);
-      });
-      for (const key of this.farCells.keys()) if (!this.world.streamer.bufferedCells.has(key)) this.removeFarCell(key);
-    }
-    const started = performance.now();
-    let built = 0;
-    while (this.pendingFarKeys.length && built < 2 && performance.now() - started < 3) {
-      const key = this.pendingFarKeys.shift()!;
-      if (!this.world.streamer.actorsInCell(key).some((a) => a.alive &&
-        !a.neverFade && (a.kind === 'tree' || a.kind === 'ore' || a.kind === 'house' || a.kind === 'tavern' || a.kind === 'camp'
-          || a.kind === 'tower' || a.kind === 'dungeon' || a.kind === 'ruin'))) {
-        this.removeFarCell(key);
-        built++;
-        continue;
-      }
-      const priorFade = this.farFades.get(key);
-      const oldOpacity = priorFade?.opacity ?? 1;
-      const oldStartFrame = priorFade?.startFrame ?? -1;
-      const oldTreeOpacity = priorFade?.treeOpacity ?? 1;
-      const oldTreeStartFrame = priorFade?.treeStartFrame ?? -1;
-      this.removeFarCell(key);
-      const [, xs, zs] = key.split(':');
-      const cx = Number(xs), cz = Number(zs);
-      const group = new THREE.Group();
-      const tileMaterial = screenDoorMaterial(this.farMaterial!);
-      setScreenDoorFade(tileMaterial, oldOpacity);
-      const materials: THREE.Material[] = [tileMaterial];
-      const tile = new THREE.Mesh(this.cached('lod-terrain', () => new THREE.PlaneGeometry(WORLD_UNITS_PER_CELL, WORLD_UNITS_PER_CELL)), tileMaterial);
-      tile.rotation.x = -Math.PI / 2;
-      tile.position.set((cx + 0.5) * WORLD_UNITS_PER_CELL, 0.006, (cz + 0.5) * WORLD_UNITS_PER_CELL);
-      group.add(tile);
-      const refs = this.world.streamer.actorsInCell(key);
-      const prepared = this.preloader.get(key)?.visual;
-      const shapes = new Shape();
-      let count = 0;
-      if (!prepared) for (const a of refs) {
-        if (!a.alive || a.neverFade) continue;
-        if (a.kind === 'ore') { shapes.add('dodec', '#848980', a.x, 0.55, a.z, 1.6, 1.1, 1.6); count++; }
-        else if (a.kind === 'house' || a.kind === 'tavern') {
-          shapes.add('box', '#b1a58d', a.x, 1.7, a.z, 4.3, 3.4, 4.1)
-            .add('cone4', '#6e6860', a.x, 4, a.z, 5.7, 1.6, 5.7, Math.PI / 4);
-          count++;
-        } else if (a.kind === 'camp' || a.kind === 'tower' || a.kind === 'citadel' || a.kind === 'dungeon' || a.kind === 'ruin') {
-          const height = a.kind === 'citadel' ? 9 : a.kind === 'tower' ? 5 : a.kind === 'camp' ? 3 : 2.5;
-          shapes.add(a.kind === 'camp' ? 'cone4' : 'box', a.kind === 'camp' ? '#886c4c' : '#8b8b80', a.x, height / 2, a.z,
-            a.kind === 'citadel' ? 4 : 2.5, height, a.kind === 'citadel' ? 4 : 2.5);
-          count++;
-        }
-      }
-      if (prepared?.positions.length || count) {
-        const geometry = prepared?.positions.length ? new THREE.BufferGeometry() : shapes.build();
-        if (prepared?.positions.length) {
-          geometry.setAttribute('position', new THREE.BufferAttribute(prepared.positions, 3));
-          geometry.setAttribute('normal', new THREE.BufferAttribute(prepared.normals, 3));
-          geometry.setAttribute('color', new THREE.BufferAttribute(prepared.colors, 3));
-          geometry.computeBoundingSphere();
-        }
-        this.farGeometries.set(key, geometry);
-        const silhouette = screenDoorMaterial(this.vertexMat);
-        setScreenDoorFade(silhouette, oldOpacity);
-        materials.push(silhouette);
-        group.add(new THREE.Mesh(geometry, silhouette));
-      }
-      const treeLayer = prepared?.treePositions.length ? prepared : parseVisual(refs.filter((a) => a.alive && !a.neverFade && a.kind === 'tree'));
-      let treeMaterial: THREE.Material | undefined;
-      if (treeLayer.treePositions.length) {
-        const geometry = new THREE.BufferGeometry();
-        geometry.setAttribute('position', new THREE.BufferAttribute(treeLayer.treePositions, 3));
-        geometry.setAttribute('uv', new THREE.BufferAttribute(treeLayer.treeUvs, 2));
-        geometry.setAttribute('color', new THREE.BufferAttribute(treeLayer.treeColors, 3));
-        geometry.computeVertexNormals();
-        geometry.computeBoundingSphere();
-        this.farTreeGeometries.set(key, geometry);
-        const billboard = screenDoorMaterial(this.treeBillboardMat!);
-        setScreenDoorFade(billboard, oldTreeOpacity);
-        treeMaterial = billboard;
-        materials.push(billboard);
-        group.add(new THREE.Mesh(geometry, billboard));
-      }
-      group.visible = false;
-      this.exteriorGroup.add(group);
-      this.farCells.set(key, group);
-      this.farFades.set(key, { materials, treeMaterial, startFrame: oldStartFrame, opacity: oldOpacity,
-        treeStartFrame: oldTreeStartFrame, treeOpacity: oldTreeOpacity });
-      built++;
-    }
-  }
-
   private removeStaticBatch(key: string) {
     const batch = this.staticBatches.get(key);
     if (!batch) return;
@@ -512,30 +447,55 @@ export class WorldRenderer {
       .add('box', '#000', 1.25, 2.1, -1.94, 0.55, 0.55, 0.05).build());
   }
 
-  /** Bake stable references into one body mesh and one shared emissive-window mesh per cell. */
-  private bakeStaticCells() {
-    const windowKey = [...this.world.streamer.bufferedCells].join('|');
-    if (this.batchRevision !== this.world.renderRevision || windowKey !== this.batchWindow) {
-      this.batchRevision = this.world.renderRevision;
-      this.batchWindow = windowKey;
-      this.pendingBatchKeys = [...this.world.streamer.bufferedCells].filter((key) =>
-        this.world.streamer.actorsInCell(key).some(isPrecombinedStatic));
-      this.pendingBatchKeys.sort((a, b) => {
-        const priority = (key: string) => {
-          const [, cx, cz] = key.split(':');
-          const dx = (Number(cx) + 0.5) * WORLD_UNITS_PER_CELL - this.world.player.x;
-          const dz = (Number(cz) + 0.5) * WORLD_UNITS_PER_CELL - this.world.player.z;
-          return (this.world.streamer.loadedCells.has(key) ? -1e6 : 0) + dx * dx + dz * dz;
-        };
-        return priority(a) - priority(b);
-      });
-      for (const key of this.staticBatches.keys()) if (!this.world.streamer.bufferedCells.has(key)) this.removeStaticBatch(key);
+  private actorInView(actor: Actor) {
+    const height = Math.max(1, actor.height);
+    this.viewSphere.center.set(actor.x, actor.y + height / 2, actor.z);
+    this.viewSphere.radius = Math.max(2, actor.radius * 3, height * 0.75);
+    return this.frustum.intersectsSphere(this.viewSphere);
+  }
+
+  private cellInView(key: string) {
+    const [, x, z] = key.split(':');
+    this.viewSphere.center.set((Number(x) + 0.5) * WORLD_UNITS_PER_CELL, 5, (Number(z) + 0.5) * WORLD_UNITS_PER_CELL);
+    this.viewSphere.radius = WORLD_UNITS_PER_CELL * Math.SQRT2 / 2 + 15;
+    return this.frustum.intersectsSphere(this.viewSphere);
+  }
+
+  private batchSignature(actors: Actor[]) {
+    return actors.map((a) => [a.id, a.kind, a.variant, a.x, a.y, a.z, a.facing, a.scale,
+      a.radius, a.surface, a.faction, a.structure, a.locationId].join(':')).sort().join('|');
+  }
+
+  /** Build changed full-detail cell batches before replacing the previous batch. */
+  private bakeStaticCells(interior: boolean) {
+    const cells = new Map<string, Actor[]>();
+    for (const key of this.world.streamer.exteriorCells) {
+      const actors = this.world.streamer.actorsInCell(key).filter(isPrecombinedStatic);
+      if (actors.length) cells.set(key, actors);
     }
-    const started = performance.now();
-    if (!this.pendingBatchKeys.length || performance.now() - started > 3) return;
-    const key = this.pendingBatchKeys.shift()!;
-    const actors = this.world.streamer.actorsInCell(key).filter(isPrecombinedStatic);
-    if (!actors.length) { this.removeStaticBatch(key); return; }
+    for (const key of this.staticBatches.keys()) if (!cells.has(key)) this.removeStaticBatch(key);
+    this.pendingBatchKeys = [...cells.keys()].filter((key) =>
+      this.staticBatches.get(key)?.signature !== this.batchSignature(cells.get(key)!));
+    const priority = (key: string) => {
+      const [, x, z] = key.split(':');
+      const dx = (Number(x) + 0.5) * WORLD_UNITS_PER_CELL - this.camera.position.x;
+      const dz = (Number(z) + 0.5) * WORLD_UNITS_PER_CELL - this.camera.position.z;
+      return (!interior && this.cellInView(key) ? -1e9 : 0) + dx * dx + dz * dz;
+    };
+    this.pendingBatchKeys.sort((a, b) => priority(a) - priority(b));
+    let built = 0;
+    while (this.pendingBatchKeys.length) {
+      const key = this.pendingBatchKeys[0];
+      const urgent = this.firstSceneReady && !interior && this.cellInView(key);
+      if (built && !urgent) break;
+      this.pendingBatchKeys.shift();
+      const actors = cells.get(key)!;
+      this.bakeStaticCell(key, actors, this.batchSignature(actors));
+      built++;
+    }
+  }
+
+  private bakeStaticCell(key: string, actors: Actor[], signature: string) {
     const parts: THREE.BufferGeometry[] = [], windows: THREE.BufferGeometry[] = [];
     for (const actor of actors) {
       // Geometry construction uses the shared transform scratch matrix, so resolve it first.
@@ -554,22 +514,22 @@ export class WorldRenderer {
       if (merged) {
         source.forEach((g) => g.dispose());
         merged.computeBoundingSphere();
+        prepareMeshBVH(merged);
         geometries.push(merged);
         group.add(new THREE.Mesh(merged, material));
       } else for (const g of source) { geometries.push(g); group.add(new THREE.Mesh(g, material)); }
     };
     attach(parts, this.vertexMat);
     attach(windows, this.windowMat);
-    group.visible = false;
     this.removeStaticBatch(key);
     this.exteriorGroup.add(group);
-    this.staticBatches.set(key, { group, geometries, refs: actors.length });
+    this.staticBatches.set(key, { group, geometries, refs: actors.length, signature });
   }
 
   // ------------------------------------------------------------------ geometry
   private cached(key: string, make: () => THREE.BufferGeometry) {
     let g = this.geometryCache.get(key);
-    if (!g) { g = make(); this.geometryCache.set(key, g); }
+    if (!g) { g = prepareMeshBVH(make()); this.geometryCache.set(key, g); }
     return g;
   }
 
@@ -749,16 +709,9 @@ export class WorldRenderer {
     return material;
   }
 
-  private itemGeometry(type: ItemType, lowDetail = false) {
-    return this.cached(`item-${type}${lowDetail ? '-low' : ''}`, () => {
+  private itemGeometry(type: ItemType) {
+    return this.cached(`item-${type}`, () => {
       const s = new Shape(true);
-      if (lowDetail) {
-        if (['apple', 'bread', 'cheese', 'herb', 'pouch', 'draught'].includes(type)) s.add('ico', '#ffffff', 0, 0.12, 0, 0.34, 0.22, 0.3);
-        else if (['barrel', 'pot', 'jug', 'bucket', 'basket', 'stool'].includes(type)) s.add('cyl', '#ffffff', 0, 0.22, 0, 0.5, 0.45, 0.5);
-        else if (['hammer', 'lockpicks', 'log'].includes(type)) s.add('box', '#ffffff', 0, 0.09, 0, 0.4, 0.14, 0.22);
-        else s.add('box', '#ffffff', 0, 0.12, 0, 0.42, 0.24, 0.34);
-        return s.build();
-      }
       switch (type) {
         case 'apple':
           s.add('ico', '#a8402f', 0, 0.11, 0, 0.24, 0.22, 0.23).add('ico', '#c45038', 0.04, 0.14, 0.04, 0.14, 0.13, 0.14)
@@ -913,20 +866,10 @@ export class WorldRenderer {
       if (accessory) v.rig.root.add(accessory);
       const group = new THREE.Group();
       group.add(v.rig.root);
-      if (a.kind !== 'player') {
-        const key = `person-low-${a.kind}-${a.kind === 'foe' ? a.foeKind : a.variant}`;
-        const low = new THREE.Mesh(this.cached(key, () => new Shape()
-          .add('box', style.pants, -0.15, 0.45, 0, 0.2, 0.8, 0.22)
-          .add('box', style.pants, 0.15, 0.45, 0, 0.2, 0.8, 0.22)
-          .add('box', style.coat, 0, 1.22, 0, 0.72, 0.82, 0.42)
-          .add('box', style.coat, -0.45, 1.2, 0, 0.16, 0.65, 0.2)
-          .add('box', style.coat, 0.45, 1.2, 0, 0.16, 0.65, 0.2)
-          .add('box', style.skin, 0, 1.78, 0.02, 0.33, 0.35, 0.32)
-          .add('box', style.hair, 0, 1.98, -0.02, 0.34, 0.12, 0.34).build()), this.vertexMat);
-        low.scale.setScalar(style.height ?? 1);
-        low.visible = false;
-        group.add(low);
-        v.low = low;
+      if (a.kind === 'player') {
+        const slash = new THREE.Mesh(this.cached('weapon-sweep', () => new THREE.RingGeometry(0.75, 1.08, 24, 1, 0.25, Math.PI * 0.75)), this.slashMat);
+        slash.position.set(0, 0.95, 0.65); slash.rotation.x = -Math.PI / 2; slash.visible = false;
+        group.add(slash); v.slash = slash;
       }
       v.obj = group;
       v.weaponLevel = this.world.weaponLevel;
@@ -936,7 +879,7 @@ export class WorldRenderer {
       shot.frustumCulled = false;
       v.obj.add(shot);
       v.shot = shot;
-    } else if (a.kind === 'tree' || a.kind === 'ore') {
+    } else if ((a.kind === 'tree' || a.kind === 'ore') && spaceOf(a) === EXTERIOR_SPACE) {
       // One instanced draw per species variant and exterior cell.
       const cell = cellKey(a);
       const key = `${a.kind}${a.variant}:${cell}`;
@@ -944,20 +887,24 @@ export class WorldRenderer {
       if (!pool) {
         const count = this.world.actors.filter((x) => x.kind === a.kind && x.variant === a.variant
           && cellKey(x) === cell).length;
-        pool = { mesh: new THREE.InstancedMesh(this.staticGeometry(a), this.vertexMat, Math.max(1, count)), next: 0, active: 0 };
+        pool = { mesh: new THREE.InstancedMesh(this.staticGeometry(a), this.vertexMat, Math.max(1, count)), next: 0, free: [], active: 0 };
         const [, cx, cz] = cell.split(':');
-        tmpM.makeScale(0.0001, 0.0001, 0.0001);
-        tmpM.setPosition((Number(cx) + 0.5) * WORLD_UNITS_PER_CELL, 0, (Number(cz) + 0.5) * WORLD_UNITS_PER_CELL);
-        for (let i = 0; i < count; i++) pool.mesh.setMatrixAt(i, tmpM);
+        tmpM.makeScale(0, 0, 0);
+        for (let i = 0; i < pool.mesh.count; i++) pool.mesh.setMatrixAt(i, tmpM);
         pool.mesh.instanceMatrix.needsUpdate = true;
         pool.mesh.castShadow = a.kind === 'tree';
         pool.mesh.frustumCulled = true;
+        pool.mesh.boundingSphere = new THREE.Sphere(
+          new THREE.Vector3((Number(cx) + 0.5) * WORLD_UNITS_PER_CELL, 3, (Number(cz) + 0.5) * WORLD_UNITS_PER_CELL),
+          WORLD_UNITS_PER_CELL * Math.SQRT2 / 2 + 8,
+        );
         pool.mesh.visible = false;
         this.pools.set(key, pool);
         this.exteriorGroup.add(pool.mesh);
       }
       v.poolKey = key;
-      v.poolIndex = pool.next++;
+      if (!pool.free.length && pool.next >= pool.mesh.count) this.growPool(pool);
+      v.poolIndex = pool.free.pop() ?? pool.next++;
       const holder = new THREE.Group();
       if (a.kind === 'tree') {
         const stump = new THREE.Mesh(this.cached('stump', () => new Shape().add('taper', C.trunk, 0, 0.25, 0, 0.6, 0.5, 0.6).add('cyl', '#b38f62', 0, 0.51, 0, 0.5, 0.02, 0.5).build()), this.vertexMat);
@@ -985,14 +932,9 @@ export class WorldRenderer {
       v.obj = g;
     } else if (a.kind === 'item') {
       const type = a.itemType!;
-      const lod = new THREE.LOD();
       const detailed = new THREE.Mesh(this.itemGeometry(type), this.itemMaterial(type));
-      const simple = new THREE.Mesh(this.itemGeometry(type, true), this.itemMaterial(type));
       detailed.castShadow = type === 'barrel' || type === 'crate' || type === 'strongbox';
-      simple.castShadow = false;
-      lod.addLevel(detailed, 0);
-      lod.addLevel(simple, 34);
-      v.obj = lod;
+      v.obj = detailed;
       v.isStatic = true;
     } else {
       const g = new THREE.Group();
@@ -1051,18 +993,53 @@ export class WorldRenderer {
     return v;
   }
 
-  private setInstance(a: Actor, v: Visual, alive: boolean) {
+  private growPool(pool: Pool) {
+    const old = pool.mesh;
+    const mesh = new THREE.InstancedMesh(old.geometry, old.material, Math.max(2, old.count * 2));
+    for (let i = 0; i < old.count; i++) { old.getMatrixAt(i, tmpM); mesh.setMatrixAt(i, tmpM); }
+    tmpM.makeScale(0, 0, 0);
+    for (let i = old.count; i < mesh.count; i++) mesh.setMatrixAt(i, tmpM);
+    mesh.instanceMatrix.needsUpdate = true;
+    mesh.castShadow = old.castShadow;
+    mesh.frustumCulled = old.frustumCulled;
+    mesh.boundingSphere = old.boundingSphere?.clone() ?? null;
+    mesh.visible = old.visible;
+    this.exteriorGroup.add(mesh);
+    this.exteriorGroup.remove(old);
+    old.dispose();
+    pool.mesh = mesh;
+  }
+
+  private removeVisual(v: Visual) {
+    const pool = v.poolKey ? this.pools.get(v.poolKey) : undefined;
+    if (pool && v.poolIndex !== undefined) {
+      if (v.poolAlive) {
+        tmpM.makeScale(0, 0, 0);
+        pool.mesh.setMatrixAt(v.poolIndex, tmpM);
+        pool.mesh.instanceMatrix.needsUpdate = true;
+        pool.active--;
+        pool.mesh.visible = pool.active > 0;
+      }
+      pool.free.push(v.poolIndex);
+    }
+    if (v.shot) {
+      v.shot.geometry.dispose();
+      (v.shot.material as THREE.Material).dispose();
+    }
+    if (v.rig) { disposeRig(v.rig); v.rig.mesh.geometry.dispose(); v.rig.skeleton.dispose(); }
+    v.obj.parent?.remove(v.obj);
+  }
+
+  private setInstance(a: Actor, v: Visual, alive: boolean, force = false) {
     const pool = this.pools.get(v.poolKey!);
-    if (!pool || v.poolIndex === undefined || v.poolAlive === alive) return;
-    tmpM.compose(
-      tmpP.set(a.x, 0, a.z),
-      tmpQ.setFromEuler(tmpE.set(0, a.variant * 1.7 + a.x * 0.13, 0)),
-      tmpS.setScalar(alive ? 1 : 0.0001),
+    if (!pool || v.poolIndex === undefined || (!force && v.poolAlive === alive)) return;
+    if (alive) tmpM.compose(
+      tmpP.set(a.x, 0, a.z), tmpQ.setFromEuler(tmpE.set(0, a.variant * 1.7 + a.x * 0.13, 0)), tmpS.setScalar(1),
     );
+    else tmpM.makeScale(0, 0, 0);
     pool.mesh.setMatrixAt(v.poolIndex, tmpM);
     pool.mesh.instanceMatrix.needsUpdate = true;
-    pool.mesh.computeBoundingSphere();
-    pool.active += alive ? 1 : v.poolAlive ? -1 : 0;
+    pool.active += Number(alive) - Number(!!v.poolAlive);
     pool.mesh.visible = pool.active > 0;
     v.poolAlive = alive;
   }
@@ -1074,6 +1051,7 @@ export class WorldRenderer {
     if (a.kind === 'player') {
       if (a.sittingOn) return 'sit';
       if (a.y > 0.05) return a.vy > 0 ? 'jump' : 'fall';
+      if (a.blocking) return 'block';
       if (this.world.held()) return speed > 0.4 ? 'carryWalk' : 'carry';
       if (a.sneaking && speed > 0.3) return 'sneak';
       return speed > 5.4 ? 'run' : speed > 0.3 ? 'walk' : 'idle';
@@ -1096,6 +1074,40 @@ export class WorldRenderer {
     return speed > 2.9 ? 'run' : speed > 0.3 ? 'walk' : 'idle';
   }
 
+  private syncRagdolls() {
+    const poses = this.world.ragdollPoses();
+    const present = new Set(poses.map((pose) => pose.id));
+    for (const [id, visual] of this.ragdollVisuals) if (!present.has(id)) {
+      visual.group.parent?.remove(visual.group);
+      this.ragdollVisuals.delete(id);
+    }
+    for (const pose of poses) {
+      let visual = this.ragdollVisuals.get(pose.id);
+      if (!visual) {
+        const actor = this.world.byId(pose.id);
+        if (!actor) continue;
+        const style = this.rigStyle(actor);
+        const group = new THREE.Group(), parts = new Map<RagdollPartName, THREE.Mesh>();
+        for (const part of pose.parts) {
+          const color = part.name === 'head' ? style.skin : part.name.endsWith('Leg') ? style.pants
+            : part.name === 'creature' ? (actor.foeKind === 'slime' ? '#76964a' : '#8b7ea0') : style.coat;
+          const mesh = new THREE.Mesh(PRIM.box, lambert(color));
+          mesh.scale.set(...part.size);
+          group.add(mesh); parts.set(part.name, mesh);
+        }
+        (this.world.currentSpace === EXTERIOR_SPACE ? this.exteriorGroup : this.interiorGroup).add(group);
+        visual = { group, parts };
+        this.ragdollVisuals.set(pose.id, visual);
+      }
+      for (const part of pose.parts) {
+        const mesh = visual.parts.get(part.name);
+        if (!mesh) continue;
+        mesh.position.set(part.position.x, part.position.y, part.position.z);
+        mesh.quaternion.set(part.rotation.x, part.rotation.y, part.rotation.z, part.rotation.w);
+      }
+    }
+  }
+
   private sync(dt: number, focus: THREE.Vector3) {
     const frame = ++this.frame;
     const t = this.time;
@@ -1103,99 +1115,91 @@ export class WorldRenderer {
     this.exteriorGroup.visible = !interior;
     this.interiorGroup.visible = interior;
     if (interior && !this.rooms.has(this.world.currentSpace)) this.createInteriorRooms(this.world.currentSpace);
+    this.terrainLod?.update(this.world.player);
     if (!interior) {
-      this.terrainLod?.update(this.world.player);
       this.waterLod?.update(this.world.player, dt);
       this.preloader.sync(this.world.streamer.bufferedCells, this.world.streamer.loadedCells,
         this.world.renderRevision, this.world.player);
-      this.rebuildFarCells();
     }
-    this.bakeStaticCells();
     this.camera.updateMatrixWorld();
     this.frustum.setFromProjectionMatrix(this.projectionView.multiplyMatrices(this.camera.projectionMatrix, this.camera.matrixWorldInverse));
-    const planes = interior ? [] : occlusionPlanes(this.camera.position, this.world.actors);
-    this.occludedDecor = 0;
-    for (const key of this.readyCells) if (!this.world.streamer.loadedCells.has(key)) this.readyCells.delete(key);
-    for (const key of this.treeFullCells) if (!this.world.streamer.loadedCells.has(key)) this.treeFullCells.delete(key);
-    const treeRange = Math.max(45, (this.world.uGridsToLoad / 2 - 0.75) * WORLD_UNITS_PER_CELL);
-    for (const key of this.world.streamer.loadedCells) if (key.startsWith('exterior:')) {
-      const [, cx, cz] = key.split(':');
-      const minX = Number(cx) * WORLD_UNITS_PER_CELL, minZ = Number(cz) * WORLD_UNITS_PER_CELL;
-      const dx = Math.max(minX - this.world.player.x, 0, this.world.player.x - minX - WORLD_UNITS_PER_CELL);
-      const dz = Math.max(minZ - this.world.player.z, 0, this.world.player.z - minZ - WORLD_UNITS_PER_CELL);
-      const distanceToCell = Math.hypot(dx, dz);
-      if (distanceToCell < treeRange - 8) this.treeFullCells.add(key);
-      else if (distanceToCell > treeRange + 8) this.treeFullCells.delete(key);
-    }
-    for (const [key, batch] of this.staticBatches) {
-      batch.group.visible = !interior && this.readyCells.has(key) && batch.geometries.some((geometry) =>
-        !!geometry.boundingSphere && this.frustum.intersectsSphere(geometry.boundingSphere)
-        && !isOccluded(this.camera.position, { id: key, x: geometry.boundingSphere.center.x,
-          z: geometry.boundingSphere.center.z, radius: geometry.boundingSphere.radius,
-          height: geometry.boundingBox?.max.y ?? 6 }, planes));
-    }
-    for (const [key, cell] of this.farCells) {
-      const fade = this.farFades.get(key);
-      if (!fade) continue;
-      if (!this.readyCells.has(key)) { fade.startFrame = -1; fade.opacity = 1; }
-      else {
-        if (fade.startFrame < 0) fade.startFrame = frame;
-        fade.opacity = Math.max(0, 1 - (frame - fade.startFrame) / 8);
-      }
-      const treeTarget = this.readyCells.has(key) && this.treeFullCells.has(key) ? 0 : 1;
-      if (fade.treeOpacity !== treeTarget && fade.treeStartFrame < 0) fade.treeStartFrame = frame;
-      fade.treeOpacity = Math.max(0, Math.min(1, fade.treeOpacity + Math.sign(treeTarget - fade.treeOpacity) / 8));
-      if (fade.treeOpacity === treeTarget) fade.treeStartFrame = -1;
-      for (const material of fade.materials) setScreenDoorFade(material, material === fade.treeMaterial ? fade.treeOpacity : fade.opacity);
-      cell.visible = !interior && (fade.opacity > 0 || (!!fade.treeMaterial && fade.treeOpacity > 0));
-    }
-    for (const [key, tufts] of this.grassCells) tufts.visible = !interior && this.readyCells.has(key);
+    const visibleActors = this.world.frustumCandidates(this.frustum);
+    this.bakeStaticCells(interior);
+    for (const tufts of this.grassCells.values()) tufts.visible = !interior;
     for (const [space, room] of this.rooms) room.visible = interior && space === this.world.currentSpace;
-    const loaded = this.world.streamer.loadedActors();
-    if (!interior) for (const actor of this.world.actors) if (actor.neverFade && actor.alive && !loaded.includes(actor)) loaded.push(actor);
-    const needsVisual = (a: Actor) => !isPrecombinedStatic(a) && (a.alive || a.kind === 'tree' || a.kind === 'ore');
-    const missing = loaded.filter((a) => needsVisual(a) && !this.visuals.has(a.id));
-    missing.sort((a, b) => {
-      const priority = (a: Actor) => (a.kind === 'player' ? -100000 : a.kind === 'citadel' ? -50000
-        : a.kind === 'house' || a.kind === 'tavern' ? -20000 : a.kind === 'villager' ? -10000 : 0)
-        + (a.x - focus.x) ** 2 + (a.z - focus.z) ** 2;
-      return priority(a) - priority(b);
-    });
+
+    // Physics cells are independent of drawing: keep the whole small exterior warm so
+    // turning the camera or crossing a cell boundary never swaps in a proxy mesh.
+    const actors = this.world.actors.filter((a) => spaceOf(a) === EXTERIOR_SPACE || spaceOf(a) === this.world.currentSpace);
+    const visibleCells = new Set<string>(), visiblePools = new Set<string>();
+    if (!interior) for (const actor of actors) if (visibleActors.has(actor.id) && spaceOf(actor) === EXTERIOR_SPACE) {
+      if (isPrecombinedStatic(actor)) visibleCells.add(cellKey(actor));
+      else if (actor.kind === 'tree' || actor.kind === 'ore') visiblePools.add(`${actor.kind}${actor.variant}:${cellKey(actor)}`);
+    }
+    for (const [key, batch] of this.staticBatches) batch.group.visible = !interior && visibleCells.has(key);
+    const needsVisual = (a: Actor) => !isPrecombinedStatic(a) && (a.alive || a.kind === 'tree');
+    const desired = new Map(actors.filter(needsVisual).map((a) => [a.id, a]));
+    for (const [id, visual] of this.visuals) {
+      const actor = desired.get(id);
+      const poolKey = actor && `${actor.kind}${actor.variant}:${cellKey(actor)}`;
+      if (!actor || (visual.poolKey && visual.poolKey !== poolKey)) {
+        this.removeVisual(visual);
+        this.visuals.delete(id);
+      }
+    }
+    const missing = [...desired.values()].filter((a) => !this.visuals.has(a.id));
+    const inView = new Map(missing.map((a) => [a.id, spaceOf(a) === this.world.currentSpace && (visibleActors.has(a.id) || this.actorInView(a))]));
+    const priority = (a: Actor) => (inView.get(a.id) ? -1e9 : 0)
+      + (a.kind === 'player' ? -100000 : a.kind === 'citadel' ? -50000 : a.kind === 'villager' ? -10000 : 0)
+      + (a.x - focus.x) ** 2 + (a.z - focus.z) ** 2;
+    missing.sort((a, b) => priority(a) - priority(b));
     const started = performance.now();
     let created = 0;
     for (const a of missing) {
-      if (created >= 16 || (created > 0 && performance.now() - started > 4)) break;
+      const urgent = this.firstSceneReady && inView.get(a.id);
+      if (!urgent && (created >= 16 || (created > 0 && performance.now() - started > 4))) break;
       const v = this.createVisual(a);
       this.visuals.set(a.id, v);
-      if (v.poolKey && !this.readyCells.has(cellKey(a))) this.setInstance(a, v, false);
       created++;
     }
-    for (const a of loaded) {
+    for (const a of actors) {
       const dx = a.x - focus.x, dz = a.z - focus.z;
       let v = this.visuals.get(a.id);
       if (!v) continue;
       if (v.rig && a.kind === 'player' && v.weaponLevel !== this.world.weaponLevel) {
-        v.obj.parent?.remove(v.obj);
+        this.removeVisual(v);
         v = this.createVisual(a);
         this.visuals.set(a.id, v);
       }
       const parent = a.spaceId && a.spaceId !== EXTERIOR_SPACE ? this.interiorGroup : this.exteriorGroup;
       if (v.obj.parent !== parent) parent.add(v.obj);
       v.frame = frame;
-      const showDetail = this.readyCells.has(cellKey(a)) || a.kind === 'player' || !!a.neverFade;
-      const hiddenByPlane = !interior && (a.kind === 'item' || a.kind === 'tree' || a.kind === 'ore')
-        && isOccluded(this.camera.position, a, planes);
-      if (hiddenByPlane) this.occludedDecor++;
-      if (a.kind === 'tree' || a.kind === 'ore') {
-        const farCell = this.farFades.get(cellKey(a));
-        const showNode = !hiddenByPlane && showDetail && (a.kind !== 'tree' || this.treeFullCells.has(cellKey(a))
-          || (farCell?.treeOpacity ?? 1) < 1 || !farCell?.treeMaterial);
-        v.obj.visible = showNode;
-        if (v.stump) { v.stump.visible = !a.alive && showNode; v.obj.position.set(a.x, 0, a.z); v.obj.updateMatrix(); }
-        if (v.poolAlive !== (a.alive && showNode)) this.setInstance(a, v, a.alive && showNode);
-      } else v.obj.visible = !hiddenByPlane && showDetail && a.alive && !(a.kind === 'villager' && a.activity === 'Sleeping') && a.kind !== 'player' ? true : a.kind === 'player';
+      const inCurrentSpace = spaceOf(a) === this.world.currentSpace;
+      if (v.poolKey) {
+        v.obj.visible = inCurrentSpace;
+        if (v.stump) v.stump.visible = !a.alive;
+        const moved = a.x !== v.lx || a.y !== v.ly || a.z !== v.lz;
+        this.setInstance(a, v, a.alive, moved);
+        if (moved) {
+          v.obj.position.set(a.x, a.y, a.z);
+          v.obj.updateMatrix();
+          v.lx = a.x; v.ly = a.y; v.lz = a.z;
+        }
+        continue;
+      } else {
+        v.obj.visible = inCurrentSpace && (a.alive || a.kind === 'player')
+          && !(a.kind === 'villager' && a.activity === 'Sleeping');
+      }
       if (a.kind === 'foe' && a.hp <= 0) v.obj.visible = false;
+      if (a.kind === 'player' && a.hp <= 0 && this.world.hasRagdoll(a.id)) v.obj.visible = false;
       if (!v.obj.visible) continue;
+
+      if (v.slash) {
+        const action = a.action;
+        const motion = action === 'attack1' || action === 'attack2' || action === 'attack3' ? sampleAttack(action, a.actionT ?? 0) : undefined;
+        v.slash.visible = !!motion && motion.effect > 0.01;
+        this.slashMat.opacity = motion ? Math.max(0, Math.min(0.75, motion.effect * 0.75)) : 0;
+      }
 
       if (v.isStatic) {
         const shaking = a.struckAt !== undefined && this.world.elapsed - a.struckAt < 0.35;
@@ -1242,25 +1246,23 @@ export class WorldRenderer {
           pos.needsUpdate = true;
         }
       }
-      const rigRange = this.pixelRatio < 0.65 ? 13 : this.pixelRatio < 0.9 ? 21 : 30;
-      const cameraDist2 = (a.x - this.camera.position.x) ** 2 + (a.z - this.camera.position.z) ** 2;
-      if (v.low) {
-        if (!v.lowActive && cameraDist2 > (rigRange + 2) ** 2) v.lowActive = true;
-        else if (v.lowActive && cameraDist2 < (rigRange - 2) ** 2) v.lowActive = false;
-      }
-      const lowDetail = !!v.low && !!v.lowActive;
-      if (v.low && v.rig) { v.low.visible = lowDetail; v.rig.root.visible = !lowDetail; }
-      if (v.rig && !lowDetail) {
+      if (v.rig) {
         const state = this.animFor(a);
         const dist2 = dx * dx + dz * dz;
-        if (dist2 < 3600 || (frame + a.variant) % 3 === 0) animateRig(v.rig, state, t + a.variant * 1.7, dt, { phase: v.phase, actionT: a.action ? a.actionT ?? 0 : 0, speed });
+        let lookYaw = 0;
         if (a.lookAt && state !== 'sleep') {
           const target = this.world.byId(a.lookAt);
           if (target) {
             const rel = angleDelta(v.yaw, Math.atan2(target.x - a.x, target.z - a.z));
-            v.rig.bones.head.rotation.y += Math.max(-1, Math.min(1, rel)) * 0.8;
+            lookYaw = Math.max(-1, Math.min(1, rel)) * 0.8;
           }
         }
+        const ground = this.world.characterGroundHeight(a.x, a.z, spaceOf(a));
+        if (visibleActors.has(a.id) || dist2 < 3600 || (frame + a.variant) % 3 === 0) animateRig(v.rig, state, t + a.variant * 1.7, dt, {
+          phase: v.phase, actionT: a.action ? a.actionT ?? 0 : 0, speed, lookYaw,
+          grounded: ground !== null && Math.abs(a.y - ground) < 0.08 && Math.abs(a.vy) < 0.4,
+          groundHeight: (x, z) => this.world.characterGroundHeight(x, z, spaceOf(a)),
+        });
       } else if (v.body) {
         const state = this.animFor(a);
         if (a.foeKind === 'slime') {
@@ -1274,66 +1276,20 @@ export class WorldRenderer {
         }
       }
     }
-    const bufferedActors = interior ? [] : this.world.streamer.bufferedActors()
-      .filter((a) => !this.world.streamer.loadedCells.has(cellKey(a)));
-    if (this.firstSceneReady && !missing.length && bufferedActors.length) {
-      const ahead = bufferedActors.filter((a) => !isPrecombinedStatic(a) && (a.alive || a.kind === 'tree' || a.kind === 'ore')
-        && !this.visuals.has(a.id) && !!this.preloader.get(cellKey(a))?.visual);
-      ahead.sort((a, b) => (a.x - this.world.player.x) ** 2 + (a.z - this.world.player.z) ** 2
-        - (b.x - this.world.player.x) ** 2 - (b.z - this.world.player.z) ** 2);
-      const started = performance.now();
-      for (const a of ahead.slice(0, 3)) {
-        if (performance.now() - started > 2) break;
-        const v = this.createVisual(a);
-        this.visuals.set(a.id, v);
-        v.frame = frame;
-        v.obj.visible = false;
-        if (v.poolKey) this.setInstance(a, v, false);
-      }
-    }
-    const bufferIds = new Set(bufferedActors.map((a) => a.id));
-    for (const [id, v] of this.visuals) if (v.frame !== frame && bufferIds.has(id)) {
-      v.frame = frame;
-      v.obj.visible = false;
-      if (v.poolKey && v.poolAlive) {
-        const actor = this.world.byId(id);
-        if (actor) this.setInstance(actor, v, false);
-      }
-    }
-    for (const [id, v] of this.visuals) if (v.frame !== frame) {
-      if (v.poolKey) {
-        const actor = this.world.byId(id);
-        if (actor && v.poolAlive) this.setInstance(actor, v, false);
-        v.obj.visible = false;
-      } else {
-        v.obj.parent?.remove(v.obj);
-        this.visuals.delete(id);
-      }
-    }
+    this.syncRagdolls();
+    this.readyCells.clear();
     for (const key of this.world.streamer.loadedCells) {
-      if (this.readyCells.has(key)) continue;
-      const actors = this.world.streamer.actorsInCell(key);
-      if (actors.every((a) => !isPrecombinedStatic(a) || this.staticBatches.has(key))
-        && actors.every((a) => !needsVisual(a) || this.visuals.has(a.id))) this.readyCells.add(key);
+      const cellActors = this.world.streamer.actorsInCell(key);
+      if (cellActors.every((a) => !isPrecombinedStatic(a) || (this.staticBatches.has(key) && !this.pendingBatchKeys.includes(key)))
+        && cellActors.every((a) => !needsVisual(a) || this.visuals.has(a.id))) this.readyCells.add(key);
     }
-    if (this.readyAtFrame < 0 && (interior || !this.pendingFarKeys.length)
-      && (interior || this.terrainLod?.ready)
-      && [...this.world.streamer.loadedCells].every((key) => this.readyCells.has(key))) this.readyAtFrame = frame;
-    const poolWindow = [...this.world.streamer.bufferedCells].join('|');
-    if (poolWindow !== this.lastPoolWindow) {
-      this.lastPoolWindow = poolWindow;
-      const retained = new Set(bufferedActors.filter((a) => a.kind === 'tree' || a.kind === 'ore')
-        .map((a) => `${a.kind}${a.variant}:${cellKey(a)}`));
-      for (const [key, pool] of this.pools) if (!retained.has(key)) {
-        this.exteriorGroup.remove(pool.mesh);
-        pool.mesh.dispose();
-        this.pools.delete(key);
-      }
-      for (const [id, visual] of this.visuals) if (visual.poolKey && !this.pools.has(visual.poolKey)) {
-        visual.obj.parent?.remove(visual.obj);
-        this.visuals.delete(id);
-      }
-    }
+    if (this.readyAtFrame < 0 && !this.pendingBatchKeys.length && this.terrainLod?.ready
+      && [...desired.keys()].every((id) => this.visuals.has(id))) this.readyAtFrame = frame;
+    for (const [key, pool] of this.pools) if (!pool.active && pool.free.length === pool.next) {
+      this.exteriorGroup.remove(pool.mesh);
+      pool.mesh.dispose();
+      this.pools.delete(key);
+    } else pool.mesh.visible = !interior && pool.active > 0 && visiblePools.has(key);
   }
 
   // ------------------------------------------------------------------ camera
@@ -1345,6 +1301,17 @@ export class WorldRenderer {
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(width, height, false);
   }
+  private applyDisplayChanges() {
+    if (this.pendingPixelRatio !== null) {
+      this.pixelRatio = this.pendingPixelRatio;
+      this.pendingPixelRatio = null;
+      this.renderer.setPixelRatio(this.pixelRatio);
+    }
+    if (this.pendingResize) {
+      this.pendingResize = false;
+      this.resize();
+    }
+  }
   /** Keep rendering within a 30 Hz budget while simulation continues at full fidelity. */
   adaptQuality(frameMs: number) {
     if (!Number.isFinite(frameMs)) return;
@@ -1353,19 +1320,12 @@ export class WorldRenderer {
     else { this.slowFrames = 0; this.fastFrames = 0; }
     if (this.slowFrames >= 3) {
       this.slowFrames = 0;
-      const next = Math.max(0.45, this.pixelRatio * 0.72);
-      if (next !== this.pixelRatio) {
-        this.pixelRatio = next;
-        this.renderer.setPixelRatio(next);
-        this.resize();
-      }
-      if (next <= 0.72) { this.sun.castShadow = false; this.renderer.shadowMap.enabled = false; }
-    } else if (this.fastFrames >= 120 && this.pixelRatio < this.preferredRatio) {
+      const current = this.pendingPixelRatio ?? this.pixelRatio;
+      const next = Math.max(0.65, current * 0.8);
+      if (next !== current) this.pendingPixelRatio = next;
+    } else if (this.fastFrames >= 120 && (this.pendingPixelRatio ?? this.pixelRatio) < this.preferredRatio) {
       this.fastFrames = 0;
-      this.pixelRatio = Math.min(this.preferredRatio, this.pixelRatio + 0.1);
-      this.renderer.setPixelRatio(this.pixelRatio);
-      this.resize();
-      if (this.pixelRatio > 0.85) { this.sun.castShadow = true; this.renderer.shadowMap.enabled = true; }
+      this.pendingPixelRatio = Math.min(this.preferredRatio, (this.pendingPixelRatio ?? this.pixelRatio) + 0.1);
     }
   }
   orbit(dx: number, dy: number) {
@@ -1382,30 +1342,27 @@ export class WorldRenderer {
   /** Swap simulations without tearing down the canvas, shaders or terrain. */
   setWorld(world: SandboxWorld) {
     this.preloader.dispose();
-    for (const visual of this.visuals.values()) {
-      visual.obj.parent?.remove(visual.obj);
-      if (visual.shot) {
-        visual.shot.geometry.dispose();
-        (visual.shot.material as THREE.Material).dispose();
-      }
-    }
+    this.world.disposeNavigation();
+    this.world.disposePhysics();
+    for (const visual of this.ragdollVisuals.values()) visual.group.parent?.remove(visual.group);
+    this.ragdollVisuals.clear();
+    for (const visual of this.visuals.values()) this.removeVisual(visual);
     this.visuals.clear();
     for (const pool of this.pools.values()) { this.exteriorGroup.remove(pool.mesh); pool.mesh.dispose(); }
     this.pools.clear();
     for (const key of this.staticBatches.keys()) this.removeStaticBatch(key);
     this.pendingBatchKeys.length = 0;
-    for (const key of this.farCells.keys()) this.removeFarCell(key);
-    this.pendingFarKeys.length = 0;
     for (const room of this.rooms.values()) this.interiorGroup.remove(room);
     for (const geometry of this.roomGeometries) geometry.dispose();
     this.rooms.clear(); this.roomGeometries.length = 0;
     if (this.ghost) { this.ghost.parent?.remove(this.ghost); this.ghost = null; this.ghostKind = null; }
     this.world = world;
+    void world.initializeNavigation(createBrowserNavigation);
+    void world.initializePhysics(this.preferredPhysics);
     this.preloader = this.makePreloader();
     this.beacon.position.set(world.citadel.x, 11, world.citadel.z);
-    this.lastLodRevision = -1; this.lastFarWindow = ''; this.lastPoolWindow = '';
-    this.batchRevision = -1; this.batchWindow = ''; this.lastSpace = EXTERIOR_SPACE;
-    this.readyCells.clear(); this.treeFullCells.clear(); this.readyAtFrame = -1; this.firstSceneReady = false;
+    this.lastSpace = EXTERIOR_SPACE;
+    this.readyCells.clear(); this.readyAtFrame = -1; this.firstSceneReady = false;
   }
 
   setGhost(kind: StructureKind | null, point: Point | null, valid: boolean) {
@@ -1437,6 +1394,7 @@ export class WorldRenderer {
     const cp = Math.cos(this.pitch);
     const desiredPos = new THREE.Vector3(p.x + Math.sin(this.yaw) * this.distance * cp, p.y + 1.6 + Math.sin(this.pitch) * this.distance, p.z + Math.cos(this.yaw) * this.distance * cp);
     let k = 1 - Math.exp(-dt * 9);
+    let shake = 0;
 
     const event = w.cameraEvents.shift();
     if (event && this.mode === 'play' && !interior) this.focusShot = { target: event.target, t: 0, duration: event.duration };
@@ -1468,14 +1426,21 @@ export class WorldRenderer {
     } else if (this.focusShot) {
       const f = this.focusShot;
       f.t += dt;
-      const weight = Math.sin(Math.min(1, f.t / f.duration) * Math.PI);
-      desiredPos.lerp(new THREE.Vector3(f.target.x + 14, 16, f.target.z + 18), weight);
-      desiredLook.lerp(new THREE.Vector3(f.target.x, 2, f.target.z), weight);
+      const shot = sampleCinematic(f.t / f.duration);
+      const weight = Math.max(0, Math.min(1, shot.weight));
+      desiredPos.lerp(new THREE.Vector3(f.target.x + shot.x, shot.y, f.target.z + shot.z), weight);
+      desiredLook.lerp(new THREE.Vector3(f.target.x, shot.targetY, f.target.z), weight);
+      shake += Math.max(0, shot.shake);
       if (f.t >= f.duration) this.focusShot = null;
+    }
+    if (p.action === 'attack1' || p.action === 'attack2' || p.action === 'attack3') {
+      shake += sampleAttack(p.action, p.actionT ?? 0).shake * attackTiming(p.action).shakeScale;
     }
     if (spaceChanged) { this.camPos.copy(desiredPos); this.camLook.copy(desiredLook); }
     else { this.camPos.lerp(desiredPos, k); this.camLook.lerp(desiredLook, k); }
     this.camera.position.copy(this.camPos);
+    this.camera.position.x += Math.sin(this.time * 43) * shake;
+    this.camera.position.y += Math.cos(this.time * 37) * shake * 0.5;
     this.camera.lookAt(this.camLook);
     focus.copy(this.mode === 'title' && !interior ? new THREE.Vector3(0, 0, 0) : desiredLook);
   }
@@ -1507,23 +1472,61 @@ export class WorldRenderer {
   }
 
   render(dt: number) {
+    this.applyDisplayChanges();
     this.time += dt;
     const focus = this.renderFocus;
     this.updateCamera(dt, focus);
     this.sync(dt, focus);
     this.updateLighting(focus);
+    if (this.contextNeedsWarmup) {
+      this.contextNeedsWarmup = false;
+      this.warmSceneResources();
+    }
     this.renderer.render(this.scene, this.camera);
-    if (this.readyAtFrame >= 0 && this.frame > this.readyAtFrame) this.firstSceneReady = true;
+    if (this.texturesReady && this.readyAtFrame >= 0 && this.frame > this.readyAtFrame) this.firstSceneReady = true;
+  }
+
+  restoreContext() {
+    this.contextNeedsWarmup = true;
+    this.render(0);
+  }
+
+  private warmSceneResources() {
+    const states: { object: THREE.Object3D; visible: boolean; culled: boolean }[] = [];
+    this.scene.traverse((object) => {
+      states.push({ object, visible: object.visible, culled: object.frustumCulled });
+      object.visible = true;
+      object.frustumCulled = false;
+    });
+    const scissor = this.renderer.getScissor(new THREE.Vector4());
+    const scissorTest = this.renderer.getScissorTest();
+    try {
+      // Upload and compile offscreen meshes while the loading backdrop still covers the canvas.
+      this.renderer.setScissor(0, 0, 1, 1);
+      this.renderer.setScissorTest(true);
+      this.renderer.render(this.scene, this.camera);
+    } finally {
+      for (const state of states) {
+        state.object.visible = state.visible;
+        state.object.frustumCulled = state.culled;
+      }
+      this.renderer.setScissor(scissor);
+      this.renderer.setScissorTest(scissorTest);
+    }
   }
 
   prepareFrame() {
     if (this.firstSceneReady) return;
+    this.applyDisplayChanges();
     this.mode = 'play';
     const focus = this.renderFocus;
     this.updateCamera(0.04, focus);
     this.sync(0.04, focus);
-    if (this.readyAtFrame < 0 || this.frame <= this.readyAtFrame) return;
+    if (!this.texturesReady || this.world.navigationStatus === 'loading' || this.world.physicsStatus === 'loading'
+      || choreographyStatus === 'loading' || ozzStatus === 'loading'
+      || this.readyAtFrame < 0 || this.frame <= this.readyAtFrame) return;
     this.updateLighting(focus);
+    this.warmSceneResources();
     this.renderer.render(this.scene, this.camera);
     this.firstSceneReady = true;
   }
@@ -1532,24 +1535,38 @@ export class WorldRenderer {
   info() { return { calls: this.renderer.info.render.calls, triangles: this.renderer.info.render.triangles, pixelRatio: this.pixelRatio,
     ready: this.firstSceneReady, bufferedCells: this.preloader.bufferedCount, preparedCells: this.preloader.visualCount,
     collisionCells: this.preloader.cache.size, worker: this.preloader.usingWorker,
-    fadingCells: [...this.farFades.values()].filter((fade) => fade.opacity > 0 && fade.opacity < 1).length,
     precombinedCells: this.staticBatches.size, precombinedRefs: [...this.staticBatches.values()].reduce((n, batch) => n + batch.refs, 0),
-    billboardCells: [...this.farFades.values()].filter((fade) => !!fade.treeMaterial && fade.treeOpacity > 0).length,
+    fullDetailActors: this.visuals.size, instancedCells: this.pools.size,
+    bvhInstances: this.world.bvhInstances,
+    bvhGeometries: [...this.geometryCache.values()].filter((geometry) => !!geometry.boundsTree).length
+      + [...this.staticBatches.values()].reduce((sum, batch) => sum + batch.geometries.filter((geometry) => !!geometry.boundsTree).length, 0)
+      + (this.terrainLod?.bvhCount ?? 0),
+    navigation: this.world.navigationStatus, crowdAgents: this.world.navigationInfo?.agents ?? 0,
+    navObstacles: this.world.navigationInfo?.obstacles ?? 0, navPathQueries: this.world.navigationInfo?.pathQueries ?? 0,
+    physics: this.world.physicsStatus, physicsBackend: this.world.physicsInfo?.backend ?? 'none',
+    physicsTick: this.world.physicsInfo?.tick ?? 0, ragdolls: this.world.physicsInfo?.ragdolls ?? 0,
+    choreography: choreographyStatus,
+    animationRuntime: ozzStatus, ozzRigs: [...this.visuals.values()].filter((visual) => !!visual.rig?.ozz).length,
+    texturesReady: this.texturesReady, ktxTextures: this.compressedTextureCount, gpuCompressedTextures: this.gpuCompressedTextureCount,
+    textureFallbacks: TEXTURE_NAMES.length - this.compressedTextureCount,
     terrainTiles: this.terrainLod?.tileCount ?? 0, terrainDraws: this.terrainLod?.drawCalls ?? 0,
-    waterHigh: this.waterLod?.highDetailCount ?? 0, waterLow: this.waterLod?.lowDetailCount ?? 0,
-    occludedDecor: this.occludedDecor }; }
+    waterHigh: this.waterLod?.highDetailCount ?? 0, waterLow: this.waterLod?.lowDetailCount ?? 0 }; }
 
   dispose() {
+    this.disposed = true;
+    this.texturePack?.dispose();
+    this.world.disposeNavigation();
+    this.world.disposePhysics();
     this.preloader.dispose();
     window.removeEventListener('resize', this.resizeHandler);
+    for (const visual of this.visuals.values()) this.removeVisual(visual);
+    for (const pool of this.pools.values()) pool.mesh.dispose();
     for (const batch of this.staticBatches.values()) for (const geometry of batch.geometries) geometry.dispose();
-    for (const geometry of [...this.farGeometries.values(), ...this.farTreeGeometries.values(), ...this.roomGeometries]) geometry.dispose();
-    for (const fade of this.farFades.values()) for (const material of fade.materials) material.dispose();
+    for (const geometry of this.roomGeometries) geometry.dispose();
     this.grassTexture?.dispose();
-    this.treeTexture?.dispose();
-    this.treeBillboardMat?.dispose();
     this.terrainLod?.dispose();
     this.waterLod?.dispose();
+    this.slashMat.dispose();
     const sharedItemTextures = new Set<THREE.Texture>(this.itemTextures.values());
     this.scene.traverse((o) => {
       if (o instanceof THREE.InstancedMesh || o instanceof THREE.Line) o.geometry.dispose();

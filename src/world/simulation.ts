@@ -12,6 +12,11 @@ import { CellStream, EXTERIOR_SPACE, cellKey, interiorSpace, sameSpace, spaceOf,
 import { applyChangeForms, baseIdFor, createChangeForms, referenceFor, type ChangeForm, type ObjectReference } from './content';
 import { canRetaliate, foePatrolPoint, FOE_BEHAVIORS, PROFESSION_DUTIES, roleResponse } from './roles';
 import { brainFor } from './brains';
+import { WorldSpatialIndex } from './spatialIndex';
+import type { Frustum } from 'three';
+import type { WorldNavigation } from './navigation';
+import type { GamePhysics, PhysicsBackend, PhysicsSnapshot } from './physics';
+import { attackTiming } from './choreography';
 
 export type Faction = 'citadel' | 'wild' | 'neutral';
 export type ActorKind =
@@ -81,7 +86,7 @@ export interface Actor extends Point {
   crowns?: number; homeFood?: number; wanted?: number; wantedUntil?: number;
   /** Shared inventory & equipment: the guardian's pack is the player actor's `items`. */
   items?: Partial<Record<ItemType, number>>; stolen?: Partial<Record<ItemType, number>>;
-  weapon?: WeaponKind;
+  weapon?: WeaponKind; blocking?: boolean;
   seatTakenBy?: string; sittingOn?: string; sneaking?: boolean; quarryId?: string;
   familyId?: string; locationId?: string; capturedFor?: string; followingPlayer?: boolean; vendettaFor?: string;
   questFor?: string; guardPost?: Point;
@@ -238,7 +243,7 @@ export class SandboxWorld {
   echoProgress = 0;
   echoSolved = false;
   respawn: Point = { x: 0, z: 11 };
-  input = { x: 0, z: 0, sprint: false };
+  input: { x: number; z: number; sprint: boolean; block?: boolean } = { x: 0, z: 0, sprint: false };
   stamina = 100;
   maxStamina = 100;
   placing: StructureKind | null = null;
@@ -260,6 +265,15 @@ export class SandboxWorld {
   private staticDirty = true;
   private solidGrid = new Grid(4);
   private itemGrid = new Grid(2);
+  private spatial = new WorldSpatialIndex();
+  private navigation?: WorldNavigation;
+  private navigationPromise?: Promise<boolean>;
+  private navigationGeneration = 0;
+  navigationStatus: 'idle' | 'loading' | 'ready' | 'fallback' = 'idle';
+  private physics?: GamePhysics;
+  private physicsPromise?: Promise<boolean>;
+  private physicsGeneration = 0;
+  physicsStatus: 'idle' | 'loading' | 'ready' | 'fallback' = 'idle';
   private chars: Actor[] = [];
   private qa: Actor[] = [];
   private qb: Actor[] = [];
@@ -284,6 +298,83 @@ export class SandboxWorld {
 
   get currentSpace() { return spaceOf(this.player); }
   isActorLoaded(actor: Actor) { return this.streamer.isLoaded(actor); }
+  frustumCandidates(frustum: Frustum) {
+    this.spatial.sync(this.actors, this.currentSpace);
+    return this.spatial.visible(this.currentSpace, frustum);
+  }
+  get bvhInstances() { return this.spatial.instanceCount; }
+  characterGroundHeight(x: number, z: number, space = this.currentSpace): number | null {
+    const limit = space === EXTERIOR_SPACE ? WORLD_LIMIT : 7;
+    return Math.abs(x) <= limit && Math.abs(z) <= limit ? 0 : null;
+  }
+  get navigationInfo() { return this.navigation?.info; }
+  get physicsInfo() { return this.physics?.info; }
+  initializePhysics(backend: PhysicsBackend = 'simd') {
+    if (this.physicsPromise) return this.physicsPromise;
+    const generation = ++this.physicsGeneration;
+    this.physicsStatus = 'loading';
+    this.physicsPromise = import('./physics').then(({ GamePhysics }) => GamePhysics.create(backend)).then((physics) => {
+      if (generation !== this.physicsGeneration) { physics.dispose(); return false; }
+      this.physics = physics;
+      this.physicsStatus = 'ready';
+      return true;
+    }).catch(() => {
+      if (generation === this.physicsGeneration) { this.physicsStatus = 'fallback'; this.physicsPromise = undefined; }
+      return false;
+    });
+    return this.physicsPromise;
+  }
+  disposePhysics() {
+    this.physicsGeneration++;
+    this.physics?.dispose(); this.physics = undefined; this.physicsPromise = undefined; this.physicsStatus = 'idle';
+  }
+  capturePhysicsSnapshot() { return this.physics?.capture(); }
+  restorePhysicsSnapshot(snapshot: PhysicsSnapshot) { if (!this.physics) return false; this.physics.restore(snapshot); return true; }
+  ragdollPoses() { return this.physics?.poses(this.currentSpace) ?? []; }
+  hasRagdoll(id: string) { return this.physics?.hasRagdoll(id) ?? false; }
+  private disablePhysics() {
+    this.physics?.dispose(); this.physics = undefined; this.physicsPromise = undefined; this.physicsStatus = 'fallback';
+  }
+  private sensorCandidates(attacker: Actor, range: number, candidates: Actor[]) {
+    if (!this.physics) return candidates;
+    try { return this.physics.swingCandidates(attacker, range, candidates); }
+    catch { this.disablePhysics(); return candidates; }
+  }
+  private spawnRagdoll(actor: Actor) {
+    if (!this.physics) return;
+    try { this.physics.spawnRagdoll(actor, this.actors); }
+    catch { this.disablePhysics(); }
+  }
+  initializeNavigation(factory?: (actors: Actor[]) => Promise<WorldNavigation>) {
+    if (this.navigationPromise) return this.navigationPromise;
+    const generation = ++this.navigationGeneration;
+    this.navigationStatus = 'loading';
+    const create = factory ?? (async (actors: Actor[]) => (await import('./navigation')).WorldNavigation.create(actors, WORLD_LIMIT));
+    this.navigationPromise = Promise.resolve().then(() => create(this.actors)).then((navigation) => {
+      if (generation !== this.navigationGeneration) { navigation.dispose(); return false; }
+      this.navigation = navigation;
+      this.navigationStatus = 'ready';
+      return true;
+    }).catch(() => {
+      if (generation === this.navigationGeneration) { this.navigationStatus = 'fallback'; this.navigationPromise = undefined; }
+      return false;
+    });
+    return this.navigationPromise;
+  }
+  disposeNavigation() {
+    this.navigationGeneration++;
+    this.navigation?.dispose();
+    this.navigation = undefined;
+    this.navigationPromise = undefined;
+    this.navigationStatus = 'idle';
+    this.spatial.dispose();
+  }
+  private disableNavigation() {
+    this.navigation?.dispose();
+    this.navigation = undefined;
+    this.navigationPromise = undefined;
+    this.navigationStatus = 'fallback';
+  }
   reference(id: string) {
     const actor = this.byId(id);
     return actor ? referenceFor(actor) : this.baseReferences.get(id);
@@ -1168,6 +1259,10 @@ export class SandboxWorld {
       if (a.kind === 'item' && !a.carriedBy && this.isActorLoaded(a)) this.itemGrid.insert(a);
       else if (a.kind === 'player' || a.kind === 'villager' || a.kind === 'foe') this.chars.push(a);
     }
+    if (this.navigation) {
+      try { this.navigation.update(dt, this.actors, this.currentSpace); }
+      catch { this.disableNavigation(); }
+    }
 
     this.updatePlayer(dt);
     const pp = this.player;
@@ -1189,6 +1284,10 @@ export class SandboxWorld {
       else if (a.kind === 'item') this.updateItem(a, dt);
     }
     this.separateCharacters();
+    if (this.physics) {
+      try { this.physics.step(dt, this.actors, this.currentSpace, this.renderRevision, (actor, dx, dz) => this.moveCharacter(actor, dx, dz)); }
+      catch { this.disablePhysics(); }
+    }
 
     if (this.waveActive && this.spawnQueue > 0) {
       this.spawnTimer -= dt;
@@ -1229,7 +1328,7 @@ export class SandboxWorld {
     let nz = clamp(a.z + dz, -limit + a.radius, limit - a.radius);
     const near = this.solidGrid.query(nx, nz, a.radius + 4, this.qa);
     for (const o of near) {
-      if (!o.alive || !o.solid || a.y > o.height - 0.05) continue;
+      if (!o.alive || !o.solid || a.y > o.y + o.height - 0.05 || a.y + a.height < o.y + 0.05) continue;
       const ox = nx - o.x, oz = nz - o.z;
       const d = Math.hypot(ox, oz), min = a.radius + o.radius;
       if (d < min) {
@@ -1307,7 +1406,7 @@ export class SandboxWorld {
     it.z = clamp(it.z, -limit + 0.5, limit - 0.5);
 
     for (const o of this.solidGrid.query(it.x, it.z, it.radius + 4, this.qa)) {
-      if (!o.alive || !o.solid || it.y >= o.height - 0.02) continue;
+      if (!o.alive || !o.solid || it.y >= o.y + o.height - 0.02 || it.y + it.height < o.y + 0.02) continue;
       const ox = it.x - o.x, oz = it.z - o.z;
       const d = Math.hypot(ox, oz), min = it.radius + o.radius;
       if (d >= min || d < 1e-4) continue;
@@ -1340,7 +1439,7 @@ export class SandboxWorld {
         if (Math.hypot(c.x - it.x, c.z - it.z) > c.radius + it.radius) continue;
         const dmg = Math.round(def.mass * speed * 0.8 + 4);
         this.hurt(c, dmg, it.thrownBy);
-        c.vx += it.vx * 0.4; c.vz += it.vz * 0.4;
+        this.applyKnockback(c, it.vx * 0.4, it.vz * 0.4);
         it.vx *= -0.3; it.vz *= -0.3;
         if (c.kind === 'foe') this.alertFoe(c, this.player);
         break;
@@ -1374,16 +1473,29 @@ export class SandboxWorld {
     a.facing += clamp(angleDelta(a.facing, target), -rate * dt, rate * dt);
   }
 
+  private applyKnockback(actor: Actor, x: number, z: number) {
+    if (this.physics) {
+      try { this.physics.knockback(actor, x, z); return; }
+      catch { this.disablePhysics(); }
+    }
+    actor.vx += x; actor.vz += z;
+  }
+
   private steer(a: Actor, target: Point, speed: number, dt: number, stop = 0.4) {
     const dx = target.x - a.x, dz = target.z - a.z;
     const d = Math.hypot(dx, dz);
     let tx = 0, tz = 0;
     if (d > stop) {
-      let sx = dx, sz = dz;
+      let guidance: Point | undefined;
+      if (this.navigation) {
+        try { guidance = this.navigation.guide(a, target, speed * this.agilityScale(a)); }
+        catch { this.disableNavigation(); }
+      }
+      let sx = guidance?.x ?? dx, sz = guidance?.z ?? dz;
       const targetId = a.kind === 'player' ? this.targetId
         : a.utility?.targetId ?? a.talkingTo ?? a.quarryId ?? a.targetId
           ?? (a.followingPlayer || (a.kind === 'foe' && (a.intent === 'chase' || a.intent === 'raid')) ? PLAYER_ID : undefined);
-      for (const other of this.chars) {
+      if (!guidance) for (const other of this.chars) {
         if (other === a || !sameSpace(a, other) || !other.alive || other.hp <= 0 || other.id === targetId || other.activity === 'Sleeping') continue;
         const ax = a.x - other.x, az = a.z - other.z;
         const separation = Math.hypot(ax, az), clearance = a.radius + other.radius + 0.55;
@@ -1393,12 +1505,12 @@ export class SandboxWorld {
           sz += az / separation * strength;
         }
       }
-      const ang = Math.atan2(sx, sz) + ((a.detourT ?? 0) > 0 ? a.detour ?? 0 : 0);
+      const ang = Math.atan2(sx, sz) + (!guidance && (a.detourT ?? 0) > 0 ? a.detour ?? 0 : 0);
       const s = Math.min(speed * this.agilityScale(a), (d - stop) * 3 + 0.4);
       tx = Math.sin(ang) * s;
       tz = Math.cos(ang) * s;
       this.turnToward(a, ang, 7, dt);
-    }
+    } else this.navigation?.stop(a);
     const k = 1 - Math.exp(-dt * 8);
     a.vx += (tx - a.vx) * k;
     a.vz += (tz - a.vz) * k;
@@ -1413,6 +1525,7 @@ export class SandboxWorld {
   }
 
   private stopMoving(a: Actor, dt: number) {
+    this.navigation?.stop(a);
     const k = 1 - Math.exp(-dt * 10);
     a.vx -= a.vx * k;
     a.vz -= a.vz * k;
@@ -1437,7 +1550,7 @@ export class SandboxWorld {
     this.staminaDelay -= dt;
     if (this.staminaDelay <= 0) this.stamina = Math.min(this.maxStamina, this.stamina + 24 * dt);
     this.regenerateFocus(p, dt);
-    if (p.hp <= 0) { this.stopMoving(p, dt); return; }
+    if (p.hp <= 0) { p.blocking = false; this.stopMoving(p, dt); return; }
     if (p.sittingOn) {
       const seat = this.byId(p.sittingOn);
       const wantMove = Math.hypot(this.input.x, this.input.z) > 0.15;
@@ -1445,7 +1558,7 @@ export class SandboxWorld {
         if (seat && seat.seatTakenBy === PLAYER_ID) seat.seatTakenBy = undefined;
         p.sittingOn = undefined;
       } else {
-        p.x = seat.x; p.z = seat.z; p.vx = 0; p.vz = 0;
+        p.blocking = false; p.x = seat.x; p.z = seat.z; p.vx = 0; p.vz = 0;
         this.stamina = Math.min(this.maxStamina, this.stamina + 30 * dt);
         return;
       }
@@ -1456,6 +1569,7 @@ export class SandboxWorld {
       if (p.actionT! >= p.actionDur!) this.finishAction(p);
     }
     const held = this.held();
+    p.blocking = !!this.input.block && !held && !p.action && !this.dialogue && p.y <= 0.05 && this.stamina > 0;
     const locked = p.action === 'gather' || p.action === 'pickup' || p.action === 'hurt' || p.action === 'land';
     const attacking = !!p.action && p.action.startsWith('attack');
     let ix = this.dialogue ? 0 : this.input.x, iz = this.dialogue ? 0 : this.input.z;
@@ -1467,8 +1581,9 @@ export class SandboxWorld {
       tz = Math.cos(p.facing) * 8.5 * this.agilityScale(p);
     } else if (!locked) {
       const mass = held ? ITEMS[held.itemType!].mass : 0;
-      const sprint = this.input.sprint && len > 0.1 && this.stamina > 1 && mass < 3 && !attacking && !p.sneaking;
-      const speed = (attacking ? 1.2 : mass >= 3 ? 2.8 : held ? 3.8 : sprint ? 7.4 : 4.3) * this.agilityScale(p) * (p.sneaking ? 0.55 : 1);
+      const sprint = this.input.sprint && len > 0.1 && this.stamina > 1 && mass < 3 && !p.sneaking;
+      const speed = (attacking ? (sprint ? 4.4 : 1.2) : p.blocking ? (sprint ? 4 : 2.8)
+        : mass >= 3 ? 2.8 : held ? 3.8 : sprint ? 7.4 : 4.3) * this.agilityScale(p) * (p.sneaking ? 0.55 : 1);
       if (sprint) { this.stamina -= 15 * dt; this.staminaDelay = 0.7; }
       tx = ix * speed;
       tz = iz * speed;
@@ -1492,8 +1607,9 @@ export class SandboxWorld {
   private resolvePlayerAction(p: Actor) {
     if (p.actionHit) return;
     const t = p.actionT!;
-    if ((p.action === 'attack1' || p.action === 'attack2') && t >= 0.2) { p.actionHit = true; this.playerStrike(p.action === 'attack1' ? 1 : 2); }
-    else if (p.action === 'attack3' && t >= 0.4) { p.actionHit = true; this.playerStrike(3); }
+    if ((p.action === 'attack1' || p.action === 'attack2' || p.action === 'attack3') && t >= attackTiming(p.action).windup) {
+      p.actionHit = true; this.playerStrike(p.action === 'attack1' ? 1 : p.action === 'attack2' ? 2 : 3);
+    }
     else if (p.action === 'gather' && t >= 0.75) { p.actionHit = true; this.completeGather(p); }
   }
 
@@ -1504,7 +1620,8 @@ export class SandboxWorld {
       this.queuedAttack = false;
       if (this.stamina >= 6) {
         this.stamina -= 12; this.staminaDelay = 0.8;
-        this.startAction(p, was === 'attack1' ? 'attack2' : 'attack3', was === 'attack1' ? 0.48 : 0.72);
+        const next = was === 'attack1' ? 'attack2' : 'attack3';
+        this.startAction(p, next, attackTiming(next).duration);
       }
     }
     this.queuedAttack = false;
@@ -1514,6 +1631,7 @@ export class SandboxWorld {
     const p = this.player;
     if (p.hp <= 0 || this.dialogue || p.y > 0.01 || (p.action && p.action !== 'land') || this.stamina < 8) return;
     if (this.held() && ITEMS[this.held()!.itemType!].mass >= 3) return;
+    p.blocking = false;
     p.vy = 7.2;
     p.y = 0.001;
     this.stamina -= 10;
@@ -1524,6 +1642,7 @@ export class SandboxWorld {
     const p = this.player;
     if (p.hp <= 0 || this.dialogue || p.y > 0.05 || this.stamina < 15 || this.held()) return;
     if (p.action && p.action !== 'attack1' && p.action !== 'attack2' && p.action !== 'attack3' && p.action !== 'land') return;
+    p.blocking = false;
     const len = Math.hypot(this.input.x, this.input.z);
     if (len > 0.1) p.facing = Math.atan2(this.input.x, this.input.z);
     this.stamina -= 20;
@@ -1539,9 +1658,10 @@ export class SandboxWorld {
     if (this.held()) { this.throwHeld(); return; }
     if (p.action === 'attack1' || p.action === 'attack2') { this.queuedAttack = true; return; }
     if (p.action || this.stamina < 6) return;
+    p.blocking = false;
     this.stamina -= 12;
     this.staminaDelay = 0.8;
-    this.startAction(p, 'attack1', 0.48);
+    this.startAction(p, 'attack1', attackTiming('attack1').duration);
   }
 
   private playerStrike(step: number) {
@@ -1549,13 +1669,17 @@ export class SandboxWorld {
     const dmg = (this.meleeDamage(p) + 6 + (this.level - 1) * 3) * [1, 1.15, 1.7][step - 1];
     const range = step === 3 ? 2.7 : 2.4;
     let hitAny = false;
-    for (const a of this.actors) {
+    this.spatial.sync(this.actors, spaceOf(p));
+    const nearby = this.spatial.nearby(spaceOf(p), p, range);
+    const candidates = this.sensorCandidates(p, range, nearby);
+    for (const a of candidates) {
       if (!a.alive || !sameSpace(a, p) || a.id === PLAYER_ID || a.carriedBy) continue;
       const hittable = a.kind === 'foe' || a.kind === 'villager' || a.kind === 'item' || (a.faction === 'wild' && (a.kind === 'tower' || a.kind === 'camp'));
       if (!hittable) continue;
       const d = distance(a, p) - a.radius;
       if (d > range || Math.abs(a.y - p.y) > 1.6) continue;
       if (d > 0.5 && Math.abs(angleDelta(p.facing, angleTo(p, a))) > 1.1) continue;
+      if (!this.spatial.clearLine(spaceOf(p), p, a)) continue;
       const nx = Math.sin(angleTo(p, a)), nz = Math.cos(angleTo(p, a));
       if (a.kind === 'item') {
         const mass = ITEMS[a.itemType!].mass;
@@ -1569,8 +1693,7 @@ export class SandboxWorld {
       hitAny = true;
       if (a.kind === 'foe') this.skillXp('blade', 2);
       this.hurt(a, dmg, PLAYER_ID);
-      a.vx += nx * (step === 3 ? 6 : 3);
-      a.vz += nz * (step === 3 ? 6 : 3);
+      this.applyKnockback(a, nx * (step === 3 ? 6 : 3), nz * (step === 3 ? 6 : 3));
       if (a.kind === 'foe') this.alertFoe(a, p);
     }
     if (hitAny) this.combatUntil = this.elapsed + 6;
@@ -1593,6 +1716,9 @@ export class SandboxWorld {
     const attacker = source ? this.byId(source) : undefined;
     if (target.kind === 'player' && attacker?.kind === 'villager' && !this.canNpcDamagePlayer(attacker)) return;
     if (target.kind === 'player' && this.elapsed < this.invulnUntil) return;
+    const blocked = target.kind === 'player' && !!target.blocking && !!attacker && sameSpace(target, attacker)
+      && Math.abs(angleDelta(target.facing, angleTo(target, attacker))) < 1.2;
+    if (blocked) { damage *= 0.45; this.stamina = Math.max(0, this.stamina - 8); this.staminaDelay = 0.7; }
     damage *= 1 - Math.min(0.45, (target.armor ?? 0) + (target.skills?.guard ?? 0) * 0.002);
     if (source && (target.kind === 'player' || target.kind === 'villager' || target.kind === 'foe')) {
       this.trainSkill(target, 'guard', target.kind === 'player' ? 1.5 : 0.8);
@@ -1601,9 +1727,10 @@ export class SandboxWorld {
     if (attacker?.kind === 'foe' && (target.kind === 'player' || target.kind === 'villager')) this.signalThreat(target, attacker);
     if (target.kind === 'player') {
       this.combatUntil = this.elapsed + 6;
-      if (target.action !== 'roll') { this.startAction(target, 'hurt', 0.28); this.queuedAttack = false; }
+      if (target.action !== 'roll' && !blocked) { this.startAction(target, 'hurt', 0.28); this.queuedAttack = false; }
       if (target.hp <= 0) {
         target.action = undefined;
+        this.spawnRagdoll(target);
         const held = this.held();
         if (held) { held.carriedBy = undefined; held.sleeping = false; }
       }
@@ -1626,6 +1753,7 @@ export class SandboxWorld {
       target.alive = false;
       target.solid = false;
       target.activity = 'Dead';
+      this.spawnRagdoll(target);
       if (target.capturedFor) this.failRadiantQuest(target.capturedFor, `${target.name} did not survive.`);
       target.capturedFor = undefined;
       target.followingPlayer = false;
@@ -1643,6 +1771,7 @@ export class SandboxWorld {
     if (target.kind === 'citadel') { this.say('The Citadel light gutters and goes dark.'); return; }
     target.alive = false;
     target.solid = false;
+    if (target.kind === 'foe') this.spawnRagdoll(target);
     if (STATIC_KINDS.has(target.kind)) { this.staticDirty = true; this.renderRevision++; }
     if (target.kind === 'foe' && target.foeKind) {
       const quest = target.questFor ? this.quests[target.questFor] : undefined;
@@ -2760,7 +2889,13 @@ export class SandboxWorld {
     const style = brainFor(n)?.attack;
     if (!t || !t.alive || !sameSpace(n, t) || !this.canNpcFight(n, t) || !style) return;
     if (distance(n, t) > 1.3 + WEAPONS[n.weapon ?? 'fists'].reach + t.radius + style.reach) return;
+    if (!this.sensorCandidates(n, 1.3 + WEAPONS[n.weapon ?? 'fists'].reach + style.reach, [t]).length) return;
+    this.spatial.sync(this.actors, spaceOf(n));
+    if (!this.spatial.clearLine(spaceOf(n), n, t)) return;
     this.hurt(t, this.meleeDamage(n) * style.damage, n.id);
+    const angle = angleTo(n, t);
+    const guarded = t.kind === 'player' && !!t.blocking && Math.abs(angleDelta(t.facing, angleTo(t, n))) < 1.2;
+    this.applyKnockback(t, Math.sin(angle) * (guarded ? 1 : 2.5), Math.cos(angle) * (guarded ? 1 : 2.5));
     this.trainSkill(n, 'blade', 1.5);
     if (t.kind === 'foe') { t.targetId = n.id; this.alertFoe(t, n); }
   }
@@ -3046,16 +3181,20 @@ export class SandboxWorld {
     const def = FOES[f.foeKind!];
     const t = f.targetId ? this.byId(f.targetId) : undefined;
     if (!t || !t.alive || !sameSpace(f, t)) return;
+    if (distance(f, t) > def.reach + t.radius + 0.5) return;
+    if (!this.sensorCandidates(f, def.reach + 0.5, [t]).length) return;
+    this.spatial.sync(this.actors, spaceOf(f));
+    if (!this.spatial.clearLine(spaceOf(f), f, t)) return;
     const siege = f.foeKind === 'brute' && (t.kind === 'citadel' || t.kind === 'tower' || t.kind === 'barricade');
     const dmg = def.damage * (siege ? 1.5 : 1) * (1 + ((f.weaponLevel ?? 1) - 1) * 0.3);
     if (t.kind === 'player') {
-      if (distance(f, t) > def.reach + t.radius + 0.5) return;
       if (Math.abs(angleDelta(f.facing, angleTo(f, t))) > 1.2) return;
       this.hurt(t, dmg, f.id);
       if (f.foeKind === 'slime') this.stamina = Math.max(0, this.stamina - 8);
       if (this.elapsed >= this.invulnUntil) {
         const a = angleTo(f, t);
-        t.vx += Math.sin(a) * 5; t.vz += Math.cos(a) * 5;
+        const guarded = !!t.blocking && Math.abs(angleDelta(t.facing, angleTo(t, f))) < 1.2;
+        this.applyKnockback(t, Math.sin(a) * (guarded ? 2 : 5), Math.cos(a) * (guarded ? 2 : 5));
       }
     } else this.hurt(t, dmg, f.id);
   }
@@ -3172,6 +3311,7 @@ export class SandboxWorld {
   recover() {
     if (this.currentSpace !== EXTERIOR_SPACE) this.leaveInterior();
     const p = this.player;
+    this.physics?.removeRagdoll(p.id);
     p.hp = p.maxHp;
     p.x = this.respawn.x; p.z = this.respawn.z; p.y = 0; p.vx = p.vz = p.vy = 0;
     p.action = undefined;

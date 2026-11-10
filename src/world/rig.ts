@@ -1,6 +1,9 @@
 // Skeletal humanoid rig: a THREE.Bone hierarchy with rigid segments bound to each bone, driven by a
 // procedural, blended behaviour state machine (locomotion, combat, work, rest and social poses).
 import * as THREE from 'three';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { sampleAttack, sampleRecoil } from './choreography';
+import { createOzzPose, ozzStatus, type OzzPose } from './ozz/runtime';
 
 export type BoneName =
   | 'hips' | 'spine' | 'chest' | 'neck' | 'head'
@@ -10,7 +13,7 @@ export const BONES: BoneName[] = ['hips', 'spine', 'chest', 'neck', 'head', 'lUp
 
 export type AnimState =
   | 'idle' | 'walk' | 'run' | 'jump' | 'fall' | 'land' | 'attack1' | 'attack2' | 'attack3' | 'roll' | 'hurt' | 'dead'
-  | 'gather' | 'carry' | 'carryWalk' | 'throw' | 'talk' | 'sit' | 'sleep' | 'work' | 'tend' | 'cheer' | 'pickup' | 'windup' | 'strike' | 'sneak' | 'captured';
+  | 'gather' | 'carry' | 'carryWalk' | 'throw' | 'talk' | 'sit' | 'sleep' | 'work' | 'tend' | 'cheer' | 'pickup' | 'windup' | 'strike' | 'sneak' | 'captured' | 'block';
 
 export interface RigStyle {
   coat: string; trim: string; skin: string; pants: string; hair: string; boots?: string;
@@ -22,8 +25,21 @@ export interface Rig {
   root: THREE.Group;
   bones: Record<BoneName, THREE.Bone>;
   skeleton: THREE.Skeleton;
+  mesh: THREE.SkinnedMesh;
   cape?: THREE.Bone;
   current: Float32Array;
+  upperCurrent: Float32Array;
+  upperWeight: number;
+  ozz?: OzzPose;
+  ozzFailed: boolean;
+  ozzMatricesActive: boolean;
+  parents: Int32Array;
+  restPositions: Float32Array;
+  baseQuaternions: Float32Array;
+  upperQuaternions: Float32Array;
+  additiveQuaternions: Float32Array;
+  upperMask: Float32Array;
+  feet: { anchor?: THREE.Vector3; weight: number; planted: boolean }[];
   hipsBase: number;
   hipsY: number;
 }
@@ -35,6 +51,7 @@ export function lambert(color: string) {
   return m;
 }
 const BOX = new THREE.BoxGeometry(1, 1, 1);
+const RIG_MATERIAL = new THREE.MeshLambertMaterial({ vertexColors: true, flatShading: true });
 
 function seg(bone: THREE.Object3D, color: string, w: number, h: number, d: number, x = 0, y = 0, z = 0, shadow = false) {
   const m = new THREE.Mesh(BOX, lambert(color));
@@ -139,7 +156,67 @@ export function buildRig(s: RigStyle): Rig {
   }
 
   const bones = { hips, spine, chest, neck, head, lUpperArm, lForearm, lHand, rUpperArm, rForearm, rHand, lThigh, lShin, lFoot, rThigh, rShin, rFoot };
-  return { root, bones, skeleton: new THREE.Skeleton(BONES.map((n) => bones[n])), cape, current: new Float32Array(BONES.length * 3), hipsBase: 0.95, hipsY: 0 };
+  const skinBones = BONES.map((name) => bones[name]);
+  if (cape) skinBones.push(cape);
+  root.updateMatrixWorld(true);
+  const inverseRoot = root.matrixWorld.clone().invert();
+  const parts: THREE.BufferGeometry[] = [];
+  for (const [index, skinBone] of skinBones.entries()) {
+    const collect = (node: THREE.Object3D) => {
+      for (const child of [...node.children]) {
+        if (child instanceof THREE.Bone) continue;
+        if (!(child instanceof THREE.Mesh)) { collect(child); continue; }
+        const geometry = child.geometry.index ? child.geometry.toNonIndexed() : child.geometry.clone();
+        geometry.applyMatrix4(new THREE.Matrix4().multiplyMatrices(inverseRoot, child.matrixWorld));
+        const count = geometry.attributes.position.count;
+        const color = (child.material as THREE.MeshLambertMaterial).color;
+        const colors = new Float32Array(count * 3), indices = new Uint16Array(count * 4), weights = new Float32Array(count * 4);
+        for (let i = 0; i < count; i++) {
+          colors.set([color.r, color.g, color.b], i * 3);
+          indices[i * 4] = index;
+          weights[i * 4] = 1;
+        }
+        geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+        geometry.setAttribute('skinIndex', new THREE.BufferAttribute(indices, 4));
+        geometry.setAttribute('skinWeight', new THREE.BufferAttribute(weights, 4));
+        parts.push(geometry);
+        node.remove(child);
+      }
+    };
+    collect(skinBone);
+  }
+  const geometry = mergeGeometries(parts, false)!;
+  parts.forEach((part) => part.dispose());
+  const skeleton = new THREE.Skeleton(skinBones);
+  const mesh = new THREE.SkinnedMesh(geometry, RIG_MATERIAL);
+  mesh.castShadow = true;
+  mesh.boundingSphere = new THREE.Sphere(new THREE.Vector3(0, 1, 0), 4);
+  root.add(mesh);
+  root.updateMatrixWorld(true);
+  mesh.bind(skeleton);
+  const parents = new Int32Array(skinBones.map((bone) => skinBones.indexOf(bone.parent as THREE.Bone)));
+  const restPositions = new Float32Array(skinBones.flatMap((bone) => [bone.position.x, bone.position.y, bone.position.z]));
+  const mask = new Float32Array(skinBones.length);
+  for (const name of ['spine', 'chest', 'neck', 'head', 'lUpperArm', 'lForearm', 'lHand', 'rUpperArm', 'rForearm', 'rHand'] as BoneName[]) mask[BONES.indexOf(name)] = 1;
+  if (cape) mask[skinBones.length - 1] = 1;
+  const rig: Rig = { root, bones, skeleton, mesh, cape, current: new Float32Array(BONES.length * 3),
+    upperCurrent: new Float32Array(BONES.length * 3), upperWeight: 0, ozzFailed: false, ozzMatricesActive: false, parents, restPositions,
+    baseQuaternions: new Float32Array(skinBones.length * 4), upperQuaternions: new Float32Array(skinBones.length * 4),
+    additiveQuaternions: new Float32Array(skinBones.length * 4), upperMask: mask,
+    feet: [{ weight: 0, planted: false }, { weight: 0, planted: false }], hipsBase: 0.95, hipsY: 0 };
+  const originalUpdate = skeleton.update.bind(skeleton);
+  const local = new THREE.Matrix4(), world = new THREE.Matrix4(), skin = new THREE.Matrix4();
+  skeleton.update = () => {
+    const matrices = skeleton.boneMatrices;
+    if (!rig.ozz || !rig.ozzMatricesActive || !matrices) { originalUpdate(); return; }
+    for (let i = 0; i < skinBones.length; i++) {
+      local.fromArray(rig.ozz.matrices, i * 16);
+      world.multiplyMatrices(root.matrixWorld, local);
+      skin.multiplyMatrices(world, skeleton.boneInverses[i]).toArray(matrices, i * 16);
+    }
+    if (skeleton.boneTexture) skeleton.boneTexture.needsUpdate = true;
+  };
+  return rig;
 }
 
 // --- pose evaluation ---------------------------------------------------------------------------
@@ -161,7 +238,10 @@ function gait(ph: number, leg: number, knee: number, arm: number, blend = 1) {
   add('hips', 0, -s * 0.08 * blend, 0);
 }
 
-export interface AnimContext { phase: number; actionT: number; speed: number }
+export interface AnimContext {
+  phase: number; actionT: number; speed: number; lookYaw?: number; grounded?: boolean;
+  groundHeight?: (x: number, z: number) => number | null;
+}
 
 function pose(state: AnimState, t: number, c: AnimContext): number {
   target.fill(0);
@@ -206,7 +286,7 @@ function pose(state: AnimState, t: number, c: AnimContext): number {
       break;
     }
     case 'attack1': case 'attack2': {
-      const a = c.actionT / 0.48, w = ease(clamp01(a / 0.38)), s = ease(clamp01((a - 0.38) / 0.28));
+      const { windup: w, strike: s } = sampleAttack(state, c.actionT);
       const dir = state === 'attack1' ? 1 : -1;
       set('rUpperArm', -1.45, dir * (0.95 * w - 1.7 * s), dir * -0.25); set('rForearm', -0.45 + 0.3 * s);
       set('chest', 0.05, dir * (0.55 * w - 0.8 * s)); set('spine', 0.12, dir * (0.2 * w - 0.3 * s));
@@ -215,7 +295,7 @@ function pose(state: AnimState, t: number, c: AnimContext): number {
       break;
     }
     case 'attack3': {
-      const a = c.actionT / 0.72, w = ease(clamp01(a / 0.52)), s = ease(clamp01((a - 0.52) / 0.18));
+      const { windup: w, strike: s } = sampleAttack(state, c.actionT);
       set('rUpperArm', -0.6 - 2.3 * w + 2.4 * s); set('lUpperArm', -0.6 - 2.1 * w + 2.2 * s); set('rForearm', -0.5 + 0.3 * s); set('lForearm', -0.5);
       set('spine', -0.22 * w + 0.65 * s); set('chest', -0.1 * w + 0.2 * s);
       set('lThigh', -0.55 * s - 0.1); set('rThigh', 0.45 * s); set('lShin', 0.5 * s); set('rShin', 0.3);
@@ -293,6 +373,10 @@ function pose(state: AnimState, t: number, c: AnimContext): number {
       set('spine', -0.28); set('lUpperArm', -2.6, 0, 0.2); set('rUpperArm', -2.6, 0, -0.2); set('lForearm', -0.4); set('rForearm', -0.4);
       set('lThigh', -0.3); set('rThigh', 0.3); hy = -0.04;
       break;
+    case 'block':
+      set('spine', 0.12); set('lUpperArm', -1.25, 0.15, 0.35); set('rUpperArm', -1.1, -0.2, -0.3);
+      set('lForearm', -1.25); set('rForearm', -1.15); set('head', -0.08);
+      break;
     case 'strike':
       set('spine', 0.55); set('lUpperArm', -0.4); set('rUpperArm', -0.4); set('lForearm', -0.2); set('rForearm', -0.2);
       set('lThigh', -0.5); set('rThigh', 0.4); set('lShin', 0.4); hy = -0.1;
@@ -301,18 +385,127 @@ function pose(state: AnimState, t: number, c: AnimContext): number {
   return hy;
 }
 
-/** Evaluate the state's pose and blend the skeleton toward it. */
-export function animateRig(rig: Rig, state: AnimState, t: number, dt: number, c: AnimContext) {
-  const hy = pose(state, t, c);
-  const snappy = state === 'roll' || state.startsWith('attack') || state === 'strike' || state === 'throw';
-  const k = state === 'roll' ? 1 : 1 - Math.exp(-dt * (snappy ? 26 : 12));
-  const cur = rig.current;
-  for (let i = 0; i < cur.length; i++) {
-    if (state === 'roll') cur[i] = target[i];
-    else cur[i] += Math.atan2(Math.sin(target[i] - cur[i]), Math.cos(target[i] - cur[i])) * k;
-  }
-  rig.hipsY += (hy - rig.hipsY) * (state === 'roll' ? 1 : k);
-  for (let b = 0; b < BONES.length; b++) rig.bones[BONES[b]].rotation.set(cur[b * 3], cur[b * 3 + 1], cur[b * 3 + 2]);
-  rig.bones.hips.position.y = rig.hipsBase + rig.hipsY;
-  if (rig.cape) rig.cape.rotation.x = 0.12 + Math.min(1.1, c.speed * 0.14) + Math.sin(t * 3.1) * 0.04;
+const upperTarget = new Float32Array(BONES.length * 3);
+const motionEuler = new THREE.Euler();
+const baseQuaternion = new THREE.Quaternion(), upperQuaternion = new THREE.Quaternion(), additiveQuaternion = new THREE.Quaternion();
+const rootInverse = new THREE.Matrix4();
+const footWorld = new THREE.Vector3(), targetLocal = new THREE.Vector3();
+const ankleMatrix = new THREE.Matrix4(), ankleWorldMatrix = new THREE.Matrix4();
+const groundNormal = new THREE.Vector3(), footUp = new THREE.Vector3(), decomposedPosition = new THREE.Vector3(), decomposedScale = new THREE.Vector3();
+const ankleRotation = new THREE.Quaternion(), worldCorrection = new THREE.Quaternion(), localCorrection = new THREE.Quaternion(), weightedCorrection = new THREE.Quaternion();
+
+function supportSlope(before: number | null, center: number, after: number | null) {
+  if (before === null || after === null || !Number.isFinite(before) || !Number.isFinite(after) || !Number.isFinite(center)) return 0;
+  const first = center - before, second = after - center;
+  return Math.abs(first - second) > 0.04 ? -2 * (Math.abs(first) < Math.abs(second) ? first : second) : before - after;
 }
+
+function applyFootIK(rig: Rig, state: AnimState, dt: number, context: AnimContext) {
+  const ozz = rig.ozz;
+  const allowed = !!ozz && !!context.groundHeight && !!context.grounded
+    && !['jump', 'fall', 'roll', 'sit', 'sleep', 'dead', 'pickup'].includes(state);
+  if (!allowed || !ozz || !context.groundHeight) {
+    for (const foot of rig.feet) { foot.weight = 0; foot.planted = false; foot.anchor = undefined; }
+    return;
+  }
+  rig.root.updateWorldMatrix(true, false);
+  rootInverse.copy(rig.root.matrixWorld).invert();
+  const rootElements = rig.root.matrixWorld.elements;
+  const footHeight = 0.07 * Math.hypot(rootElements[4], rootElements[5], rootElements[6]);
+  const chains = [[11, 12, 13], [14, 15, 16]] as const;
+  for (const [side, [hip, knee, ankle]] of chains.entries()) {
+    const plant = rig.feet[side];
+    footWorld.fromArray(ozz.matrices, ankle * 16 + 12).applyMatrix4(rig.root.matrixWorld);
+    const height = context.groundHeight(footWorld.x, footWorld.z);
+    const stance = height !== null && Number.isFinite(height)
+      && (context.speed < 0.25 || Math.sin(context.phase + side * Math.PI) > 0)
+      && footWorld.y - height < 0.4;
+    if (stance && height !== null) {
+      if (!plant.planted || !plant.anchor || Math.hypot(plant.anchor.x - footWorld.x, plant.anchor.z - footWorld.z) > 0.7) {
+        plant.anchor = new THREE.Vector3(footWorld.x, height + footHeight, footWorld.z);
+      }
+      plant.planted = true;
+    } else plant.planted = false;
+    const targetWeight = plant.planted ? 1 : 0;
+    plant.weight += (targetWeight - plant.weight) * (1 - Math.exp(-Math.max(0, dt) * 14));
+    if (plant.anchor && plant.weight > 0.01) {
+      const anchorHeight = context.groundHeight(plant.anchor.x, plant.anchor.z);
+      if (anchorHeight !== null && Number.isFinite(anchorHeight)) plant.anchor.y = anchorHeight + footHeight;
+      targetLocal.copy(plant.anchor).applyMatrix4(rootInverse);
+      if (ozz.solveLeg(hip, knee, ankle, targetLocal, plant.weight)) {
+        const x = plant.anchor.x, z = plant.anchor.z, epsilon = 0.12;
+        const left = context.groundHeight(x - epsilon, z), right = context.groundHeight(x + epsilon, z);
+        const back = context.groundHeight(x, z - epsilon), front = context.groundHeight(x, z + epsilon);
+        const center = anchorHeight !== null && Number.isFinite(anchorHeight) ? anchorHeight : plant.anchor.y - footHeight;
+        groundNormal.set(supportSlope(left, center, right), epsilon * 2, supportSlope(back, center, front)).normalize();
+        ankleMatrix.fromArray(ozz.matrices, ankle * 16);
+        ankleWorldMatrix.multiplyMatrices(rig.root.matrixWorld, ankleMatrix).decompose(decomposedPosition, ankleRotation, decomposedScale);
+        footUp.set(0, 1, 0).applyQuaternion(ankleRotation);
+        worldCorrection.setFromUnitVectors(footUp, groundNormal);
+        localCorrection.copy(ankleRotation).invert().multiply(worldCorrection).multiply(ankleRotation);
+        weightedCorrection.identity().slerp(localCorrection, plant.weight);
+        ozz.rotateJoint(ankle, weightedCorrection);
+      }
+    } else if (!plant.planted) plant.anchor = undefined;
+  }
+}
+
+/** Blend locomotion, masked actions and additive motion, then solve grounded feet. */
+export function animateRig(rig: Rig, state: AnimState, t: number, dt: number, c: AnimContext) {
+  let hy = pose(state, t, c);
+  upperTarget.set(target);
+  const upperAction = state.startsWith('attack') || state === 'block' || state === 'windup' || state === 'strike';
+  const moving = c.speed > 0.3 && (upperAction || state === 'hurt');
+  if (moving) hy = pose(c.speed > 3 ? 'run' : 'walk', t, c);
+  const layered = moving && upperAction;
+  if (!layered) upperTarget.set(target);
+  const headYaw = Math.max(-1, Math.min(1, c.lookYaw ?? 0));
+  target[IDX.head + 1] += headYaw;
+  upperTarget[IDX.head + 1] += headYaw;
+  const snappy = state === 'roll' || state.startsWith('attack') || state === 'strike' || state === 'throw';
+  const k = state === 'roll' ? 1 : 1 - Math.exp(-Math.max(0, dt) * (snappy ? 26 : 12));
+  for (let i = 0; i < rig.current.length; i++) {
+    rig.current[i] += Math.atan2(Math.sin(target[i] - rig.current[i]), Math.cos(target[i] - rig.current[i])) * k;
+    rig.upperCurrent[i] += Math.atan2(Math.sin(upperTarget[i] - rig.upperCurrent[i]), Math.cos(upperTarget[i] - rig.upperCurrent[i])) * k;
+  }
+  rig.upperWeight += ((layered ? 1 : 0) - rig.upperWeight) * k;
+  rig.hipsY += (hy - rig.hipsY) * (state === 'roll' ? 1 : k);
+  const recoil = state === 'hurt' ? sampleRecoil(c.actionT) : 0;
+  const breathe = state === 'dead' || state === 'roll' ? 0 : Math.sin(t * 1.9) * 0.018;
+  const count = rig.parents.length;
+  for (let i = 0; i < count; i++) {
+    const at = i * 3;
+    const cape = i >= BONES.length;
+    const capeAngle = 0.12 + Math.min(1.1, c.speed * 0.14) + Math.sin(t * 3.1) * 0.04;
+    baseQuaternion.setFromEuler(motionEuler.set(cape ? capeAngle : rig.current[at], cape ? 0 : rig.current[at + 1], cape ? 0 : rig.current[at + 2]));
+    upperQuaternion.setFromEuler(motionEuler.set(cape ? capeAngle : rig.upperCurrent[at], cape ? 0 : rig.upperCurrent[at + 1], cape ? 0 : rig.upperCurrent[at + 2]));
+    const additiveX = i === 2 ? breathe - recoil * 0.28 : i === 4 ? -recoil * 0.16 : 0;
+    const additiveZ = i === 5 ? recoil * 0.12 : i === 8 ? -recoil * 0.12 : 0;
+    additiveQuaternion.setFromEuler(motionEuler.set(additiveX, 0, additiveZ));
+    baseQuaternion.toArray(rig.baseQuaternions, i * 4);
+    upperQuaternion.toArray(rig.upperQuaternions, i * 4);
+    additiveQuaternion.toArray(rig.additiveQuaternions, i * 4);
+  }
+  if (!rig.ozz && !rig.ozzFailed && ozzStatus === 'ready') {
+    rig.ozz = createOzzPose(rig.parents, rig.restPositions);
+    if (!rig.ozz) rig.ozzFailed = true;
+  }
+  const blended = rig.ozz?.blend(rig.baseQuaternions, rig.upperQuaternions, rig.additiveQuaternions,
+    rig.upperMask, rig.upperWeight, 1, rig.hipsY) ?? false;
+  if (blended && rig.ozz) {
+    applyFootIK(rig, state, dt, c);
+    for (let i = 0; i < count; i++) rig.skeleton.bones[i].quaternion.fromArray(rig.ozz.quaternions, i * 4);
+    rig.ozzMatricesActive = true;
+  } else {
+    rig.ozzMatricesActive = false;
+    for (let i = 0; i < count; i++) {
+      baseQuaternion.fromArray(rig.baseQuaternions, i * 4);
+      upperQuaternion.fromArray(rig.upperQuaternions, i * 4);
+      additiveQuaternion.fromArray(rig.additiveQuaternions, i * 4);
+      rig.skeleton.bones[i].quaternion.copy(baseQuaternion.slerp(upperQuaternion, rig.upperMask[i] * rig.upperWeight).multiply(additiveQuaternion));
+    }
+  }
+  rig.bones.hips.position.y = rig.hipsBase + rig.hipsY;
+}
+
+export function disposeRig(rig: Rig) { rig.ozz?.dispose(); rig.ozz = undefined; rig.ozzMatricesActive = false; }
