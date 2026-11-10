@@ -1,9 +1,21 @@
 import assert from 'node:assert/strict';
-import { SandboxWorld, type Actor } from '../src/world/simulation';
-import { DUNGEON_SITES } from '../src/world/narrative';
+import { SandboxWorld, PLAYER_ID, type Actor } from '../src/world/simulation';
+import { DUNGEON_SITES, RADIANT_SITES } from '../src/world/narrative';
 import { activePackage } from '../src/world/packages';
 import { animateRig, buildRig } from '../src/world/rig';
+import { planTactic } from '../src/world/tactics';
+import { canRetaliate, foePatrolPoint, FOE_BEHAVIORS, PROFESSION_DUTIES, roleResponse } from '../src/world/roles';
+import { brainFor, PROFESSION_BRAINS } from '../src/world/brains';
+import { parseCollision, parseVisual } from '../src/world/cellArchive';
+import { isPrecombinedStatic } from '../src/world/renderBatches';
+import { TERRAIN_LOD_LEVELS, selectTerrainTiles, terrainHeight, terrainTileGeometry } from '../src/world/terrainLod';
+import { GLOBAL_WATER_HEIGHT, WATER_BODIES, waterGeometry } from '../src/world/waterLod';
+import { isOccluded, occlusionPlanes } from '../src/world/occlusion';
+import { screenDoorMaterial, setScreenDoorFade } from '../src/world/screenDoor';
+import * as THREE from 'three';
 import { canSee, chooseGoal } from '../src/world/vivid';
+import { BASE_OBJECTS } from '../src/world/content';
+import { ENGINE_UNITS_PER_CELL, WORLD_UNITS_PER_CELL, cellKey, exteriorCell, interiorSpace, uExteriorCellBuffer } from '../src/world/cells';
 
 const tests: [string, () => void][] = [];
 const test = (name: string, fn: () => void) => tests.push([name, fn]);
@@ -96,7 +108,8 @@ test('objects carried elsewhere stay exactly where they were left, across saves'
 test('narrative: older saves gain new dungeon sites and family links without losing progress', () => {
   const w = new SandboxWorld(6);
   const old = w.snapshot();
-  old.actors = old.actors.filter((a) => a.kind !== 'dungeon' && !(a.kind === 'item' && a.itemType === 'candle' && (a.owner === 'Tobin' || a.owner === 'Bran')));
+  old.actors = structuredClone(w.actors).filter((a) => !a.spaceId && a.kind !== 'dungeon' && !(a.kind === 'item' && a.itemType === 'candle' && (a.owner === 'Tobin' || a.owner === 'Bran')));
+  old.changeForms = undefined; old.spawned = undefined;
   old.visitedLocations = undefined; old.metNpcIds = undefined;
   old.flags.keepProgress = true;
   const restored = new SandboxWorld(w.seed, old);
@@ -104,6 +117,232 @@ test('narrative: older saves gain new dungeon sites and family links without los
   assert.equal(restored.actors.filter((a) => a.kind === 'dungeon').length, DUNGEON_SITES.length);
   assert.ok(restored.npc('Tobin')!.familyId && restored.npc('Bran')!.familyId);
   assert.ok(restored.actors.some((a) => a.itemType === 'candle' && a.owner === 'Tobin'));
+  assert.ok(restored.actors.some((a) => a.kind === 'portal' && a.spaceId?.startsWith('interior:')), 'missing interiors were not migrated');
+});
+
+test('cell stream loads a centered 5x5 grid and keeps distant references indexed', () => {
+  const w = new SandboxWorld(12);
+  assert.equal(ENGINE_UNITS_PER_CELL, 4096);
+  assert.equal(WORLD_UNITS_PER_CELL, 57.6);
+  assert.deepEqual(exteriorCell({ x: -1, z: 58 }), { x: -1, z: 1 });
+  assert.equal(w.streamer.loadedCells.size, 25);
+  assert.equal(uExteriorCellBuffer, 36);
+  assert.equal(w.streamer.bufferedCells.size, 36);
+  assert.ok([...w.streamer.loadedCells].every((key) => w.streamer.bufferedCells.has(key)));
+  const item = w.spawnItem('stoneChunk', -70, -70, 1);
+  item.sleeping = false; item.vx = 3;
+  w.uGridsToLoad = 1;
+  w.player.x = 80; w.player.z = 80;
+  w.update(0.05);
+  assert.deepEqual([...w.streamer.loadedCells], ['exterior:1:1']);
+  assert.equal(w.isActorLoaded(item), false);
+  assert.equal(item.y, 1, 'unloaded physics changed the object');
+  assert.ok(w.streamer.actorsInCell(cellKey(item)).includes(item), 'the reference was lost from its cell');
+  w.player.x = -70; w.player.z = -70;
+  w.update(0.05);
+  assert.equal(w.isActorLoaded(item), true);
+  assert.ok(item.y < 1, 'loaded physics did not resume');
+  assert.equal(save(w).uGridsToLoad, 1);
+});
+
+test('the buffered window slides ahead of travel while retaining every active cell', () => {
+  const w = new SandboxWorld(14);
+  w.player.x = 2; w.player.z = 3; w.player.vz = -2;
+  w.update(0.05);
+  assert.ok(w.streamer.bufferedCells.has('exterior:0:-3'), 'northbound cells were not preselected');
+  assert.ok(!w.streamer.bufferedCells.has('exterior:0:3'));
+  w.player.z = 54; w.player.vz = 2;
+  w.update(0.05);
+  assert.ok(w.streamer.bufferedCells.has('exterior:0:3'), 'southbound cells were not preselected');
+  assert.ok([...w.streamer.loadedCells].every((key) => w.streamer.bufferedCells.has(key)));
+  assert.equal(w.streamer.bufferedCells.size, 36);
+  assert.equal(save(w).uExteriorCellBuffer, 36);
+});
+
+test('collision heightfields are available before decorative cell vertices', () => {
+  const w = new SandboxWorld(15);
+  const refs = w.streamer.actorsInCell('exterior:0:0').map((a) => ({
+    id: a.id, kind: a.kind, x: a.x, z: a.z, radius: a.radius, height: a.height, solid: a.solid, alive: a.alive,
+  }));
+  const collision = parseCollision(refs);
+  assert.equal(collision.heights.length, 81);
+  assert.ok([...collision.heights].every((h) => h === 0));
+  assert.ok(collision.bodies.length >= 4 && collision.bodies.length % 4 === 0);
+  const visuals = parseVisual(refs);
+  assert.ok(visuals.positions.length > 0);
+  assert.equal(visuals.positions.length, visuals.normals.length);
+  assert.equal(visuals.positions.length, visuals.colors.length);
+  assert.ok([...visuals.normals].every(Number.isFinite));
+  assert.ok(visuals.treePositions.length > 0 && visuals.treePositions.length % 18 === 0);
+  assert.equal(visuals.treeUvs.length, visuals.treePositions.length / 3 * 2);
+  const tree = refs.find((ref) => ref.kind === 'tree')!;
+  const billboards = parseVisual([tree]).treePositions;
+  assert.equal(billboards.length, 36);
+  assert.ok([2, 5, 8, 11, 14, 17].every((i) => billboards[i] === tree.z), 'the first billboard was not an X plane');
+  assert.ok([18, 21, 24, 27, 30, 33].every((i) => billboards[i] === tree.x), 'the second billboard did not intersect it');
+});
+
+test('static batches include stable stone but exclude movable items and persistent landmarks', () => {
+  const w = new SandboxWorld(18);
+  const house = w.actors.find((a) => a.kind === 'house')!;
+  const ore = w.actors.find((a) => a.kind === 'ore')!;
+  const item = w.actors.find((a) => a.kind === 'item')!;
+  assert.equal(isPrecombinedStatic(house), true);
+  assert.equal(isPrecombinedStatic(w.actors.find((a) => a.kind === 'ruin')!), true);
+  assert.equal(isPrecombinedStatic(ore), true, 'immovable stone was not precombined with its cell');
+  ore.alive = false;
+  assert.equal(isPrecombinedStatic(ore), false, 'a depleted node remained in the next batch');
+  assert.equal(isPrecombinedStatic(item), false, 'a movable object was baked into a cell');
+  assert.equal(w.citadel.neverFade, true);
+  assert.equal(isPrecombinedStatic(w.citadel), false);
+  const restored = save(w);
+  assert.equal(restored.citadel.neverFade, true);
+});
+
+test('terrain quadtree uses 4, 8, 16 and 32 subdivisions with continuous skirted boundaries', () => {
+  assert.deepEqual(TERRAIN_LOD_LEVELS, [4, 8, 16, 32]);
+  const tiles = selectTerrainTiles({ x: 80, z: 80 });
+  assert.equal(tiles.reduce((area, tile) => area + tile.size * tile.size, 0), 512 * 512);
+  assert.ok(new Set(tiles.map((tile) => tile.level)).size >= 3);
+  assert.equal(terrainHeight(0, 0), 0);
+  const far = { x: 128, z: 128, size: 64, level: 8 as const };
+  const geometry = terrainTileGeometry(far);
+  assert.ok(geometry.attributes.position.count > (far.level + 1) ** 2, 'the terrain had no seam skirts');
+  assert.ok([...geometry.attributes.position.array].every(Number.isFinite));
+  assert.equal(terrainHeight(far.x + far.size, far.z), terrainHeight(192, 128));
+  geometry.dispose();
+  const flat = terrainTileGeometry({ x: 0, z: 0, size: 64, level: 32 });
+  assert.equal(flat.getAttribute('position'), undefined, 'a second flat mesh overdraws the playable terrain');
+  flat.dispose();
+});
+
+test('high and low water meshes share one shoreline height and a stable global level', () => {
+  assert.equal(WATER_BODIES.length, 1);
+  const high = waterGeometry(WATER_BODIES[0].radius, 96, 4);
+  const low = waterGeometry(WATER_BODIES[0].radius, 24, 1);
+  assert.ok(high.attributes.position.count > low.attributes.position.count);
+  for (const geometry of [high, low]) {
+    const position = geometry.attributes.position;
+    for (let i = 0; i < position.count; i++) assert.ok(Math.abs(position.getY(i) - GLOBAL_WATER_HEIGHT) < 1e-6);
+  }
+  assert.equal(high.attributes.position.getX(high.attributes.position.count - 96), low.attributes.position.getX(1));
+  high.dispose(); low.dispose();
+});
+
+test('occlusion planes cull only fully hidden decor, not visible actors or landmarks', () => {
+  const camera = { x: 0, y: 1.7, z: 0 };
+  const planes = [{ id: 'house', x: 0, z: 7, radius: 3, height: 6 }];
+  const stone = { id: 'stone', x: 0, z: 21, radius: 0.3, height: 1 };
+  assert.equal(isOccluded(camera, stone, planes), true);
+  assert.equal(isOccluded(camera, { ...stone, x: 8 }, planes), false);
+  assert.equal(isOccluded(camera, { ...stone, z: 4 }, planes), false);
+  assert.equal(isOccluded(camera, { ...stone, kind: 'villager' }, planes), false);
+  assert.equal(isOccluded(camera, { ...stone, neverFade: true }, planes), false);
+  assert.ok(occlusionPlanes(camera, new SandboxWorld(20).actors).some((plane) => plane.id === 'citadel'));
+});
+
+test('ordered screen-door fades use a stable Bayer pattern instead of temporal alpha noise', () => {
+  const source = new THREE.MeshBasicMaterial();
+  const material = screenDoorMaterial(source);
+  const shader = { uniforms: {} as Record<string, { value: number }>, fragmentShader: 'void main() {\n#include <alphatest_fragment>\n}' };
+  material.onBeforeCompile(shader as Parameters<typeof material.onBeforeCompile>[0], {} as THREE.WebGLRenderer);
+  assert.match(shader.fragmentShader, /float bayer/);
+  assert.equal(material.alphaHash, false);
+  setScreenDoorFade(material, 0.375);
+  assert.equal(shader.uniforms.uScreenDoorFade.value, 0.375);
+  material.dispose(); source.dispose();
+});
+
+test('crossing into an uncached cell keeps terrain and solid collision authoritative', () => {
+  const w = new SandboxWorld(16);
+  const door = w.actors.find((a) => a.kind === 'dungeon')!;
+  w.uGridsToLoad = 1;
+  w.player.x = door.x;
+  w.player.z = door.z + door.radius + w.player.radius + 0.25;
+  w.player.y = 0;
+  w.input = { x: 0, z: -1, sprint: false };
+  tick(w, 1.5);
+  assert.ok(w.player.z >= door.z + door.radius + w.player.radius - 0.12, 'the unloaded doorway lost collision');
+  assert.equal(w.player.y, 0, 'the guardian fell through the pending terrain');
+});
+
+test('base objects, reference IDs and change forms reproduce moved, removed and spawned objects', () => {
+  const w = new SandboxWorld(32);
+  const apples = w.actors.filter((a) => a.itemType === 'apple').slice(0, 2);
+  assert.equal(apples[0].baseId, apples[1].baseId);
+  assert.equal(BASE_OBJECTS.get(apples[0].baseId!)?.value, 2);
+  const original = w.baseReferences.get(apples[0].id)!;
+  assert.equal(original.transform.x, apples[0].x);
+  const untouched = w.snapshot();
+  assert.equal(untouched.actors, undefined);
+  assert.equal(Object.keys(untouched.changeForms ?? {}).length, 0);
+  assert.equal(untouched.spawned?.length, 0);
+  assert.ok(JSON.stringify(untouched).length < JSON.stringify(w.actors).length / 3);
+
+  apples[0].x += 3; apples[0].y = 1.2; apples[0].facing += 0.4;
+  w.actors = w.actors.filter((a) => a !== apples[1]);
+  const newItem = w.spawnItem('apple', 28, -22);
+  w.elapsed += 10 * 24 * 30;
+  const delta = w.snapshot();
+  assert.equal(delta.changeForms?.[apples[0].id]?.fields?.x, apples[0].x);
+  assert.equal(delta.changeForms?.[apples[1].id]?.deleted, true);
+  assert.ok(delta.spawned?.some((a) => a.id === newItem.id));
+  assert.equal(w.reference(apples[0].id)?.transform.x, apples[0].x);
+  assert.equal(w.baseReferences.get(apples[0].id)?.transform.x, original.transform.x);
+  const restored = save(w);
+  assert.equal(restored.byId(apples[0].id)?.x, apples[0].x);
+  assert.equal(restored.byId(apples[0].id)?.y, 1.2);
+  assert.equal(restored.byId(apples[1].id), undefined);
+  assert.ok(restored.byId(newItem.id));
+  const candle = restored.actors.find((a) => a.itemType === 'candle' && a.owner === 'Tobin')!;
+  restored.actors = restored.actors.filter((a) => a !== candle);
+  assert.equal(save(restored).actors.some((a) => a.itemType === 'candle' && a.owner === 'Tobin'), false,
+    'migration recreated a stolen default object');
+});
+
+test('interior cells isolate physics and retain their object state through exits and saves', () => {
+  const w = new SandboxWorld(46);
+  const tavern = w.tavern!;
+  const outside = { x: w.player.x, z: w.player.z };
+  assert.equal(w.enterInterior(tavern), true);
+  const room = interiorSpace(tavern.id);
+  assert.equal(w.currentSpace, room);
+  assert.deepEqual([...w.streamer.loadedCells], [room]);
+  assert.ok(w.streamer.loadedActors().every((a) => a.spaceId === room));
+  const jug = w.actors.find((a) => a.spaceId === room && a.itemType === 'jug')!;
+  const exterior = w.spawnItem('apple', jug.x, jug.z);
+  face(w, jug, 0.02);
+  assert.equal(w.focus()?.id, jug.id, 'an exterior object occluded the interior item');
+  w.interact();
+  assert.equal(w.pack.jug, 1);
+  assert.equal(w.actors.includes(jug), false);
+  assert.equal(w.actors.includes(exterior), true);
+  const foe = w.actors.find((a) => a.kind === 'foe')!;
+  foe.x = w.player.x; foe.z = w.player.z + 2;
+  w.player.spells!.push('bolt');
+  assert.equal(w.castBolt(w.player, foe), false, 'a spell crossed worldspace boundaries');
+  const restored = save(w);
+  assert.equal(restored.currentSpace, room);
+  assert.ok(!restored.byId(jug.id));
+  assert.equal(restored.leaveInterior(), true);
+  assert.equal(restored.currentSpace, 'exterior');
+  assert.deepEqual({ x: restored.player.x, z: restored.player.z }, outside);
+  assert.equal(restored.enterInterior(restored.tavern!), true);
+  assert.ok(!restored.byId(jug.id), 'the taken jug reappeared when the room was revisited');
+  assert.ok(restored.actors.some((a) => a.spaceId === room && a.kind === 'counter'));
+});
+
+test('exterior schedules and raids keep progressing while the guardian is in another worldspace', () => {
+  const w = new SandboxWorld(48);
+  const npc = w.npc('Bran')!;
+  assert.equal(w.enterInterior(w.tavern!), true);
+  const hunger = npc.needs!.hunger;
+  w.startWave();
+  const queue = w.spawnQueue;
+  tick(w, 4);
+  assert.ok(npc.needs!.hunger > hunger, 'the exterior NPC stopped living while unloaded');
+  assert.ok(w.spawnQueue < queue, 'the raid stopped spawning outside');
+  assert.equal(w.currentSpace.startsWith('interior:'), true);
 });
 
 test('a looted room keeps its scattered contents when you return', () => {
@@ -171,12 +410,21 @@ test('narrative: a bonded, encountered villager can trigger a tailored rescue qu
   w.metNpcIds.push(mara.id, bran.id);
   w.adjustOpinion(mara, 30); w.adjustOpinion(bran, 24);
   w.player.skills!.stealth = 40;
+  assert.equal(w.canGenerateRescue(mara), false, 'an unexplored site should not be an alias');
+  const explored = DUNGEON_SITES[0];
+  w.player.x = explored.point.x; w.player.z = explored.point.z;
+  tick(w, 0.6);
+  assert.equal(w.locationStatus(explored.id), 'cleared');
   assert.equal(w.canGenerateRescue(mara), true);
   assert.equal(w.generateRescueQuest(mara), true);
   const quest = w.quests.rescue!, data = quest.data!;
+  assert.equal(data.kind, 'rescue');
+  if (data.kind !== 'rescue') throw new Error('expected a rescue');
   assert.equal(data.captiveId, bran.id, "the quest ignored the player's relationship");
-  assert.ok(DUNGEON_SITES.some((site) => site.id === data.dungeonId), 'the target is not a dungeon');
-  assert.ok(!w.visitedLocations.includes(data.dungeonId), 'the quest chose an already explored site');
+  assert.equal(data.siteId, explored.id, 'the alias was not matched from explored sites');
+  assert.ok(w.visitedLocations.includes(data.siteId), 'the quest chose an unexplored site');
+  assert.equal(w.locationStatus(data.siteId), 'occupied');
+  assert.equal(data.aliases.personId, bran.id);
   assert.match(data.approach, /stealth/i, 'the objective did not use the player skill profile');
   assert.equal(bran.capturedFor, 'rescue');
   assert.equal(w.questTitle('rescue').includes(data.dungeonName), true);
@@ -199,6 +447,119 @@ test('narrative: a bonded, encountered villager can trigger a tailored rescue qu
   w.interact(); w.choose('rescue-report');
   assert.equal(w.quests.rescue!.status, 'done');
   assert.equal(w.pack.familyLocket, 1);
+  assert.equal(w.locationStatus(data.siteId), 'recovering');
+  for (const guard of w.actors.filter((a) => a.questFor === 'rescue')) guard.alive = false;
+  w.elapsed += 46; w.update(0.05);
+  assert.equal(w.locationStatus(data.siteId), 'reset');
+  assert.equal(w.generateRescueQuest(mara), true, 'the same relationship should be able to make new quests');
+  assert.notEqual(w.tracked, 'rescue', 'a repeat quest must keep the old journal entry');
+  assert.equal(w.quests.rescue.status, 'done');
+});
+
+test('radiant aliases reserve only explored cleared or reset sites and persist across saves', () => {
+  const w = new SandboxWorld(41);
+  const tobin = w.npc('Tobin')!;
+  w.metNpcIds.push(tobin.id);
+  assert.equal(w.generateRadiantQuest(tobin, 'retrieve'), undefined);
+  const site = RADIANT_SITES.find((p) => p.kind === 'cave')!;
+  w.player.x = site.point.x; w.player.z = site.point.z;
+  tick(w, 0.6);
+  assert.equal(w.locationStatus(site.id), 'cleared');
+  const id = w.generateRadiantQuest(tobin, 'retrieve')!;
+  const data = w.quests[id].data!;
+  assert.equal(data.kind, 'retrieve');
+  if (data.kind !== 'retrieve') throw new Error('expected retrieval');
+  assert.equal(data.aliases.locationId, site.id);
+  assert.equal(data.aliases.itemType, data.itemType);
+  assert.equal(w.locationStatus(site.id), 'occupied');
+  assert.equal(w.canGenerateRadiant(w.npc('Mara')!), false, 'another quest reserved the only explored site');
+  const restored = save(w);
+  assert.deepEqual(restored.quests[id].data, data);
+  assert.equal(restored.siteStates[site.id].questId, id);
+  assert.equal(restored.nextRadiantQuest, w.nextRadiantQuest);
+  restored.quests[id].status = 'done';
+  assert.equal(restored.locationStatus(site.id), 'recovering', 'an orphaned reservation never released its site');
+});
+
+test('radiant retrieval can be dropped and recovered, then the site resets for a new hunt', () => {
+  const w = new SandboxWorld(52);
+  const patron = w.npc('Tobin')!, hunter = w.npc('Alden')!;
+  w.metNpcIds.push(patron.id, hunter.id);
+  const site = DUNGEON_SITES[0];
+  w.player.x = site.point.x; w.player.z = site.point.z;
+  tick(w, 0.6);
+  const id = w.generateRadiantQuest(patron, 'retrieve')!;
+  const data = w.quests[id].data!;
+  if (data.kind !== 'retrieve') throw new Error('expected retrieval');
+  const item = w.byId(data.itemActorId)!;
+  face(w, item, 0.02);
+  w.interact();
+  tick(w, 0.6);
+  assert.equal(w.questStage(id), 'report');
+  assert.equal(data.recovered, true);
+  w.dropFromPack(data.itemType);
+  assert.equal(w.questStage(id), 'recover');
+  assert.equal(data.recovered, false);
+  face(w, w.byId(data.itemActorId)!, 0.02);
+  tick(w, 0.4);
+  w.interact();
+  tick(w, 0.6);
+  assert.equal(w.questStage(id), 'report');
+  assert.equal(w.finishRetrieveQuest(id, patron), true);
+  assert.equal(w.quests[id].status, 'done');
+  assert.equal(w.generateRadiantQuest(hunter, 'hunt'), undefined, 'the site was reused before recovery');
+  for (const guard of w.actors.filter((a) => a.questFor === id)) guard.alive = false;
+  w.elapsed += 46; w.update(0.05);
+  assert.equal(w.locationStatus(site.id), 'reset');
+  const huntId = w.generateRadiantQuest(hunter, 'hunt')!;
+  const hunt = w.quests[huntId].data!;
+  if (hunt.kind !== 'hunt') throw new Error('expected a hunt');
+  assert.equal(hunt.aliases.locationId, site.id);
+  w.hurt(w.byId(hunt.enemyId)!, 999, PLAYER_ID);
+  assert.equal(w.questStage(huntId), 'report');
+  assert.equal(w.finishHuntQuest(huntId, hunter), true);
+  assert.equal(w.quests[huntId].status, 'done');
+});
+
+test('a contested camp becomes a quest alias only after the living threats are cleared', () => {
+  const w = new SandboxWorld(28);
+  const camp = RADIANT_SITES.find((p) => p.kind === 'camp')!;
+  w.player.x = camp.point.x; w.player.z = camp.point.z;
+  tick(w, 0.6);
+  assert.equal(w.locationStatus(camp.id), 'uncleared');
+  for (const foe of w.actors.filter((a) => a.kind === 'foe')) foe.alive = false;
+  tick(w, 0.6);
+  assert.equal(w.locationStatus(camp.id), 'cleared');
+  const tobin = w.npc('Tobin')!;
+  face(w, tobin);
+  w.interact();
+  assert.ok(w.dialogueView()!.options.some((option) => option.id === 'radiant-accept'));
+  w.choose('radiant-accept');
+  assert.equal(w.quests[w.tracked].data?.aliases.locationId, camp.id);
+});
+
+test('an active rescue in an older save keeps its alias and upgrades its site reservation', () => {
+  const w = new SandboxWorld(34);
+  const site = DUNGEON_SITES[0];
+  w.player.x = site.point.x; w.player.z = site.point.z;
+  tick(w, 0.6);
+  const mara = w.npc('Mara')!, bran = w.npc('Bran')!;
+  w.metNpcIds.push(mara.id, bran.id);
+  mara.memory!.opinion = 20; bran.memory!.opinion = 20;
+  w.generateRescueQuest(mara);
+  const old = w.snapshot();
+  const data = old.quests.rescue.data!;
+  if (data.kind !== 'rescue') throw new Error('expected rescue data');
+  delete (data as Partial<typeof data>).siteId;
+  delete (data as Partial<typeof data>).siteName;
+  delete (data as Partial<typeof data>).siteActorId;
+  delete (data as Partial<typeof data>).aliases;
+  old.siteStates = undefined; old.nextRadiantQuest = undefined; old.threatSignals = undefined;
+  old.visitedLocations = ['village'];
+  const restored = new SandboxWorld(w.seed, old);
+  assert.equal(restored.siteStates[site.id].questId, 'rescue');
+  assert.equal(restored.quests.rescue.data?.aliases.locationId, site.id);
+  assert.equal(restored.questStage('rescue'), 'travel');
 });
 
 test('relationships let a trusted guardian take low-value goods from a home', () => {
@@ -271,7 +632,7 @@ test('AI packages: the smith forges, takes a midday tavern meal and locks the ho
   sera.x = 0; sera.z = 4; sera.decideIn = 0; sera.utility = undefined;
   w.elapsed = (12 - 8) * 30;
   tick(w, 0.2);
-  assert.equal(sera.utility?.kind, 'tavern', 'the midday package did not pull the smith toward the tavern');
+  assert.equal(w.byId(sera.id)?.utility?.kind, 'tavern', 'the midday package did not pull the smith toward the tavern');
   tick(w, 30);
   assert.equal(sera.crowns, 17, 'the tavern meal was not paid for');
   assert.ok(sera.needs!.hunger < 0.45, 'the meal did not satisfy hunger');
@@ -406,6 +767,227 @@ test('foes call allies when they spot the guardian', () => {
   assert.ok(foes[1].intent === 'search' || foes[1].intent === 'chase');
 });
 
+test('tactical operators choose a flank, withdrawal or healer support from world conditions', () => {
+  const w = new SandboxWorld(13);
+  const stalker = w.actors.find((a) => a.foeKind === 'stalker')!;
+  const brute = w.actors.find((a) => a.foeKind === 'brute')!;
+  const wisp = w.actors.find((a) => a.foeKind === 'wisp')!;
+  const player = w.player;
+  player.x = 30; player.z = 30;
+  stalker.x = 30; stalker.z = 36;
+  brute.x = 31; brute.z = 36;
+  assert.equal(planTactic(stalker, player, [brute], undefined, w.elapsed).action, 'flank');
+  stalker.hp = stalker.maxHp * 0.2;
+  assert.equal(planTactic(stalker, player, [brute], undefined, w.elapsed).action, 'withdraw');
+  wisp.x = 32; wisp.z = 36;
+  brute.hp = brute.maxHp * 0.25;
+  const support = planTactic(wisp, player, [stalker], brute, w.elapsed);
+  assert.equal(support.action, 'support');
+  assert.equal(support.allyId, brute.id);
+});
+
+test('squad sightings spread to allies and wisps heal using the shared spell rules', () => {
+  const w = new SandboxWorld(17);
+  const mara = w.npc('Mara')!, bran = w.npc('Bran')!;
+  const foe = w.actors.find((a) => a.foeKind === 'brute')!;
+  foe.x = mara.x + 2; foe.z = mara.z + 1;
+  bran.x = mara.x + 3; bran.z = mara.z + 2;
+  w.hurt(mara, 10, foe.id);
+  tick(w, 0.5);
+  assert.ok(w.threatSignals.some((s) => s.targetId === foe.id));
+  assert.equal(bran.memory!.threatId, foe.id, 'the nearby villager did not hear the warning');
+  assert.ok(save(w).threatSignals.some((s) => s.targetId === foe.id), 'the warning was lost on save');
+
+  const healer = w.actors.find((a) => a.foeKind === 'wisp')!;
+  const injured = w.actors.find((a) => a.foeKind === 'stalker')!;
+  w.player.x = -70; w.player.z = -70;
+  healer.x = 50; healer.z = 50; healer.focus = healer.maxFocus = 60;
+  injured.x = 52; injured.z = 50; injured.hp = injured.maxHp * 0.3;
+  const hp = injured.hp, focus = healer.focus;
+  tick(w, 0.6);
+  assert.ok(injured.hp > hp, 'the wisp did not mend its ally');
+  assert.ok(healer.focus! < focus, 'healing did not spend focus');
+});
+
+test('witnesses report an assault; civilians and support roles do not all attack the player', () => {
+  const w = new SandboxWorld(55), p = w.player;
+  p.x = 0; p.z = 0;
+  const victim = w.npc('Iona')!;
+  for (const n of w.actors.filter((a) => a.kind === 'villager')) {
+    n.x = ((n.variant ?? 0) % 4 - 1.5) * 1.8;
+    n.z = 3 + Math.floor((n.variant ?? 0) / 4) * 1.6;
+    n.facing = Math.atan2(p.x - n.x, p.z - n.z);
+    n.persona!.courage = 1; n.persona!.loyalty = 1;
+    n.decideIn = 0; n.utility = undefined;
+  }
+  w.hurt(victim, 5, p.id);
+  assert.equal(canRetaliate(victim, p, w.elapsed), true);
+  for (const name of ['Mara', 'Tobin', 'Bran', 'Lark', 'Rhea', 'Oren', 'Ellis', 'Tamsin']) {
+    const witness = w.npc(name)!;
+    assert.equal(canRetaliate(witness, p, w.elapsed), false, `${name} attacked without being hit`);
+    assert.ok(!['fight', 'castBolt'].includes(roleResponse(w, witness, p).kind), `${name} treated witnessing as permission to attack`);
+  }
+  tick(w, 1.2);
+  assert.ok(['fight', 'windup', 'strike', 'Fighting'].includes(victim.utility?.kind ?? victim.action ?? victim.activity ?? ''), 'the assaulted mason did not defend herself');
+  for (const name of ['Mara', 'Tobin', 'Bran', 'Lark', 'Rhea', 'Oren', 'Ellis', 'Tamsin']) {
+    const witness = w.npc(name)!;
+    assert.notEqual(witness.utility?.kind, 'fight', `${name} joined an assault on the player`);
+  }
+});
+
+test('each profession runs a separate threat, routine and work controller', () => {
+  const w = new SandboxWorld(68);
+  const villagers = w.actors.filter((a) => a.kind === 'villager');
+  const professions = new Set(villagers.map((n) => n.profession));
+  const brains = [...professions].map((profession) => PROFESSION_BRAINS[profession!]!);
+  assert.equal(brains.length, 13);
+  assert.ok(villagers.every((n) => !!brainFor(n)));
+  assert.equal(new Set(brains.map((brain) => brain.onThreat)).size, brains.length);
+  assert.equal(new Set(brains.map((brain) => brain.onRoutine)).size, brains.length);
+  assert.equal(new Set(brains.map((brain) => brain.onWork)).size, brains.length);
+  assert.equal(brainFor(w.npc('Tobin')!)?.attack, undefined, 'a merchant inherited a fighter attack pattern');
+  const fighters = ['Alden', 'Vela', 'Sera', 'Perrin', 'Iona', 'Mara'].map((name) => brainFor(w.npc(name)!)!.attack!);
+  assert.equal(new Set(fighters.map((style) => `${style.speed}:${style.windup}:${style.cooldown}`)).size, fighters.length);
+});
+
+test('save repair strips monster and tower behavior from villagers, and NPC logic from structures', () => {
+  const w = new SandboxWorld(70);
+  const merchant = w.npc('Tobin')!;
+  merchant.foeKind = 'brute'; merchant.intent = 'raid'; merchant.structure = 'archer';
+  w.stock.wood = 10; w.stock.stone = 10; w.stock.gold = 100;
+  assert.equal(w.build('archer', { x: 6, z: -16 }), true);
+  const tower = w.actors.find((a) => a.kind === 'tower')!;
+  tower.profession = 'Warden'; tower.foeKind = 'stalker'; tower.intent = 'chase';
+  tower.utility = { kind: 'fight', targetId: w.player.id, until: 999 };
+  const foe = w.actors.find((a) => a.kind === 'foe')!;
+  foe.profession = 'Merchant'; foe.structure = 'archer';
+  const restored = save(w);
+  assert.equal(restored.npc('Tobin')!.foeKind, undefined);
+  assert.equal(restored.npc('Tobin')!.intent, undefined);
+  assert.equal(restored.npc('Tobin')!.structure, undefined);
+  assert.equal(restored.byId(tower.id)!.profession, undefined);
+  assert.equal(restored.byId(tower.id)!.utility, undefined);
+  assert.equal(restored.byId(foe.id)!.profession, undefined);
+  assert.equal(planTactic(restored.byId(tower.id)!, restored.player, [], undefined, restored.elapsed).action, 'hold');
+});
+
+test('combat refuses unauthorized NPC damage even if a stale goal points at the guardian', () => {
+  const w = new SandboxWorld(69), p = w.player;
+  const merchant = w.npc('Tobin')!, smith = w.npc('Sera')!, warden = w.npc('Alden')!;
+  merchant.memory!.alarmUntil = w.elapsed + 20; merchant.memory!.threatId = p.id;
+  merchant.utility = { kind: 'fight', targetId: p.id, until: w.elapsed + 20 };
+  const hp = p.hp;
+  w.hurt(p, 15, merchant.id);
+  assert.equal(p.hp, hp, 'an untrained witness hurt the player');
+  w.hurt(merchant, 5, p.id);
+  w.hurt(p, 15, merchant.id);
+  assert.equal(p.hp, hp, 'a directly hurt merchant became an attacker');
+  warden.activity = 'Fighting'; warden.memory!.threatId = p.id;
+  w.hurt(p, 15, warden.id);
+  assert.equal(p.hp, hp, 'an unauthorized guard struck the player');
+  w.hurt(smith, 5, p.id);
+  assert.equal(w.canNpcDamagePlayer(smith), true);
+  w.hurt(p, 15, smith.id);
+  assert.ok(p.hp < hp, 'a directly attacked defender could not protect herself');
+});
+
+test('a saved guard fighting state does not become an unearned attack after loading', () => {
+  const w = new SandboxWorld(71), p = w.player, guard = w.npc('Alden')!;
+  guard.x = p.x; guard.z = p.z + 1.4;
+  guard.activity = 'Fighting'; guard.targetId = p.id; guard.decideIn = 100;
+  const restored = save(w), before = restored.player.hp;
+  restored.update(0.05);
+  assert.notEqual(restored.npc('Alden')!.activity, 'Fighting');
+  assert.equal(restored.player.hp, before);
+});
+
+test('an attack on the guardian brings guards forward while civilians seek safety', () => {
+  const w = new SandboxWorld(56), p = w.player;
+  p.x = 0; p.z = 0;
+  const foe = w.actors.find((a) => a.foeKind === 'brute')!;
+  foe.x = 1; foe.z = 5; foe.facing = Math.PI;
+  const positions: [string, number, number][] = [
+    ['Alden', -1, 3], ['Vela', 3, 3], ['Tobin', -2, 4], ['Ellis', 2, 4], ['Lark', 4, 5],
+  ];
+  for (const [name, x, z] of positions) {
+    const n = w.npc(name)!;
+    n.x = x; n.z = z; n.decideIn = 0; n.utility = undefined;
+    n.needs = { energy: 0.9, hunger: 0, social: 0, fun: 0 };
+  }
+  w.hurt(p, 5, foe.id);
+  tick(w, 1.3);
+  assert.equal(w.npc('Tobin')!.memory!.threatId, foe.id);
+  assert.ok(['warn', 'shelter'].includes(w.npc('Tobin')!.utility?.kind ?? ''));
+  assert.equal(w.npc('Ellis')!.utility?.kind, 'hide');
+  assert.ok(['fight', 'castBolt'].includes(w.npc('Alden')!.utility?.kind ?? ''), 'the warden did not defend the village');
+  for (const name of ['Tobin', 'Ellis', 'Lark']) assert.notEqual(w.npc(name)!.targetId, p.id, `${name} attacked the guardian instead of the foe`);
+});
+
+test('each profession and foe type has an explicit job and a different response to danger', () => {
+  const w = new SandboxWorld(57);
+  const foe = w.actors.find((a) => a.foeKind === 'brute')!;
+  foe.x = 5; foe.z = 5;
+  const roles = new Set(w.actors.filter((a) => a.kind === 'villager').map((n) => PROFESSION_DUTIES[n.profession!]));
+  assert.ok(roles.size >= 8, `only ${roles.size} occupation behaviors`);
+  const response = ['Alden', 'Vela', 'Sera', 'Iona', 'Rhea', 'Lark', 'Tobin', 'Ellis', 'Oren'].map((name) => {
+    const n = w.npc(name)!; n.x = 5; n.z = 7;
+    return roleResponse(w, n, foe).kind;
+  });
+  assert.ok(new Set(response).size >= 5, `roles chose only ${new Set(response).size} reactions`);
+  assert.deepEqual(Object.values(FOE_BEHAVIORS).map((b) => b.duty).sort(), ['ambush', 'siege', 'support', 'swarm']);
+  const camp = w.camp;
+  const stalker = w.actors.find((a) => a.foeKind === 'stalker')!;
+  const slime = w.actors.find((a) => a.foeKind === 'slime')!;
+  assert.ok(Math.hypot(foePatrolPoint(stalker, camp, 0).x - camp.x, foePatrolPoint(stalker, camp, 0).z - camp.z)
+    > Math.hypot(foePatrolPoint(slime, camp, 0).x - camp.x, foePatrolPoint(slime, camp, 0).z - camp.z));
+});
+
+test('wild species prowl, screen, lurk or gather rather than sharing one idle routine', () => {
+  const w = new SandboxWorld(63);
+  w.player.x = -75; w.player.z = -75;
+  tick(w, 1.5);
+  const active = (kind: string) => w.actors.find((a) => a.foeKind === kind && a.alive)!;
+  assert.equal(active('slime').activity, 'Prowling');
+  assert.equal(active('wisp').activity, 'Screening');
+  assert.equal(active('stalker').activity, 'Lurking');
+  assert.ok(active('brute').targetId, 'the brute never sought materials for its siege');
+});
+
+test('bakers, farmers, smiths and apprentices produce different persistent work outcomes', () => {
+  const w = new SandboxWorld(65);
+  w.elapsed = (10 - 8) * 30;
+  const workers: [string, number][] = [['Bran', 23], ['Oren', 23], ['Sera', 18], ['Rhea', 12]];
+  for (const [name, interval] of workers) {
+    const n = w.npc(name)!;
+    n.x = n.work!.x; n.z = n.work!.z; n.vx = n.vz = 0;
+    n.needs = { energy: 0.9, hunger: 0, social: 0, fun: 0 };
+    n.utility = { kind: 'work', until: w.elapsed + 40, score: 1 };
+    n.decideIn = 100;
+    n.workProgress = interval - 0.04;
+  }
+  const bread = w.actors.filter((a) => a.itemType === 'bread' && a.owner === 'Bran').length;
+  const food = w.npc('Oren')!.homeFood!;
+  const stone = w.citadel.stockStone!;
+  const magic = w.npc('Rhea')!.skills!.magic;
+  tick(w, 0.2);
+  assert.ok(w.actors.filter((a) => a.itemType === 'bread' && a.owner === 'Bran').length > bread, 'baker made no real bread');
+  assert.ok(w.npc('Oren')!.homeFood! > food, 'farmer grew no food');
+  assert.ok(w.citadel.stockStone! < stone, 'smith consumed no materials for forging');
+  assert.ok(w.npc('Rhea')!.skills!.magic > magic, 'apprentice learned nothing while studying');
+});
+
+test('a squad flanker takes a lateral route instead of piling onto its target', () => {
+  const w = new SandboxWorld(19);
+  const stalker = w.actors.find((a) => a.foeKind === 'stalker')!;
+  const brute = w.actors.find((a) => a.foeKind === 'brute')!;
+  w.player.x = 25; w.player.z = 25;
+  stalker.x = 25; stalker.z = 32; stalker.intent = 'chase'; stalker.targetId = PLAYER_ID;
+  brute.x = 26; brute.z = 32; brute.intent = 'chase'; brute.targetId = PLAYER_ID;
+  w.update(0.05);
+  assert.equal(stalker.tactic?.action, 'flank');
+  assert.ok(stalker.tactic?.point && Math.abs(stalker.tactic.point.x - w.player.x) > 1, 'the route has no lateral offset');
+});
+
 test('attacks chain into combos and rolling avoids a strike', () => {
   const w = new SandboxWorld(5);
   const p = w.player;
@@ -447,6 +1029,26 @@ test('simulation stays fast: a minute of world time with everyone active', () =>
   const ms = (performance.now() - start) / 1200;
   console.log(`  ${ms.toFixed(3)} ms per simulation step`);
   assert.ok(ms < 4, `${ms.toFixed(2)} ms per step`);
+});
+
+test('simultaneous radiant quests, a raid, items and distant minds stay inside the simulation budget', () => {
+  const w = new SandboxWorld(61);
+  for (const site of DUNGEON_SITES) w.visitedLocations.push(site.id);
+  const tobin = w.npc('Tobin')!, alden = w.npc('Alden')!, mara = w.npc('Mara')!, bran = w.npc('Bran')!;
+  w.metNpcIds.push(tobin.id, alden.id, mara.id, bran.id);
+  mara.memory!.opinion = 25; bran.memory!.opinion = 25;
+  assert.ok(w.generateRadiantQuest(tobin, 'retrieve'));
+  assert.ok(w.generateRadiantQuest(alden, 'hunt'));
+  assert.equal(w.generateRescueQuest(mara), true);
+  w.startWave();
+  const start = performance.now();
+  tick(w, 10);
+  const ms = (performance.now() - start) / 200;
+  assert.ok(ms < 4, `${ms.toFixed(2)} ms per busy simulation step`);
+  assert.equal(w.radiantQuests().filter(([, q]) => q.status === 'active').length, 3);
+  assert.ok(w.actors.some((a) => a.questFor && a.alive));
+  assert.ok(w.actors.some((a) => a.kind === 'villager' && a.activity), 'distant schedules stopped');
+  assert.ok(w.waveActive || w.waveCleared > 0, 'the raid stopped updating');
 });
 
 // ---------------------------------------------------------------- Vivid AI
@@ -492,7 +1094,7 @@ test('vivid: urgent hunger can replace a valid work goal without inventing food'
 test('vivid: a hungry, penniless, dishonest villager steals when nobody is watching', () => {
   const w = new SandboxWorld(5);
   const ellis = w.npc('Ellis')!;
-  ellis.persona!.honesty = 0.05; ellis.crowns = 0; ellis.food = 0; ellis.homeFood = 0;
+  ellis.persona!.honesty = 0.05; ellis.crowns = 0; ellis.items = {}; ellis.homeFood = 0;
   ellis.needs!.hunger = 0.95; ellis.needs!.energy = 0.9; ellis.needs!.social = 0; ellis.needs!.fun = 0;
   for (const v of w.actors.filter((a) => a.kind === 'villager' && a !== ellis)) { v.x = 70; v.z = -70; v.utility = { kind: 'idle', until: 1e9 }; v.decideIn = 1e6; }
   const stall = w.actors.find((a) => a.kind === 'stall')!;
@@ -501,14 +1103,14 @@ test('vivid: a hungry, penniless, dishonest villager steals when nobody is watch
     + w.actors.filter((a) => a.itemType === 'bread' && Math.hypot(a.x - stall.x, a.z - stall.z) < 1.5).length;
   const before = breads();
   tick(w, 30);
-  assert.ok(breads() < before || (ellis.food ?? 0) > 0 || ellis.needs!.hunger < 0.5, 'Ellis never stole');
+  assert.ok(breads() < before || (ellis.items.bread ?? 0) > 0 || ellis.needs!.hunger < 0.5, 'Ellis never stole');
   assert.equal(ellis.wanted ?? 0, 0, 'nobody saw, so no fine');
 });
 
 test('vivid: a witnessed theft brings a fine from the wardens', () => {
   const w = new SandboxWorld(5);
   const ellis = w.npc('Ellis')!;
-  ellis.persona!.honesty = 0.05; ellis.crowns = 30; ellis.food = 0; ellis.homeFood = 0;
+  ellis.persona!.honesty = 0.05; ellis.crowns = 30; ellis.items = {}; ellis.homeFood = 0;
   ellis.needs!.hunger = 0.95; ellis.needs!.energy = 0.9; ellis.needs!.social = 0; ellis.needs!.fun = 0;
   const stall = w.actors.find((a) => a.kind === 'stall')!;
   const tobin = w.npc('Tobin')!;
