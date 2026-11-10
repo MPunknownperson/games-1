@@ -47,7 +47,8 @@ let browser;
     await page.waitForFunction(() => window.__renderer.isReady());
     const streaming = await page.evaluate(() => window.__renderer.info());
     if (!streaming.worker || streaming.bufferedCells !== 36 || streaming.collisionCells !== 36
-      || streaming.precombinedRefs < 20 || streaming.terrainDraws < 1 || streaming.terrainDraws > 4) {
+      || streaming.precombinedRefs < 20 || streaming.terrainDraws < 1 || streaming.terrainDraws > 16
+      || streaming.navigation !== 'ready' || streaming.bvhGeometries < 5 || streaming.animationRuntime !== 'ready' || streaming.ozzRigs < 1) {
       throw new Error(`The worker/collision buffer was not ready: ${JSON.stringify(streaming)}`);
     }
   }
@@ -65,7 +66,7 @@ let browser;
       return Math.abs(w.player.z - z0);
     });
     if (moved < 1) throw new Error(`Guardian barely moved (${moved})`);
-    await page.evaluate(() => { const w = window.__world; const m = w.npc('Mara'); m.goal = undefined; m.decideIn = 99; const p = w.player; p.x = m.x; p.z = m.z + 1.1; p.facing = Math.PI; });
+    await page.evaluate(() => { const w = window.__world; const m = w.npc('Mara'); m.goal = undefined; m.decideIn = 99; m.work = { x: m.x, z: m.z }; m.vx = m.vz = 0; const p = w.player; p.x = m.x; p.z = m.z + 1.1; p.vx = p.vz = 0; p.facing = Math.PI; });
     await page.locator('.prompt', { hasText: 'Talk' }).waitFor();
     await page.screenshot({ path: 'test-results/prompt.png' });
     await page.keyboard.press('e');
@@ -98,28 +99,32 @@ let browser;
     await page.evaluate(() => { const w = window.__world; w.player.x = -44; w.player.z = 33; w.player.vx = w.player.vz = 0; w.update(0.05); });
     await page.waitForFunction(() => window.__world.streamer.loadedCells.has('exterior:-1:0'));
     await page.waitForFunction(() => window.__renderer.readyCells.has('exterior:-1:0'));
-    const fastTravel = await page.evaluate(() => ({
-      info: window.__renderer.info(), height: window.__world.player.y,
-      dither: window.__renderer.farFades.get('exterior:-1:0')?.materials.every((material) => material.userData.screenDoor),
-      landmark: !window.__world.streamer.loadedCells.has('exterior:0:-1')
-        && !!window.__renderer.visuals.get(window.__world.citadel.id)?.obj.visible,
-    }));
-    if (fastTravel.info.bufferedCells !== 36 || fastTravel.info.collisionCells !== 36 || fastTravel.info.billboardCells < 1 || fastTravel.height < 0
-      || !fastTravel.dither || !fastTravel.landmark) {
+    const fastTravel = await page.evaluate(() => {
+      const w = window.__world, r = window.__renderer;
+      const trees = w.actors.filter((a) => a.kind === 'tree' && a.alive && !w.streamer.isLoaded(a));
+      return { info: r.info(), height: w.player.y,
+        fullTrees: trees.length > 0 && trees.every((a) => {
+          const visual = r.visuals.get(a.id), pool = visual && r.pools.get(visual.poolKey);
+          return visual?.poolAlive && !!pool?.mesh;
+        }),
+        landmark: !w.streamer.loadedCells.has('exterior:0:-1') && !!r.visuals.get(w.citadel.id)?.obj.visible,
+      };
+    });
+    if (fastTravel.info.bufferedCells !== 36 || fastTravel.info.collisionCells !== 36 || fastTravel.height < 0
+      || !fastTravel.fullTrees || !fastTravel.landmark) {
       throw new Error(`Fast cell transition lost geometry or collision: ${JSON.stringify(fastTravel)}`);
     }
     await page.screenshot({ path: 'test-results/buffer-travel.png' });
     assertVisual('buffer-travel');
     await page.evaluate(() => { const w = window.__world; w.player.x = 42; w.player.z = -36; w.player.vx = w.player.vz = 0; w.update(0.05); });
     await page.waitForFunction(() => window.__renderer.info().waterHigh === 1);
-    const water = await page.evaluate(async () => {
-      const layer = window.__renderer.waterLod.layers[0], fades = [];
-      for (let i = 0; i < 8; i++) { fades.push(layer.fade); await new Promise((resolve) => setTimeout(resolve, 60)); }
-      return { fades, sharedNormals: layer.highMaterial.normalMap === layer.lowMaterial.normalMap,
-        level: layer.high.geometry.attributes.position.getY(0) - layer.low.geometry.attributes.position.getY(0) };
+    const water = await page.evaluate(() => {
+      const lod = window.__renderer.waterLod, layer = lod.layers[0];
+      return { highVisible: layer.high.visible, normalMap: layer.highMaterial.normalMap === lod.normalMap,
+        level: layer.high.geometry.attributes.position.getY(0), lowCount: lod.lowDetailCount };
     });
-    if (!water.sharedNormals || Math.abs(water.level) > 1e-6 || !water.fades.some((fade) => fade > 0 && fade < 1)) {
-      throw new Error(`Water LOD had a height or wave seam: ${JSON.stringify(water)}`);
+    if (!water.highVisible || !water.normalMap || Math.abs(water.level - 0.055) > 1e-6 || water.lowCount !== 0) {
+      throw new Error(`Water did not remain in full detail: ${JSON.stringify(water)}`);
     }
     await page.screenshot({ path: 'test-results/water-near.png' });
     const entered = await page.evaluate(() => { const w = window.__world; w.uGridsToLoad = 1; return w.enterInterior(w.tavern); });
@@ -146,7 +151,7 @@ let browser;
   await page.keyboard.press('Escape');
   const streamState = await page.locator('.system .stats').innerText();
   if (!streamState.includes('36 buffered') || !streamState.includes('background stream')
-    || !streamState.includes('precombined') || !streamState.includes('terrain draws')) {
+    || !streamState.includes('precombined') || !streamState.includes('terrain draws') || !streamState.includes('Recast navigation') || !streamState.includes('ozz ready')) {
     throw new Error(`Production streaming worker was not active: ${streamState}`);
   }
   await page.getByRole('button', { name: 'Save and leave to title' }).click();

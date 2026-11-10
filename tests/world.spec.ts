@@ -159,7 +159,7 @@ test('the buffered window slides ahead of travel while retaining every active ce
   assert.equal(save(w).uExteriorCellBuffer, 36);
 });
 
-test('collision heightfields are available before decorative cell vertices', () => {
+test('collision heightfields and full-detail reference manifests are available for cells', () => {
   const w = new SandboxWorld(15);
   const refs = w.streamer.actorsInCell('exterior:0:0').map((a) => ({
     id: a.id, kind: a.kind, x: a.x, z: a.z, radius: a.radius, height: a.height, solid: a.solid, alive: a.alive,
@@ -169,17 +169,9 @@ test('collision heightfields are available before decorative cell vertices', () 
   assert.ok([...collision.heights].every((h) => h === 0));
   assert.ok(collision.bodies.length >= 4 && collision.bodies.length % 4 === 0);
   const visuals = parseVisual(refs);
-  assert.ok(visuals.positions.length > 0);
-  assert.equal(visuals.positions.length, visuals.normals.length);
-  assert.equal(visuals.positions.length, visuals.colors.length);
-  assert.ok([...visuals.normals].every(Number.isFinite));
-  assert.ok(visuals.treePositions.length > 0 && visuals.treePositions.length % 18 === 0);
-  assert.equal(visuals.treeUvs.length, visuals.treePositions.length / 3 * 2);
+  assert.deepEqual(visuals.fullDetailIds, refs.filter((ref) => ref.alive || ref.kind === 'tree').map((ref) => ref.id));
   const tree = refs.find((ref) => ref.kind === 'tree')!;
-  const billboards = parseVisual([tree]).treePositions;
-  assert.equal(billboards.length, 36);
-  assert.ok([2, 5, 8, 11, 14, 17].every((i) => billboards[i] === tree.z), 'the first billboard was not an X plane');
-  assert.ok([18, 21, 24, 27, 30, 33].every((i) => billboards[i] === tree.x), 'the second billboard did not intersect it');
+  assert.deepEqual(parseVisual([{ ...tree, alive: false }]).fullDetailIds, [tree.id], 'a felled tree lost its stump reference');
 });
 
 test('static batches include stable stone but exclude movable items and persistent landmarks', () => {
@@ -199,11 +191,13 @@ test('static batches include stable stone but exclude movable items and persiste
   assert.equal(restored.citadel.neverFade, true);
 });
 
-test('terrain quadtree uses 4, 8, 16 and 32 subdivisions with continuous skirted boundaries', () => {
+test('terrain stays at full detail with continuous skirted boundaries across camera movement', () => {
   assert.deepEqual(TERRAIN_LOD_LEVELS, [4, 8, 16, 32]);
   const tiles = selectTerrainTiles({ x: 80, z: 80 });
   assert.equal(tiles.reduce((area, tile) => area + tile.size * tile.size, 0), 512 * 512);
-  assert.ok(new Set(tiles.map((tile) => tile.level)).size >= 3);
+  assert.equal(tiles.length, 64);
+  assert.ok(tiles.every((tile) => tile.level === 32));
+  assert.deepEqual(tiles, selectTerrainTiles({ x: -80, z: -80 }), 'moving the camera rebuilt or simplified the terrain');
   assert.equal(terrainHeight(0, 0), 0);
   const far = { x: 128, z: 128, size: 64, level: 8 as const };
   const geometry = terrainTileGeometry(far);
@@ -1354,6 +1348,26 @@ test('engine: locomotion blends with speed and captured NPCs have a stable pose'
   animateRig(rig, 'captured', 1.1, 0.05, { phase: 0, actionT: 0, speed: 0 });
   assert.ok(rig.bones.lUpperArm.rotation.x < 0, 'captured pose did not bind the arms forward');
   assert.ok(Object.values(rig.bones).every((bone) => Number.isFinite(bone.rotation.x + bone.rotation.y + bone.rotation.z)));
+});
+
+test('full character geometry is batched without losing bone or cape animation', () => {
+  const rig = buildRig({ coat: '#52604a', trim: '#b8a171', skin: '#c99470', pants: '#38342f', hair: '#30251f', cape: true, weapon: 'sword' });
+  let meshes = 0;
+  rig.root.traverse((node) => { if (node instanceof THREE.Mesh) meshes++; });
+  assert.equal(meshes, 1, 'the character was not merged into a single skinned draw');
+  assert.ok(rig.mesh.geometry.attributes.position.count > 500, 'detailed body parts were lost');
+  assert.ok(rig.cape && rig.skeleton.bones.includes(rig.cape), 'cape was not bound to the skeleton');
+  const boneIndex = rig.skeleton.bones.indexOf(rig.bones.lUpperArm);
+  const skinIndices = rig.mesh.geometry.getAttribute('skinIndex');
+  let vertex = 0;
+  while (vertex < skinIndices.count && skinIndices.getX(vertex) !== boneIndex) vertex++;
+  assert.ok(vertex < skinIndices.count, 'arm geometry was not bound to the arm bone');
+  const before = rig.mesh.getVertexPosition(vertex, new THREE.Vector3()).clone();
+  animateRig(rig, 'captured', 1.1, 0.2, { phase: 0, actionT: 0, speed: 0 });
+  rig.root.updateMatrixWorld(true);
+  const after = rig.mesh.getVertexPosition(vertex, new THREE.Vector3());
+  assert.ok(before.distanceTo(after) > 0.05, 'the merged arm did not follow the animated bone');
+  rig.mesh.geometry.dispose(); rig.skeleton.dispose();
 });
 
 test('vivid: a worker whose spot is occupied works beside it instead of freezing', () => {
