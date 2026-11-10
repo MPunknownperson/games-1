@@ -2,15 +2,21 @@
 // with a position and a body, and everything persists exactly where it was left.
 import { repairWorld, verifyWorld, type VerificationIssue } from '../engine/verifier';
 import { ITEMS, type ItemType } from './items';
-import { QUESTS, barkFor, buildOptions, confrontOptions, greetingFor, type DynamicQuestData, type StoryOption } from './story';
+import { QUESTS, barkFor, buildOptions, confrontOptions, greetingFor, type DynamicQuestData, type QuestDef, type StoryOption } from './story';
 import { SPELLS, canSee, chooseGoal, makeAttrs, makeDesires, makePersona, makeRoutine, makeSkills, type Attrs, type Desires, type Goal, type Persona, type Routine, type SkillKind, type Skills, type SpellId, impression } from './vivid';
-import { DUNGEON_SITES, WORLD_LOCATIONS } from './narrative';
+import { DUNGEON_SITES, RADIANT_SITES, WORLD_LOCATIONS } from './narrative';
+import { matchLocationAliases, RADIANT_ITEMS, type LocationAlias, type SiteState } from './radiant';
 import { activePackage, makePackages, type AiPackage } from './packages';
+import { planTactic, type TacticalOrder, type ThreatSignal } from './tactics';
+import { CellStream, EXTERIOR_SPACE, cellKey, interiorSpace, sameSpace, spaceOf, uGridsToLoad, uExteriorCellBuffer } from './cells';
+import { applyChangeForms, baseIdFor, createChangeForms, referenceFor, type ChangeForm, type ObjectReference } from './content';
+import { canRetaliate, foePatrolPoint, FOE_BEHAVIORS, PROFESSION_DUTIES, roleResponse } from './roles';
+import { brainFor } from './brains';
 
 export type Faction = 'citadel' | 'wild' | 'neutral';
 export type ActorKind =
   | 'player' | 'villager' | 'foe' | 'tree' | 'ore' | 'item' | 'rune' | 'echo' | 'citadel' | 'house' | 'camp'
-  | 'tower' | 'barricade' | 'well' | 'table' | 'stall' | 'pillar' | 'roof' | 'ruin' | 'post' | 'note' | 'bell' | 'dungeon' | 'tavern';
+  | 'tower' | 'barricade' | 'well' | 'table' | 'stall' | 'pillar' | 'roof' | 'ruin' | 'post' | 'note' | 'bell' | 'dungeon' | 'tavern' | 'portal' | 'counter';
 export type StructureKind = 'archer' | 'ward' | 'barricade' | 'outpost';
 export type FoeKind = 'slime' | 'brute' | 'wisp' | 'stalker';
 export type WeaponKind = 'fists' | 'club' | 'sword' | 'blade' | 'staff';
@@ -55,6 +61,7 @@ export interface Vendetta {
 
 export interface Actor extends Point {
   id: string; kind: ActorKind; name: string;
+  baseId?: string; spaceId?: string; scale?: number; portalTo?: string; neverFade?: boolean;
   y: number; vx: number; vy: number; vz: number;
   radius: number; height: number; solid: boolean; alive: boolean;
   hp: number; maxHp: number; faction: Faction; facing: number; variant: number;
@@ -62,7 +69,7 @@ export interface Actor extends Point {
   itemType?: ItemType; owner?: string; carriedBy?: string; sleeping?: boolean; thrownBy?: string; thrownAt?: number; restTimer?: number;
   surface?: number;
   profession?: string; home?: Point; work?: Point; social?: Point;
-  memory?: Memory; needs?: Needs; activity?: string; goal?: Point; talkingTo?: string; socialUntil?: number; lookAt?: string;
+  memory?: Memory; needs?: Needs; activity?: string; goal?: Point; talkingTo?: string; socialUntil?: number; lookAt?: string; retaliationUntil?: number;
   decideIn?: number; stuck?: number; detour?: number; detourT?: number; patrol?: Point[]; patrolIndex?: number;
   foeKind?: FoeKind; intent?: 'forage' | 'return' | 'raid' | 'chase' | 'search' | 'flee' | 'guard'; targetId?: string; lastKnown?: Point; lostFor?: number;
   carriedWood?: number; carriedStone?: number; attackCooldown?: number; workCooldown?: number; weaponLevel?: number;
@@ -77,6 +84,8 @@ export interface Actor extends Point {
   weapon?: WeaponKind;
   seatTakenBy?: string; sittingOn?: string; sneaking?: boolean; quarryId?: string;
   familyId?: string; locationId?: string; capturedFor?: string; followingPlayer?: boolean; vendettaFor?: string;
+  questFor?: string; guardPost?: Point;
+  tactic?: TacticalOrder;
   houseId?: string; residents?: string[]; doorLocked?: boolean; homeDefenseUntil?: number; earnTimer?: number; workProgress?: number;
   locked?: number; loot?: ItemType[]; acc?: number; far?: boolean;
   structure?: StructureKind; currentRune?: number; targetRune?: number; stockWood?: number; stockStone?: number;
@@ -97,13 +106,16 @@ export const PLAYER_ID = 'guardian';
 const CITADEL_ID = 'citadel';
 const SAVE_VERSION = 2;
 
-export interface QuestState { stage: string; status: 'active' | 'done'; log: string[]; title?: string; data?: DynamicQuestData }
+export interface QuestState { stage: string; status: 'active' | 'done' | 'failed'; log: string[]; title?: string; data?: DynamicQuestData }
 export interface WorldSave {
-  version: number; seed: number; actors: Actor[]; stock: Stock; pack: Partial<Record<ItemType, number>>;
+  version: number; seed: number; actors?: Actor[]; changeForms?: Record<string, ChangeForm<Actor>>; spawned?: Actor[];
+  stock: Stock; pack: Partial<Record<ItemType, number>>;
   elapsed: number; level: number; xp: number; weaponLevel: number; flags: Record<string, string | number | boolean>;
   quests: Record<string, QuestState>; tracked: string; wave: number; waveCleared: number; bounty: number; standing: number;
   nextId: number; echoProgress: number; echoSolved: boolean; respawn: Point;
   visitedLocations?: string[]; metNpcIds?: string[]; deeds?: Deed[]; vendettas?: Vendetta[];
+  siteStates?: Record<string, SiteState>; nextRadiantQuest?: number; threatSignals?: ThreatSignal[];
+  outsideReturn?: Point & { facing: number }; uGridsToLoad?: number; uExteriorCellBuffer?: number;
 }
 export interface Prompt { name: string; primary?: string; secondary?: string; crime: boolean }
 export interface DialogueView { npcId: string; speaker: string; line: string; options: { id: string; text: string }[]; shop: boolean }
@@ -181,8 +193,8 @@ class Grid {
   }
 }
 
-const INTERACTIVE = new Set<ActorKind>(['item', 'villager', 'tree', 'ore', 'rune', 'echo', 'note', 'camp', 'well', 'house', 'table', 'stall', 'post', 'citadel', 'bell', 'ruin', 'tower', 'barricade', 'dungeon', 'tavern']);
-const STATIC_KINDS = new Set<ActorKind>(['tree', 'ore', 'rune', 'echo', 'citadel', 'house', 'camp', 'tower', 'barricade', 'well', 'table', 'stall', 'pillar', 'ruin', 'post', 'note', 'bell', 'dungeon', 'tavern']);
+const INTERACTIVE = new Set<ActorKind>(['item', 'villager', 'tree', 'ore', 'rune', 'echo', 'note', 'camp', 'well', 'house', 'table', 'stall', 'post', 'citadel', 'bell', 'ruin', 'tower', 'barricade', 'dungeon', 'tavern', 'portal', 'counter']);
+const STATIC_KINDS = new Set<ActorKind>(['tree', 'ore', 'rune', 'echo', 'citadel', 'house', 'camp', 'tower', 'barricade', 'well', 'table', 'stall', 'pillar', 'ruin', 'post', 'note', 'bell', 'dungeon', 'tavern', 'portal', 'counter']);
 const WORK_ACTIVITY: Record<string, string> = {
   Keeper: 'Keeping watch', Merchant: 'Minding the stall', Warden: 'Patrolling', Mason: 'Masonry', Woodcutter: 'Chopping',
   Herbalist: 'Gathering herbs', Farmer: 'Tending fields', Forager: 'Foraging', Apprentice: 'Studying', Smith: 'Forging',
@@ -192,6 +204,13 @@ const WORK_ACTIVITY: Record<string, string> = {
 export class SandboxWorld {
   seed: number;
   actors: Actor[] = [];
+  readonly streamer = new CellStream<Actor>();
+  readonly baseReferences = new Map<string, ObjectReference>();
+  private initialActors = new Map<string, Actor>();
+  renderRevision = 0;
+  uGridsToLoad = uGridsToLoad;
+  uExteriorCellBuffer = uExteriorCellBuffer;
+  outsideReturn?: Point & { facing: number };
   stock: Stock = { gold: 40, wood: 0, stone: 0, essence: 0 };
   pack: Partial<Record<ItemType, number>> = { draught: 1, apple: 2 };
   elapsed = 0;
@@ -201,6 +220,9 @@ export class SandboxWorld {
   flags: Record<string, string | number | boolean> = {};
   quests: Record<string, QuestState> = {};
   visitedLocations: string[] = [];
+  siteStates: Record<string, SiteState> = {};
+  nextRadiantQuest = 1;
+  threatSignals: ThreatSignal[] = [];
   metNpcIds: string[] = [];
   deeds: Deed[] = [];
   vendettas: Vendetta[] = [];
@@ -233,6 +255,7 @@ export class SandboxWorld {
   private spawnTimer = 0;
   private campTimer = 0;
   private questTimer = 0;
+  private tacticTimer = 0;
   private confrontCooldown = 0;
   private staticDirty = true;
   private solidGrid = new Grid(4);
@@ -248,12 +271,27 @@ export class SandboxWorld {
     this.seed = seed;
     this.rng = random(seed);
     this.createWorld();
+    this.createInteriors();
+    for (const actor of this.actors) {
+      this.baseReferences.set(actor.id, referenceFor(actor));
+      this.initialActors.set(actor.id, structuredClone(actor));
+    }
     this.visitedLocations.push('village');
-    this.quests.light = { stage: 'meet', status: 'active', log: [QUESTS.light.stages.meet.journal(this)] };
-    if (saved && saved.version === SAVE_VERSION && Array.isArray(saved.actors)) this.restore(saved);
+    this.quests.light = { stage: 'meet', status: 'active', log: [QUESTS.light.stages.meet.journal(this, 'light')] };
+    if (saved && saved.version === SAVE_VERSION && (Array.isArray(saved.actors) || !!saved.changeForms)) this.restore(saved);
     this.reindex();
   }
 
+  get currentSpace() { return spaceOf(this.player); }
+  isActorLoaded(actor: Actor) { return this.streamer.isLoaded(actor); }
+  reference(id: string) {
+    const actor = this.byId(id);
+    return actor ? referenceFor(actor) : this.baseReferences.get(id);
+  }
+  interiorName() {
+    if (this.currentSpace === EXTERIOR_SPACE) return '';
+    return this.byId(this.currentSpace.slice('interior:'.length))?.name ?? 'Interior';
+  }
   get player() { return this.byId(PLAYER_ID)!; }
   get citadel() { return this.byId(CITADEL_ID)!; }
   get tavern() { return this.actors.find((a) => a.kind === 'tavern' && a.alive); }
@@ -262,7 +300,7 @@ export class SandboxWorld {
   }
   byId(id: string) {
     const cached = this.byIdCache.get(id);
-    if (cached && this.actors.includes(cached)) return cached;
+    if (cached) return cached;
     const found = this.actors.find((a) => a.id === id);
     if (found) this.byIdCache.set(id, found);
     return found;
@@ -281,7 +319,10 @@ export class SandboxWorld {
   private reindex() {
     this.byIdCache.clear();
     for (const a of this.actors) this.byIdCache.set(a.id, a);
+    this.streamer.reconcile(this.actors);
+    this.streamer.update(this.player, this.uGridsToLoad, this.uExteriorCellBuffer);
     this.staticDirty = true;
+    this.renderRevision++;
   }
 
   // ---------------------------------------------------------------- world creation
@@ -290,9 +331,10 @@ export class SandboxWorld {
       id: `a${this.nextId++}`, kind, name, x, z, y: 0, vx: 0, vy: 0, vz: 0, radius: 0.8, height: 3, solid: true, alive: true,
       hp: 100, maxHp: 100, faction: 'neutral', facing: 0, variant: 0, ...o,
     };
+    a.baseId = baseIdFor(a);
     this.actors.push(a);
     this.byIdCache.set(a.id, a);
-    if (STATIC_KINDS.has(kind)) this.staticDirty = true;
+    if (STATIC_KINDS.has(kind)) { this.staticDirty = true; this.renderRevision++; }
     return a;
   }
 
@@ -303,6 +345,76 @@ export class SandboxWorld {
       facing: this.rng() * Math.PI * 2, sleeping: true,
     });
   }
+  random() { return this.rng(); }
+  removeActor(actor: Actor) {
+    if (!this.actors.includes(actor)) return false;
+    actor.alive = false;
+    this.actors = this.actors.filter((a) => a !== actor);
+    this.byIdCache.delete(actor.id);
+    if (STATIC_KINDS.has(actor.kind)) { this.staticDirty = true; this.renderRevision++; }
+    return true;
+  }
+
+  private createInteriors() {
+    const entrances = this.actors.filter((a) => a.kind === 'tavern' || a.kind === 'dungeon' || a.kind === 'house');
+    for (const entrance of entrances) {
+      const spaceId = interiorSpace(entrance.id);
+      entrance.portalTo = spaceId;
+      if (this.actors.some((a) => a.kind === 'portal' && a.spaceId === spaceId)) continue;
+      this.add('portal', 'Back outside', 0, 5.35, { spaceId, portalTo: EXTERIOR_SPACE, radius: 0.65, height: 3, solid: false });
+      if (entrance.kind === 'tavern') {
+        this.add('counter', 'Tavern counter', 0, -4.6, { spaceId, radius: 1.3, height: 1.15, surface: 1.1, solid: true });
+        this.add('table', 'Taproom table', -2.7, -0.6, { spaceId, radius: 0.8, height: 0.9, surface: 0.9 });
+        const jug = this.spawnItem('jug', -2.6, -0.5, 0.9); jug.spaceId = spaceId;
+        const stool = this.spawnItem('stool', -3, 0.9); stool.spaceId = spaceId;
+      } else if (entrance.kind === 'dungeon') {
+        this.add('table', 'Ancient shelf', -2.4, -1.4, { spaceId, radius: 0.8, height: 0.9, surface: 0.9 });
+        const book = this.spawnItem('book', -2.4, -1.4, 0.9); book.spaceId = spaceId;
+        const box = this.spawnItem('strongbox', 2.5, -2.4); box.spaceId = spaceId;
+        box.locked = 24; box.loot = ['pouch', 'herb'];
+      } else {
+        this.add('table', 'Household table', -2.2, -1, { spaceId, radius: 0.75, height: 0.9, surface: 0.9 });
+        const candle = this.spawnItem('candle', -2.2, -1, 0.9); candle.spaceId = spaceId;
+      }
+    }
+  }
+
+  enterInterior(entrance: Actor) {
+    if (this.currentSpace !== EXTERIOR_SPACE || !entrance.portalTo || spaceOf(entrance) !== EXTERIOR_SPACE) return false;
+    const p = this.player;
+    const before = { x: p.x, z: p.z, facing: p.facing };
+    const followers = this.actors.filter((a) => a.followingPlayer && sameSpace(a, p) && distance(a, p) < 6);
+    this.outsideReturn = before;
+    p.spaceId = entrance.portalTo;
+    p.x = 0; p.z = 2.1; p.y = 0; p.vx = p.vy = p.vz = 0; p.facing = Math.PI; p.action = undefined;
+    for (const follower of followers) { follower.spaceId = p.spaceId; follower.x = 1.3; follower.z = 2.8; }
+    const held = this.held(); if (held) held.spaceId = p.spaceId;
+    this.dialogue = null; this.placing = null; this.cameraEvents.length = 0;
+    if (!this.visitedLocations.includes(p.spaceId)) this.visitedLocations.push(p.spaceId);
+    this.streamer.reconcile(this.actors);
+    this.streamer.update(p, this.uGridsToLoad, this.uExteriorCellBuffer);
+    this.staticDirty = true;
+    this.say(`Inside ${entrance.name}.`, undefined, 3);
+    return true;
+  }
+
+  leaveInterior() {
+    if (this.currentSpace === EXTERIOR_SPACE) return false;
+    const p = this.player, room = this.currentSpace;
+    const entrance = this.byId(room.slice('interior:'.length));
+    const point = this.outsideReturn ?? { x: entrance?.x ?? 0, z: (entrance?.z ?? 0) + (entrance?.radius ?? 1) + 1.5, facing: Math.PI };
+    const followers = this.actors.filter((a) => a.followingPlayer && spaceOf(a) === room);
+    p.spaceId = EXTERIOR_SPACE;
+    p.x = point.x; p.z = point.z; p.y = 0; p.vx = p.vy = p.vz = 0; p.facing = point.facing; p.action = undefined;
+    for (const follower of followers) { follower.spaceId = EXTERIOR_SPACE; follower.x = p.x + 1.2; follower.z = p.z + 0.5; }
+    const held = this.held(); if (held) held.spaceId = EXTERIOR_SPACE;
+    this.outsideReturn = undefined;
+    this.streamer.reconcile(this.actors);
+    this.streamer.update(p, this.uGridsToLoad, this.uExteriorCellBuffer);
+    this.staticDirty = true;
+    this.say('Back in the open air.', undefined, 2.5);
+    return true;
+  }
 
   private createWorld() {
     this.add('player', 'The Guardian', 0, 11, {
@@ -310,8 +422,8 @@ export class SandboxWorld {
       attrs: { might: 6, agility: 6, will: 6 }, skills: { blade: 0, guard: 0, stealth: 0, lockpick: 0, speech: 5, magic: 0 },
       spells: [], focus: 66, maxFocus: 66, armor: 0, weapon: 'sword',
     });
-    this.add('citadel', 'The Citadel', 0, -8, { id: CITADEL_ID, radius: 3.6, height: 12, hp: 500, maxHp: 500, faction: 'citadel', stockWood: 8, stockStone: 8, desc: STATIC_DESC.citadel });
-    this.add('camp', 'Wild camp', 5, 57, { radius: 2.6, height: 4, hp: 320, maxHp: 320, faction: 'wild', stockWood: 0, stockStone: 0, desc: 'Hide tents and a crude totem. It smells of smoke and wet fur.' });
+    this.add('citadel', 'The Citadel', 0, -8, { id: CITADEL_ID, radius: 3.6, height: 12, hp: 500, maxHp: 500, faction: 'citadel', stockWood: 8, stockStone: 8, neverFade: true, desc: STATIC_DESC.citadel });
+    this.add('camp', 'Wild camp', 5, 57, { radius: 2.6, height: 4, hp: 320, maxHp: 320, faction: 'wild', locationId: 'southern-camp', stockWood: 0, stockStone: 0, desc: 'Hide tents and a crude totem. It smells of smoke and wet fur.' });
     this.add('bell', 'Warning bell', 4.6, -3.4, { radius: 0.55, height: 3, desc: 'A bronze bell on a timber frame. Rung only when the village is ready to fight.' });
     this.add('well', 'Village well', 6, 0, { radius: 1.2, height: 1, desc: 'Cold, clean water.' });
     this.add('tavern', 'The Kettle & Crown', TAVERN_POINT.x, TAVERN_POINT.z, {
@@ -354,7 +466,8 @@ export class SandboxWorld {
         routine: makeRoutine(this.rng, profession, home, social),
         crowns: profession === 'Merchant' ? 60 : 4 + Math.floor(this.rng() * 20), homeFood: 2,
         items: this.rng() < 0.5 ? { apple: 1 } : {},
-        weapon: profession === 'Warden' ? 'staff' : profession === 'Smith' || profession === 'Woodcutter' ? 'club' : 'fists',
+        weapon: profession === 'Warden' ? 'staff' : profession === 'Scout' ? 'blade'
+          : profession === 'Smith' || profession === 'Woodcutter' || profession === 'Mason' ? 'club' : 'fists',
         spells: (['Apprentice', 'Herbalist', 'Keeper'] as string[]).includes(profession) ? (['mending', 'bolt'] as SpellId[]) : undefined,
         focus: 60, maxFocus: 60, armor: profession === 'Warden' ? 0.2 : 0,
       });
@@ -370,6 +483,7 @@ export class SandboxWorld {
     }
     this.npc('Alden')!.patrol = [{ x: -6, z: 8 }, { x: -14, z: -1 }, { x: -5, z: -14 }, { x: 8, z: -12 }, { x: 9, z: 9 }];
     this.npc('Nell')!.patrol = [{ x: 4.5, z: 25 }, { x: 7, z: 31 }, { x: -1, z: 30 }];
+    this.npc('Vela')!.patrol = [{ x: 10, z: 23 }, { x: 4, z: 29 }, { x: 13, z: 34 }];
 
     // Market stall and bakery: owned goods.
     const stall = this.add('stall', 'Market stall', 9.4, 6.2, { radius: 0.95, height: 0.95, surface: 0.95, desc: STATIC_DESC.stall });
@@ -459,6 +573,7 @@ export class SandboxWorld {
     return this.add('foe', def.name, x, z, {
       foeKind: kind, faction: 'wild', radius: def.radius, height: 1.8, solid: false, hp: def.hp + this.wave * 8, maxHp: def.hp + this.wave * 8,
       intent: raid ? 'raid' : 'forage', carriedWood: 0, carriedStone: 0, attackCooldown: 0, workCooldown: 0, weaponLevel: 1,
+      focus: kind === 'wisp' ? 60 : 0, maxFocus: kind === 'wisp' ? 60 : 0,
       facing: this.rng() * Math.PI * 2,
     });
   }
@@ -466,51 +581,83 @@ export class SandboxWorld {
   // ---------------------------------------------------------------- messages
   say(text: string, speaker?: string, seconds = 4.5) { this.subtitle = { text, speaker, until: this.elapsed + seconds }; }
   notify(text: string) { this.notice = { text, until: this.elapsed + 5 }; }
-  private bark(n: Actor, text: string) { if (distance(n, this.player) < 7 && !this.dialogue) this.say(text, n.name, 2.6); }
+  private bark(n: Actor, text: string) { if (sameSpace(n, this.player) && distance(n, this.player) < 7 && !this.dialogue) this.say(text, n.name, 2.6); }
 
   // ---------------------------------------------------------------- quests
+  private questDefinition(id: string): QuestDef | undefined {
+    return QUESTS[this.quests[id]?.data?.kind ?? id];
+  }
   startQuest(id: string, stage: string) {
     if (this.quests[id]) return;
     const def = QUESTS[id];
-    this.quests[id] = { stage, status: 'active', title: def.title, log: [def.stages[stage].journal(this)] };
+    this.quests[id] = { stage, status: 'active', title: def.title, log: [def.stages[stage].journal(this, id)] };
     this.tracked = id;
     this.notify(`New in your journal: ${def.title}`);
   }
   setStage(id: string, stage: string) {
     const q = this.quests[id];
-    const def = QUESTS[id];
+    const def = this.questDefinition(id);
     if (!q || !def) return;
     q.stage = stage;
     if (stage === 'done') {
       q.status = 'done';
-      this.notify(`${this.questTitle(id)} — completed`);
+      this.releaseQuestSite(id);
+      this.notify(`${this.questTitle(id)} completed`);
       if (this.tracked === id) this.tracked = Object.keys(this.quests).find((k) => this.quests[k].status === 'active') ?? id;
       return;
     }
-    q.log.push(def.stages[stage].journal(this));
+    q.log.push(def.stages[stage].journal(this, id));
     this.notify(`Journal updated: ${this.questTitle(id)}`);
+  }
+  private failRadiantQuest(id: string, reason: string) {
+    const q = this.quests[id];
+    if (!q || q.status !== 'active') return;
+    q.status = 'failed';
+    q.log.push(reason);
+    this.releaseQuestSite(id);
+    if (this.tracked === id) this.tracked = Object.keys(this.quests).find((k) => this.quests[k].status === 'active') ?? id;
+    this.notify(`${this.questTitle(id)} could not be finished`);
+  }
+  private releaseQuestSite(id: string) {
+    const siteId = this.quests[id]?.data?.siteId;
+    const state = siteId ? this.siteStates[siteId] : undefined;
+    if (state?.questId === id) {
+      state.phase = 'recovering';
+      state.questId = undefined;
+      state.readyAt = this.elapsed + 45;
+      state.lastUsed = this.elapsed;
+    }
   }
   journalText(id: string) {
     const q = this.quests[id];
     if (!q) return '';
-    if (q.status === 'done') return q.log[q.log.length - 1];
-    return QUESTS[id].stages[q.stage].journal(this);
+    if (q.status !== 'active') return q.log[q.log.length - 1];
+    return this.questDefinition(id)?.stages[q.stage]?.journal(this, id) ?? '';
   }
   questTitle(id: string) { return this.quests[id]?.title ?? QUESTS[id]?.title ?? id; }
   questTarget(): Point | null {
     const q = this.quests[this.tracked];
     if (!q || q.status !== 'active') return null;
-    return QUESTS[this.tracked].stages[q.stage].target?.(this) ?? null;
+    if (this.currentSpace !== EXTERIOR_SPACE) {
+      const exit = this.actors.find((a) => a.kind === 'portal' && a.spaceId === this.currentSpace);
+      return exit ? { x: exit.x, z: exit.z } : null;
+    }
+    return this.questDefinition(this.tracked)?.stages[q.stage]?.target?.(this, this.tracked) ?? null;
   }
   private updateQuests() {
     for (const [id, q] of Object.entries(this.quests)) {
       if (q.status !== 'active') continue;
-      const next = QUESTS[id].stages[q.stage]?.update?.(this);
+      const data = q.data;
+      if (data && !this.byId(data.patronId)?.alive) { this.failRadiantQuest(id, 'The person who asked for help is gone.'); continue; }
+      if (data?.kind === 'rescue' && !this.byId(data.captiveId)?.alive) { this.failRadiantQuest(id, `${data.captiveName} did not survive.`); continue; }
+      if (data?.kind === 'hunt' && !this.byId(data.enemyId)?.alive) data.defeated = true;
+      const next = this.questDefinition(id)?.stages[q.stage]?.update?.(this, id);
       if (next) this.setStage(id, next);
     }
   }
 
   private updateWorldHistory() {
+    if (this.currentSpace !== EXTERIOR_SPACE) return;
     const p = this.player;
     for (const place of WORLD_LOCATIONS) {
       if (!this.visitedLocations.includes(place.id) && distance(p, place.point) <= place.radius) {
@@ -522,16 +669,74 @@ export class SandboxWorld {
       if (n.kind !== 'villager' || !n.alive || this.metNpcIds.includes(n.id)) continue;
       if (distance(p, n) < 6 && canSee(n, p, 7, this.hour(), p.skills?.stealth ?? 0, !!p.sneaking)) this.metNpcIds.push(n.id);
     }
+    this.refreshSiteStates();
   }
 
+  private refreshSiteStates() {
+    for (const site of RADIANT_SITES) {
+      if (!this.visitedLocations.includes(site.id)) continue;
+      const state = this.siteStates[site.id] ??= { phase: 'uncleared' };
+      if (state.phase === 'occupied') {
+        if (state.questId && this.quests[state.questId]?.status === 'active') continue;
+        state.phase = 'recovering';
+        state.readyAt = this.elapsed + 45;
+        state.lastUsed ??= this.elapsed;
+        state.questId = undefined;
+      }
+      if (state.phase === 'recovering' && (state.readyAt ?? 0) > this.elapsed) continue;
+      const threatened = this.actors.some((a) => a.alive && a.kind === 'foe'
+        && (a.x - site.point.x) ** 2 + (a.z - site.point.z) ** 2 < site.radius ** 2);
+      if (threatened) state.phase = 'uncleared';
+      else state.phase = state.lastUsed === undefined ? 'cleared' : 'reset';
+    }
+  }
+  locationStatus(id: string) {
+    this.refreshSiteStates();
+    return this.visitedLocations.includes(id) ? this.siteStates[id]?.phase ?? 'uncleared' : 'unexplored';
+  }
+  private availableAliases() {
+    this.refreshSiteStates();
+    const readiness = Math.min(3, this.level + (this.weaponLevel > 1 ? 1 : 0));
+    return matchLocationAliases(this.visitedLocations, this.siteStates, this.actors, this.player, readiness, this.nextRadiantQuest);
+  }
+  radiantQuests(): [string, QuestState][] { return Object.entries(this.quests).filter(([, q]) => !!q.data); }
+  hasActiveRadiantFor(patronId: string) {
+    return this.radiantQuests().some(([, q]) => q.status === 'active' && q.data?.patronId === patronId);
+  }
+  canGenerateRadiant(patron: Actor) {
+    return patron.kind === 'villager' && patron.alive && this.metNpcIds.includes(patron.id)
+      && !this.hasActiveRadiantFor(patron.id) && this.availableAliases().length > 0;
+  }
   canGenerateRescue(patron: Actor) {
-    if (patron.kind !== 'villager' || !patron.alive || this.quests.rescue || !this.metNpcIds.includes(patron.id)) return false;
-    if ((patron.memory?.opinion ?? 0) < 10) return false;
-    const captive = this.actors.some((a) => a.kind === 'villager' && a.alive && a !== patron && !a.capturedFor
-      && this.metNpcIds.includes(a.id) && (a.memory?.opinion ?? 0) > 0 && a.profession !== 'Warden');
-    return captive && DUNGEON_SITES.some((site) => !this.visitedLocations.includes(site.id));
+    return this.canGenerateRadiant(patron) && (patron.memory?.opinion ?? 0) >= 10
+      && this.actors.some((a) => a.kind === 'villager' && a.alive && a !== patron && !a.capturedFor
+        && this.metNpcIds.includes(a.id) && (a.memory?.opinion ?? 0) > 0 && a.profession !== 'Warden');
   }
 
+  private nextQuestKey() {
+    let id: string;
+    do { id = `radiant-${this.nextRadiantQuest++}`; } while (this.quests[id]);
+    return id;
+  }
+  private reserveSite(alias: LocationAlias, id: string) {
+    this.siteStates[alias.locationId] = { phase: 'occupied', questId: id, lastUsed: this.siteStates[alias.locationId]?.lastUsed };
+  }
+  private beginRadiant(id: string, data: DynamicQuestData, title: string, alias: LocationAlias) {
+    this.quests[id] = { stage: 'travel', status: 'active', title, log: [], data };
+    this.reserveSite(alias, id);
+    this.quests[id].log.push(QUESTS[data.kind].stages.travel.journal(this, id));
+    this.tracked = id;
+    this.notify(`New in your journal: ${title}`);
+  }
+  private stationGuard(id: string, alias: LocationAlias, x: number, z: number) {
+    const guard = this.spawnFoe('stalker', x, z);
+    guard.name = 'Site guard';
+    guard.intent = 'guard';
+    guard.guardPost = { ...alias.point };
+    guard.lastKnown = { ...alias.point };
+    guard.questFor = id;
+    return guard;
+  }
   generateRescueQuest(patron: Actor) {
     if (!this.canGenerateRescue(patron)) return false;
     const captives = this.actors.filter((a) => a.kind === 'villager' && a.alive && a !== patron && !a.capturedFor
@@ -539,14 +744,9 @@ export class SandboxWorld {
     captives.sort((a, b) => (b.memory?.opinion ?? 0) - (a.memory?.opinion ?? 0) || a.id.localeCompare(b.id));
     const captive = captives[0];
     const readiness = this.level - 1 + (this.weaponLevel > 1 ? 1 : 0) + ((this.player.spells?.length ?? 0) > 0 ? 1 : 0);
-    const sites = DUNGEON_SITES.filter((site) => !this.visitedLocations.includes(site.id));
-    sites.sort((a, b) => {
-      const score = (site: typeof a) => distance(this.player, site.point) * 0.14 + Math.abs(site.difficulty - Math.min(3, readiness)) * 12;
-      return score(a) - score(b);
-    });
-    const site = sites[0];
-    const door = this.actors.find((a) => a.kind === 'dungeon' && a.locationId === site.id);
-    if (!captive || !site || !door) return false;
+    const site = this.availableAliases()[0];
+    if (!captive || !site) return false;
+    const id = this.quests.rescue ? this.nextQuestKey() : 'rescue';
 
     if (captive.sittingOn) this.releaseSeat(captive);
     this.endConversation(captive);
@@ -558,37 +758,77 @@ export class SandboxWorld {
       : readiness >= 2 ? 'The sentries know the tunnels. Expect a fight if you rush in.' : 'The entrance is close; stay quiet and look for a way through.';
     const data: DynamicQuestData = {
       kind: 'rescue', patronId: patron.id, captiveId: captive.id, captiveName: captive.name,
-      dungeonId: site.id, dungeonName: site.name, dungeonActorId: door.id,
+      siteId: site.locationId, siteName: site.locationName, siteActorId: site.actorId,
+      dungeonId: site.locationId, dungeonName: site.locationName, dungeonActorId: site.actorId,
+      aliases: { locationId: site.locationId, locationActorId: site.actorId, personId: captive.id },
       point: { ...site.point }, originalPoint, reward: 25 + readiness * 10, guardCount, approach,
     };
-    const state: QuestState = { stage: 'travel', status: 'active', title: `${captive.name} at ${site.name}`, log: [], data };
-    this.quests.rescue = state;
-    state.log.push(QUESTS.rescue.stages.travel.journal(this));
-    this.tracked = 'rescue';
-    captive.capturedFor = 'rescue';
+    this.beginRadiant(id, data, `${captive.name} at ${site.locationName}`, site);
+    captive.capturedFor = id;
     captive.followingPlayer = false;
     captive.activity = 'Captured';
     captive.utility = undefined;
     captive.goal = undefined;
     captive.action = undefined; captive.actionT = 0; captive.actionDur = 0;
-    captive.x = site.point.x + 2.4;
+    captive.x = site.point.x + (site.kind === 'camp' ? 4.3 : 2.4);
     captive.z = site.point.z + 2.2;
     captive.vx = captive.vz = 0;
     for (let i = 0; i < guardCount; i++) {
       const angle = (i / guardCount) * Math.PI * 2;
-      const guard = this.spawnFoe('stalker', site.point.x + Math.cos(angle) * 5, site.point.z + Math.sin(angle) * 5);
-      guard.name = 'Cell guard';
-      guard.intent = 'guard';
-      guard.lastKnown = { ...site.point };
-      guard.targetId = PLAYER_ID;
+      this.stationGuard(id, site, site.point.x + Math.cos(angle) * 5, site.point.z + Math.sin(angle) * 5);
     }
-    this.notify(`New in your journal: ${state.title}`);
     return true;
   }
 
+  /** Assemble a new objective from a place, a patron, and an item, enemy, or known friend. */
+  generateRadiantQuest(patron: Actor, preferred?: DynamicQuestData['kind']): string | undefined {
+    if (!this.canGenerateRadiant(patron)) return undefined;
+    const cycle: DynamicQuestData['kind'][] = ['retrieve', 'hunt', 'rescue'];
+    let kind = preferred ?? cycle[(this.nextRadiantQuest - 1) % cycle.length];
+    if (kind === 'rescue') {
+      if (this.canGenerateRescue(patron) && this.generateRescueQuest(patron)) return this.tracked;
+      if (preferred) return undefined;
+      kind = this.nextRadiantQuest % 2 ? 'retrieve' : 'hunt';
+    }
+    const alias = this.availableAliases()[0];
+    if (!alias) return undefined;
+    const id = this.nextQuestKey();
+    const base = {
+      patronId: patron.id, siteId: alias.locationId, siteName: alias.locationName, siteActorId: alias.actorId,
+      point: { ...alias.point }, reward: 22 + alias.difficulty * 8 + this.level * 4,
+    };
+    if (kind === 'retrieve') {
+      const itemType = RADIANT_ITEMS[(this.nextRadiantQuest + Math.floor(this.rng() * RADIANT_ITEMS.length)) % RADIANT_ITEMS.length];
+      const item = this.spawnItem(itemType, alias.point.x + 2.4, alias.point.z + 2.3);
+      item.questFor = id;
+      const data: DynamicQuestData = {
+        ...base, kind, itemType, itemName: ITEMS[itemType].name, itemActorId: item.id,
+        aliases: { locationId: alias.locationId, locationActorId: alias.actorId, itemType, itemActorId: item.id },
+      };
+      this.beginRadiant(id, data, `${data.itemName} from ${alias.locationName}`, alias);
+      this.stationGuard(id, alias, alias.point.x - 4.5, alias.point.z + 2.5);
+    } else {
+      const kinds: FoeKind[] = ['brute', 'stalker', 'wisp', 'slime'];
+      const enemyType = kinds[(this.nextRadiantQuest + Math.floor(this.rng() * kinds.length)) % kinds.length];
+      const enemy = this.spawnFoe(enemyType, alias.point.x + 3.8, alias.point.z + 3);
+      enemy.name = `${FOES[enemyType].name} captain`;
+      enemy.questFor = id;
+      enemy.guardPost = { ...alias.point };
+      enemy.intent = 'guard';
+      const data: DynamicQuestData = {
+        ...base, kind: 'hunt', enemyType, enemyName: enemy.name, enemyId: enemy.id,
+        aliases: { locationId: alias.locationId, locationActorId: alias.actorId, enemyType, enemyId: enemy.id },
+      };
+      this.beginRadiant(id, data, `${enemy.name} at ${alias.locationName}`, alias);
+      this.stationGuard(id, alias, alias.point.x - 4.4, alias.point.z + 2.5);
+    }
+    return id;
+  }
+
   rescueCaptive(captive: Actor) {
-    const quest = this.quests.rescue, data = quest?.data;
-    if (!quest || quest.status !== 'active' || quest.stage !== 'free' || !data || data.captiveId !== captive.id || !captive.alive) return false;
+    const id = captive.capturedFor;
+    const quest = id ? this.quests[id] : undefined, data = quest?.data;
+    if (!quest || quest.status !== 'active' || quest.stage !== 'free' || data?.kind !== 'rescue' || data.captiveId !== captive.id || !captive.alive) return false;
     data.rescued = true;
     captive.capturedFor = undefined;
     captive.followingPlayer = true;
@@ -598,24 +838,47 @@ export class SandboxWorld {
     captive.decideIn = 1;
     this.adjustOpinion(captive, 12);
     this.addRumor(captive, 'helped');
-    this.setStage('rescue', 'report');
+    this.setStage(id!, 'report');
     return true;
   }
 
-  finishRescueQuest(patron: Actor) {
-    const quest = this.quests.rescue, data = quest?.data;
-    const captive = data ? this.byId(data.captiveId) : undefined;
-    if (!quest || quest.status !== 'active' || quest.stage !== 'report' || !data || data.patronId !== patron.id || !captive?.alive) return false;
+  finishRescueQuest(patron: Actor, id = this.radiantQuests().find(([, q]) => q.status === 'active' && q.data?.kind === 'rescue' && q.data.patronId === patron.id)?.[0]) {
+    const quest = id ? this.quests[id] : undefined, data = quest?.data;
+    const captive = data?.kind === 'rescue' ? this.byId(data.captiveId) : undefined;
+    if (!id || !quest || quest.status !== 'active' || quest.stage !== 'report' || data?.kind !== 'rescue' || data.patronId !== patron.id || !captive?.alive || !data.rescued) return false;
     this.stock.gold += data.reward;
     this.awardExperience(25);
-    this.addToPack('familyLocket');
+    if (!this.flags.firstRescueReward) { this.addToPack('familyLocket'); this.flags.firstRescueReward = true; }
     this.adjustOpinion(patron, 10);
     this.adjustOpinion(captive, 8);
     captive.followingPlayer = false;
     captive.activity = undefined;
     captive.utility = undefined;
     this.addRumor(patron, 'helped');
-    this.setStage('rescue', 'done');
+    this.setStage(id, 'done');
+    return true;
+  }
+
+  finishRetrieveQuest(id: string, patron: Actor) {
+    const quest = this.quests[id], data = quest?.data;
+    if (!quest || quest.status !== 'active' || quest.stage !== 'report' || data?.kind !== 'retrieve'
+      || data.patronId !== patron.id || !data.recovered || !this.takeFromPack(data.itemType)) return false;
+    this.stock.gold += data.reward;
+    this.awardExperience(18);
+    this.adjustOpinion(patron, 8);
+    this.addRumor(patron, 'helped');
+    this.setStage(id, 'done');
+    return true;
+  }
+
+  finishHuntQuest(id: string, patron: Actor) {
+    const quest = this.quests[id], data = quest?.data;
+    if (!quest || quest.status !== 'active' || quest.stage !== 'report' || data?.kind !== 'hunt' || data.patronId !== patron.id || !data.defeated) return false;
+    this.stock.gold += data.reward;
+    this.awardExperience(22);
+    this.adjustOpinion(patron, 8);
+    this.addRumor(patron, 'helped');
+    this.setStage(id, 'done');
     return true;
   }
 
@@ -692,14 +955,28 @@ export class SandboxWorld {
     if (!this.takeFromPack(type)) return;
     const p = this.player;
     const it = this.spawnItem(type, p.x + Math.sin(p.facing) * 0.8, p.z + Math.cos(p.facing) * 0.8, 1.0);
+    it.spaceId = p.spaceId;
     it.sleeping = false;
+    const reserved = this.radiantQuests().filter(([, q]) => q.status === 'active' && q.data?.kind === 'retrieve'
+      && q.data.recovered && q.data.itemType === type);
+    if ((this.pack[type] ?? 0) < reserved.length && reserved[0]) {
+      const [id, quest] = reserved[0];
+      const data = quest.data;
+      if (data?.kind === 'retrieve') {
+        data.recovered = false;
+        data.itemActorId = it.id;
+        data.aliases.itemActorId = it.id;
+        it.questFor = id;
+        if (quest.stage === 'report') this.setStage(id, 'recover');
+      }
+    }
   }
 
   // ---------------------------------------------------------------- crime
   private witnesses(at: Point, exclude?: string) {
     const sneaking = this.player.sneaking;
     return this.actors.filter((n) => {
-      if (n.kind !== 'villager' || !n.alive || n.id === exclude || n.activity === 'Sleeping') return false;
+      if (n.kind !== 'villager' || !n.alive || !sameSpace(n, this.player) || n.id === exclude || n.activity === 'Sleeping') return false;
       return canSee(n, at, sneaking ? 6 : 13, this.hour(), this.player.skills?.stealth ?? 0, !!sneaking);
     });
   }
@@ -795,6 +1072,7 @@ export class SandboxWorld {
     const owner = this.houseOwner(house);
     if (!owner) { this.say('The door is locked. No one seems to live here.'); return false; }
     if (!this.houseLocked(house)) {
+      if ((owner.memory?.opinion ?? 0) >= 40) return this.enterInterior(house);
       this.say(`${owner.name}'s door is unbarred, though propriety keeps you on the step.`);
       return false;
     }
@@ -875,16 +1153,19 @@ export class SandboxWorld {
   update(dtIn: number) {
     const dt = clamp(dtIn, 0, 0.05);
     this.elapsed += dt;
+    this.streamer.reconcile(this.actors);
+    if (this.streamer.update(this.player, this.uGridsToLoad, this.uExteriorCellBuffer,
+      { x: this.player.vx || this.input.x, z: this.player.vz || this.input.z })) this.staticDirty = true;
     if (this.staticDirty) {
       this.solidGrid.clear();
-      for (const a of this.actors) if (a.alive && a.solid && STATIC_KINDS.has(a.kind)) this.solidGrid.insert(a);
+      for (const a of this.streamer.loadedActors()) if (a.alive && a.solid && STATIC_KINDS.has(a.kind)) this.solidGrid.insert(a);
       this.staticDirty = false;
     }
     this.itemGrid.clear();
     this.chars.length = 0;
     for (const a of this.actors) {
       if (!a.alive) continue;
-      if (a.kind === 'item' && !a.carriedBy) this.itemGrid.insert(a);
+      if (a.kind === 'item' && !a.carriedBy && this.isActorLoaded(a)) this.itemGrid.insert(a);
       else if (a.kind === 'player' || a.kind === 'villager' || a.kind === 'foe') this.chars.push(a);
     }
 
@@ -895,7 +1176,7 @@ export class SandboxWorld {
       // Tiered simulation: nearby minds run every tick, distant ones think and move in longer strides.
       if (a.kind === 'villager' || a.kind === 'foe') {
         const d2 = (a.x - pp.x) ** 2 + (a.z - pp.z) ** 2;
-        a.far = d2 > 55 * 55;
+        a.far = !this.isActorLoaded(a);
         a.acc = (a.acc ?? 0) + dt;
         const step = a.far ? 0.25 : d2 > 30 * 30 ? 0.12 : 0;
         if (step > 0 && a.acc < step) continue;
@@ -929,6 +1210,8 @@ export class SandboxWorld {
     if (this.campTimer >= 5) { this.campTimer = 0; this.updateCamps(); }
     this.questTimer += dt;
     if (this.questTimer >= 0.5) { this.questTimer = 0; this.updateWorldHistory(); this.updateQuests(); this.updateVendettas(); }
+    this.tacticTimer += dt;
+    if (this.tacticTimer >= 0.4) { this.tacticTimer = 0; this.coordinateThreats(); }
     this.confrontCooldown = Math.max(0, this.confrontCooldown - dt);
     if (this.subtitle && this.subtitle.until < this.elapsed) this.subtitle = null;
   }
@@ -936,13 +1219,14 @@ export class SandboxWorld {
   // ---------------------------------------------------------------- movement & physics
   private moveCharacter(a: Actor, dx: number, dz: number) {
     if (!dx && !dz) return;
+    const limit = spaceOf(a) === EXTERIOR_SPACE ? WORLD_LIMIT : 6.3;
     if (a.far && a.kind !== 'player') {
-      a.x = clamp(a.x + dx, -WORLD_LIMIT + a.radius, WORLD_LIMIT - a.radius);
-      a.z = clamp(a.z + dz, -WORLD_LIMIT + a.radius, WORLD_LIMIT - a.radius);
+      a.x = clamp(a.x + dx, -limit + a.radius, limit - a.radius);
+      a.z = clamp(a.z + dz, -limit + a.radius, limit - a.radius);
       return;
     }
-    let nx = clamp(a.x + dx, -WORLD_LIMIT + a.radius, WORLD_LIMIT - a.radius);
-    let nz = clamp(a.z + dz, -WORLD_LIMIT + a.radius, WORLD_LIMIT - a.radius);
+    let nx = clamp(a.x + dx, -limit + a.radius, limit - a.radius);
+    let nz = clamp(a.z + dz, -limit + a.radius, limit - a.radius);
     const near = this.solidGrid.query(nx, nz, a.radius + 4, this.qa);
     for (const o of near) {
       if (!o.alive || !o.solid || a.y > o.height - 0.05) continue;
@@ -991,6 +1275,7 @@ export class SandboxWorld {
     if (it.carriedBy) {
       const c = this.byId(it.carriedBy);
       if (!c || !c.alive || c.hp <= 0) { it.carriedBy = undefined; it.sleeping = false; return; }
+      it.spaceId = c.spaceId;
       const reach = c.radius + def.radius * 0.7 + 0.1;
       it.x = c.x + Math.sin(c.facing) * reach;
       it.z = c.z + Math.cos(c.facing) * reach;
@@ -1000,9 +1285,8 @@ export class SandboxWorld {
       return;
     }
     if (it.sleeping) return;
-    const p = this.player;
-    // Far from the guardian, objects are held exactly where they lie.
-    if (Math.abs(it.x - p.x) > 60 || Math.abs(it.z - p.z) > 60) return;
+    // Unloaded references keep their exact state until their cell is simulated again.
+    if (!this.isActorLoaded(it)) return;
     it.vy -= 20 * dt;
     it.x += it.vx * dt;
     it.z += it.vz * dt;
@@ -1018,8 +1302,9 @@ export class SandboxWorld {
     it.vx *= friction;
     it.vz *= friction;
     if (!onGround) it.facing += dt * 5;
-    it.x = clamp(it.x, -WORLD_LIMIT + 0.5, WORLD_LIMIT - 0.5);
-    it.z = clamp(it.z, -WORLD_LIMIT + 0.5, WORLD_LIMIT - 0.5);
+    const limit = spaceOf(it) === EXTERIOR_SPACE ? WORLD_LIMIT : 6.3;
+    it.x = clamp(it.x, -limit + 0.5, limit - 0.5);
+    it.z = clamp(it.z, -limit + 0.5, limit - 0.5);
 
     for (const o of this.solidGrid.query(it.x, it.z, it.radius + 4, this.qa)) {
       if (!o.alive || !o.solid || it.y >= o.height - 0.02) continue;
@@ -1050,6 +1335,7 @@ export class SandboxWorld {
     const speed = Math.hypot(it.vx, it.vz);
     if (speed > 4 && it.y < 1.9) {
       for (const c of this.chars) {
+        if (!sameSpace(c, it)) continue;
         if (c.id === it.thrownBy && this.elapsed - (it.thrownAt ?? 0) < 0.45) continue;
         if (Math.hypot(c.x - it.x, c.z - it.z) > c.radius + it.radius) continue;
         const dmg = Math.round(def.mass * speed * 0.8 + 4);
@@ -1072,6 +1358,7 @@ export class SandboxWorld {
       const a = cs[i];
       for (let j = i + 1; j < cs.length; j++) {
         const b = cs[j];
+        if (!sameSpace(a, b)) continue;
         const dx = b.x - a.x, dz = b.z - a.z;
         if (Math.abs(dx) > 2 || Math.abs(dz) > 2) continue;
         const d = Math.hypot(dx, dz), min = a.radius + b.radius;
@@ -1097,7 +1384,7 @@ export class SandboxWorld {
         : a.utility?.targetId ?? a.talkingTo ?? a.quarryId ?? a.targetId
           ?? (a.followingPlayer || (a.kind === 'foe' && (a.intent === 'chase' || a.intent === 'raid')) ? PLAYER_ID : undefined);
       for (const other of this.chars) {
-        if (other === a || !other.alive || other.hp <= 0 || other.id === targetId || other.activity === 'Sleeping') continue;
+        if (other === a || !sameSpace(a, other) || !other.alive || other.hp <= 0 || other.id === targetId || other.activity === 'Sleeping') continue;
         const ax = a.x - other.x, az = a.z - other.z;
         const separation = Math.hypot(ax, az), clearance = a.radius + other.radius + 0.55;
         if (separation > 1e-4 && separation < clearance) {
@@ -1263,7 +1550,7 @@ export class SandboxWorld {
     const range = step === 3 ? 2.7 : 2.4;
     let hitAny = false;
     for (const a of this.actors) {
-      if (!a.alive || a.id === PLAYER_ID || a.carriedBy) continue;
+      if (!a.alive || !sameSpace(a, p) || a.id === PLAYER_ID || a.carriedBy) continue;
       const hittable = a.kind === 'foe' || a.kind === 'villager' || a.kind === 'item' || (a.faction === 'wild' && (a.kind === 'tower' || a.kind === 'camp'));
       if (!hittable) continue;
       const d = distance(a, p) - a.radius;
@@ -1289,14 +1576,29 @@ export class SandboxWorld {
     if (hitAny) this.combatUntil = this.elapsed + 6;
   }
 
+  canNpcDamagePlayer(attacker: Actor) {
+    if (attacker.kind !== 'villager' || !attacker.alive || !brainFor(attacker)?.attack) return false;
+    const resisting = attacker.profession === 'Warden' && attacker.activity === 'Fighting' && this.hostileUntil > this.elapsed;
+    return resisting || (canRetaliate(attacker, this.player, this.elapsed)
+      && (attacker.memory?.alarmUntil ?? 0) > this.elapsed);
+  }
+
+  private canNpcFight(attacker: Actor, target: Actor) {
+    return attacker.kind === 'villager' && !!brainFor(attacker)?.attack
+      && (target.kind === 'foe' || (target.kind === 'player' && this.canNpcDamagePlayer(attacker)));
+  }
+
   hurt(target: Actor, damage: number, source?: string) {
     if (!target.alive || target.hp <= 0) return;
+    const attacker = source ? this.byId(source) : undefined;
+    if (target.kind === 'player' && attacker?.kind === 'villager' && !this.canNpcDamagePlayer(attacker)) return;
     if (target.kind === 'player' && this.elapsed < this.invulnUntil) return;
     damage *= 1 - Math.min(0.45, (target.armor ?? 0) + (target.skills?.guard ?? 0) * 0.002);
     if (source && (target.kind === 'player' || target.kind === 'villager' || target.kind === 'foe')) {
       this.trainSkill(target, 'guard', target.kind === 'player' ? 1.5 : 0.8);
     }
     target.hp = Math.max(0, target.hp - damage);
+    if (attacker?.kind === 'foe' && (target.kind === 'player' || target.kind === 'villager')) this.signalThreat(target, attacker);
     if (target.kind === 'player') {
       this.combatUntil = this.elapsed + 6;
       if (target.action !== 'roll') { this.startAction(target, 'hurt', 0.28); this.queuedAttack = false; }
@@ -1315,6 +1617,7 @@ export class SandboxWorld {
       if (target.hp > 0) {
         this.startAction(target, 'hurt', 0.3);
         if (target.memory) { target.memory.alarmUntil = this.elapsed + 30; target.memory.threatId = source; }
+        if (attacker?.kind === 'player' || attacker?.kind === 'foe') target.retaliationUntil = this.elapsed + 12;
         if (source === PLAYER_ID && this.hostileUntil < this.elapsed) this.commitCrime('assault', 0, target);
         return;
       }
@@ -1323,6 +1626,7 @@ export class SandboxWorld {
       target.alive = false;
       target.solid = false;
       target.activity = 'Dead';
+      if (target.capturedFor) this.failRadiantQuest(target.capturedFor, `${target.name} did not survive.`);
       target.capturedFor = undefined;
       target.followingPlayer = false;
       if (source === PLAYER_ID) {
@@ -1339,8 +1643,13 @@ export class SandboxWorld {
     if (target.kind === 'citadel') { this.say('The Citadel light gutters and goes dark.'); return; }
     target.alive = false;
     target.solid = false;
-    if (STATIC_KINDS.has(target.kind)) this.staticDirty = true;
+    if (STATIC_KINDS.has(target.kind)) { this.staticDirty = true; this.renderRevision++; }
     if (target.kind === 'foe' && target.foeKind) {
+      const quest = target.questFor ? this.quests[target.questFor] : undefined;
+      if (quest?.status === 'active' && quest.data?.kind === 'hunt' && quest.data.enemyId === target.id) {
+        quest.data.defeated = true;
+        if (quest.stage !== 'report') this.setStage(target.questFor!, 'report');
+      }
       this.stock.gold += FOES[target.foeKind].bounty;
       this.awardExperience(15);
       if (this.rng() < 0.35) { const h = this.spawnItem('herb', target.x, target.z, 0.6); h.sleeping = false; }
@@ -1397,13 +1706,57 @@ export class SandboxWorld {
     this.say(`${kin.name} has inherited ${victim.name}'s affairs, and sworn the family will have its reckoning.`, kin.name, 5);
   }
 
-  private alertFoe(f: Actor, at: Point) {
+  private planCombatOrder(actor: Actor, target: Actor): TacticalOrder {
+    const order = actor.tactic;
+    if (order && order.targetId === target.id && order.until > this.elapsed
+      && (actor.hp >= actor.maxHp * 0.34 || order.action === 'withdraw')) return order;
+    const allies = this.chars.filter((a) => a !== actor && sameSpace(a, actor) && a.alive && a.hp > 0 && a.faction === actor.faction
+      && (a.kind === 'foe' || a.kind === 'villager') && !a.capturedFor
+      && (a.x - actor.x) ** 2 + (a.z - actor.z) ** 2 < 14 * 14
+      && (a.intent === 'chase' || a.intent === 'raid' || a.intent === 'search' || a.activity === 'Fighting' || a.utility?.kind === 'fight'));
+    const wounded = this.chars.find((a) => a !== actor && a !== target && sameSpace(a, actor) && a.alive && a.hp > 0 && a.hp < a.maxHp * 0.72
+      && a.faction === actor.faction && (a.x - actor.x) ** 2 + (a.z - actor.z) ** 2 < 9 * 9);
+    actor.tactic = planTactic(actor, target, allies, wounded, this.elapsed);
+    return actor.tactic;
+  }
+
+  private signalThreat(source: Actor, target: Actor) {
+    const existing = this.threatSignals.find((s) => s.sourceId === source.id && s.targetId === target.id && s.until > this.elapsed);
+    if (existing) { existing.point = { x: target.x, z: target.z }; existing.until = this.elapsed + 3; return; }
+    this.threatSignals.push({ sourceId: source.id, targetId: target.id, faction: source.faction,
+      point: { x: target.x, z: target.z }, until: this.elapsed + 3 });
+    if (this.threatSignals.length > 24) this.threatSignals.shift();
+  }
+
+  /** Short-lived sightings let nearby allies respond without every mind scanning every actor. */
+  private coordinateThreats() {
+    this.threatSignals = this.threatSignals.filter((s) => s.until > this.elapsed && !!this.byId(s.targetId)?.alive);
+    for (const signal of this.threatSignals) {
+      const target = this.byId(signal.targetId);
+      if (!target) continue;
+      for (const ally of this.chars) {
+        if (!ally.alive || !sameSpace(ally, target) || ally.hp <= 0 || ally.id === signal.sourceId || ally.faction !== signal.faction || ally.capturedFor) continue;
+        if ((ally.x - signal.point.x) ** 2 + (ally.z - signal.point.z) ** 2 > 18 * 18) continue;
+        if (ally.kind === 'foe' && ally.intent !== 'raid' && ally.intent !== 'chase' && ally.intent !== 'flee') {
+          ally.intent = 'search'; ally.targetId = target.id; ally.lastKnown = { ...signal.point }; ally.lostFor = 0;
+        } else if (ally.kind === 'villager' && target.kind === 'foe' && ally.memory) {
+          ally.memory.threatId = target.id;
+          ally.memory.alarmUntil = Math.max(ally.memory.alarmUntil, this.elapsed + 7);
+          ally.decideIn = Math.min(ally.decideIn ?? 0, 0.1);
+        }
+      }
+    }
+  }
+
+  private alertFoe(f: Actor, at: Actor) {
     f.intent = f.intent === 'flee' ? 'flee' : 'chase';
     f.lastKnown = { x: at.x, z: at.z };
     f.lostFor = 0;
+    f.targetId = at.id;
+    this.signalThreat(f, at);
     // Foes call to each other: anyone in earshot comes to look.
     for (const ally of this.chars) {
-      if (ally.kind !== 'foe' || ally === f || !ally.alive) continue;
+      if (ally.kind !== 'foe' || ally === f || !ally.alive || !sameSpace(ally, f)) continue;
       if (distance(ally, f) < 14 && ally.intent !== 'chase' && ally.intent !== 'flee') {
         ally.intent = 'search';
         ally.lastKnown = { x: at.x, z: at.z };
@@ -1422,7 +1775,7 @@ export class SandboxWorld {
     const p = this.player;
     let best: Actor | null = null, bestScore = Infinity;
     for (const a of this.actors) {
-      if (!a.alive || a.id === PLAYER_ID || a.carriedBy || !INTERACTIVE.has(a.kind)) continue;
+      if (!a.alive || !sameSpace(a, p) || a.id === PLAYER_ID || a.carriedBy || !INTERACTIVE.has(a.kind)) continue;
       if ((a.kind === 'camp' && a.faction !== 'citadel') || (a.kind === 'villager' && a.activity === 'Sleeping')) continue;
       const dx = a.x - p.x, dz = a.z - p.z;
       if (Math.abs(dx) > 5 || Math.abs(dz) > 5) continue;
@@ -1457,12 +1810,15 @@ export class SandboxWorld {
       case 'bell': return { name, primary: this.waveActive ? 'Examine' : 'Ring', crime: false };
       case 'camp': return { name, primary: 'Rest', crime: false };
       case 'well': return { name, primary: 'Drink', crime: false };
-      case 'dungeon': return { name, primary: 'Examine', crime: false };
+      case 'dungeon': return { name, primary: 'Enter', crime: false };
       case 'house': {
         const locked = this.houseLocked(a);
-        return { name, primary: locked ? 'Try the door' : 'Examine', secondary: locked ? 'Listen' : 'Look in', crime: locked };
+        const welcome = !locked && (this.houseOwner(a)?.memory?.opinion ?? 0) >= 40;
+        return { name, primary: locked ? 'Try the door' : welcome ? 'Enter' : 'Examine', secondary: locked ? 'Listen' : 'Look in', crime: locked };
       }
       case 'tavern': return { name, primary: 'Enter', secondary: 'Listen', crime: false };
+      case 'portal': return { name, primary: 'Leave', crime: false };
+      case 'counter': return { name, primary: 'Buy a drink', crime: false };
       default: return { name, primary: 'Examine', crime: false };
     }
   }
@@ -1514,12 +1870,18 @@ export class SandboxWorld {
         else this.startWave();
         return false;
       case 'dungeon':
-        this.say(this.examineText(t), undefined, 4.5);
+        this.enterInterior(t);
         return false;
       case 'house':
         this.attemptHouseEntry(t);
         return false;
       case 'tavern':
+        this.enterInterior(t);
+        return false;
+      case 'portal':
+        this.leaveInterior();
+        return false;
+      case 'counter':
         if (this.stock.gold >= 2) {
           this.stock.gold -= 2;
           p.hp = Math.min(p.maxHp, p.hp + 8);
@@ -1581,6 +1943,7 @@ export class SandboxWorld {
     if (!box.loot?.length) { this.say('Empty but for dust.'); return; }
     for (const type of box.loot) {
       const it = this.spawnItem(type, box.x + (this.rng() - 0.5), box.z + 0.8, 1);
+      it.spaceId = box.spaceId;
       it.sleeping = false;
     }
     box.loot = [];
@@ -1603,7 +1966,9 @@ export class SandboxWorld {
     const def = ITEMS[it.itemType!];
     const owned = !!it.owner && it.owner !== 'player';
     const trusted = this.isTrustedHouseholdItem(it);
-    if (owned && !trusted) this.commitCrime('theft', def.value);
+    if (owned && !trusted && !it.questFor) this.commitCrime('theft', def.value);
+    const data = it.questFor ? this.quests[it.questFor]?.data : undefined;
+    if (data?.kind === 'retrieve' && data.itemActorId === it.id) data.recovered = true;
     if (def.stock) this.stock[def.stock] += 2;
     else if (def.gold) this.stock.gold += def.gold;
     else this.addToPack(it.itemType!);
@@ -1663,7 +2028,7 @@ export class SandboxWorld {
       it.vx = Math.sin(a) * 2; it.vz = Math.cos(a) * 2; it.vy = 2.5; it.sleeping = false;
     };
     pop();
-    if (node.hp <= 0) { pop(); node.alive = false; node.solid = false; this.staticDirty = true; }
+    if (node.hp <= 0) { pop(); node.alive = false; node.solid = false; this.staticDirty = true; this.renderRevision++; }
   }
 
   private strikeEcho(t: Actor) {
@@ -1769,7 +2134,9 @@ export class SandboxWorld {
     if (this.stock.wood >= 5) list.push({ id: 'timber', name: 'Five timber', price: Math.round(25 * m), count: Math.floor(this.stock.wood / 5) });
     for (const [type, count] of Object.entries(this.pack) as [ItemType, number][]) {
       if (!count || type === 'ledger') continue;
-      list.push({ id: type, name: ITEMS[type].name, price: Math.max(1, Math.round(ITEMS[type].value * 0.5 * m)), count });
+      const reserved = this.radiantQuests().filter(([, q]) => q.status === 'active' && q.data?.kind === 'retrieve'
+        && q.data.recovered && q.data.itemType === type).length;
+      if (count > reserved) list.push({ id: type, name: ITEMS[type].name, price: Math.max(1, Math.round(ITEMS[type].value * 0.5 * m)), count: count - reserved });
     }
     return list;
   }
@@ -1816,14 +2183,16 @@ export class SandboxWorld {
       return;
     }
     if (n.followingPlayer) {
+      if (!sameSpace(n, p)) { n.activity = 'Waiting'; this.stopMoving(n, dt); return; }
       const d = this.steer(n, p, 2.5, dt, 2.6);
       n.activity = d > 3.5 ? 'Following' : 'Waiting';
       if (d <= 3.5) this.stopMoving(n, dt);
       return;
     }
-    const dp = distance(n, p);
-    const seesPlayer = p.hp > 0 && canSee(n, p, 5, this.hour(), p.skills?.stealth ?? 0, !!p.sneaking);
-    n.lookAt = !asleep && seesPlayer ? PLAYER_ID : n.talkingTo;
+    const dp = sameSpace(n, p) ? distance(n, p) : Infinity;
+    const seesPlayer = p.hp > 0 && sameSpace(n, p) && canSee(n, p, 5, this.hour(), p.skills?.stealth ?? 0, !!p.sneaking);
+    const avoiding = n.utility?.kind === 'warn' || n.utility?.kind === 'shelter' || n.utility?.kind === 'hide';
+    n.lookAt = !asleep && seesPlayer && !avoiding ? PLAYER_ID : n.talkingTo;
     if (dp < 3.2 && seesPlayer && !asleep && this.elapsed - m.lastGreet > 50 && m.alarmUntil < this.elapsed && !n.talkingTo && n.profession !== 'Warden') {
       m.lastGreet = this.elapsed;
       this.bark(n, barkFor(this, n));
@@ -1831,11 +2200,12 @@ export class SandboxWorld {
 
     n.decideIn = (n.decideIn ?? 0) - dt;
     if (n.decideIn <= 0) { this.vividDecide(n); n.decideIn = 0.8 + this.rng() * 0.5; }
+    if (n.utility?.kind !== 'hide' && n.activity === 'Hiding') n.sneaking = false;
 
     const warden = n.profession === 'Warden';
     if (warden && n.quarryId) {
       const q = this.byId(n.quarryId);
-      if (!q || !q.alive || (q.wantedUntil ?? 0) < this.elapsed) n.quarryId = undefined;
+      if (!q || !q.alive || !sameSpace(n, q) || (q.wantedUntil ?? 0) < this.elapsed) n.quarryId = undefined;
       else {
         n.activity = 'Pursuing';
         const d = this.steer(n, q, 4.3, dt, 1.2);
@@ -1854,20 +2224,22 @@ export class SandboxWorld {
         return;
       }
     }
-    if (warden && (n.activity === 'Pursuing' || n.activity === 'Fighting')) {
+    if (warden && !sameSpace(n, p) && (n.activity === 'Pursuing' || n.activity === 'Fighting')) n.activity = 'Patrolling';
+    if (warden && n.activity === 'Fighting' && this.hostileUntil <= this.elapsed && !canRetaliate(n, p, this.elapsed)) {
+      n.activity = this.bounty > 0 ? 'Pursuing' : 'Patrolling';
+    }
+    if (warden && n.activity === 'Fighting' && this.canNpcDamagePlayer(n)) {
+      n.utility = { kind: 'fight', targetId: p.id, until: this.elapsed + 5, score: 3 };
+      this.runGoal(n, dt);
+      return;
+    }
+    if (warden && n.activity === 'Pursuing') {
       n.goal = { x: p.x, z: p.z };
-      const d = this.steer(n, p, n.activity === 'Fighting' ? 4.4 : 4, dt, 1.4);
-      if (d < 1.9) {
+      const d = this.steer(n, p, 4, dt, 1.4);
+      if (d < 1.9 && this.confrontCooldown <= 0 && !this.dialogue && p.hp > 0) {
         this.turnToward(n, angleTo(n, p), 8, dt);
-        if (n.activity === 'Fighting' && n.attackCooldown <= 0) {
-          n.attackCooldown = 1.4;
-          this.startAction(n, 'strike', 0.35);
-          this.hurt(p, this.meleeDamage(n), n.id);
-          this.trainSkill(n, 'blade', 1.5);
-        } else if (n.activity === 'Pursuing' && this.confrontCooldown <= 0 && !this.dialogue && p.hp > 0) {
-          this.confrontCooldown = 25;
-          this.dialogue = { npcId: n.id, line: `Stop right there. You owe ${Math.ceil(this.bounty)} crowns for what you did. Pay up, or come with me.`, options: confrontOptions(this), shop: false };
-        }
+        this.confrontCooldown = 25;
+        this.dialogue = { npcId: n.id, line: `Stop right there. You owe ${Math.ceil(this.bounty)} crowns for what you did. Pay up, or come with me.`, options: confrontOptions(this), shop: false };
       }
       return;
     }
@@ -1890,7 +2262,7 @@ export class SandboxWorld {
     }
     if (n.homeDefenseUntil && n.homeDefenseUntil > this.elapsed) {
       const intruder = this.byId(PLAYER_ID);
-      if (!intruder || intruder.hp <= 0 || distance(n, intruder) > 15) {
+      if (!intruder || !sameSpace(n, intruder) || intruder.hp <= 0 || distance(n, intruder) > 15) {
         n.homeDefenseUntil = 0;
         m.alarmUntil = 0;
         n.utility = undefined;
@@ -1905,28 +2277,28 @@ export class SandboxWorld {
       this.endConversation(n);
       if (n.sittingOn) this.releaseSeat(n);
       const threat = m.threatId ? this.byId(m.threatId) : undefined;
-      const courage = n.persona?.courage ?? 0.5, loyalty = n.persona?.loyalty ?? 0.5;
-      const willDefend = threat?.kind === 'player' ? courage > 0.76 && loyalty > 0.55 : threat?.kind === 'foe' && courage > 0.46;
-      const standsGround = !!threat && threat.alive && threat.hp > 0 && distance(n, threat) < 12 && willDefend && n.hp > n.maxHp * 0.4;
-      if (standsGround) {
-        n.activity = 'Fighting';
-        n.utility = { kind: 'fight', targetId: threat!.id, until: this.elapsed + 8, score: 2.2 };
-      } else {
-        n.utility = { kind: 'flee', targetId: threat?.alive ? threat.id : undefined, until: this.elapsed + 6, score: 2 };
+      if (threat?.alive && sameSpace(n, threat) && distance(n, threat) < 22) {
+        n.utility = roleResponse(this, n, threat, (n.retaliationUntil ?? 0) > this.elapsed);
+        if (n.utility.kind === 'fight') n.activity = 'Fighting';
+        return;
       }
-      return;
+      m.alarmUntil = 0;
+      m.threatId = undefined;
+      if (n.utility?.kind === 'hide') n.sneaking = false;
+      n.utility = undefined;
     }
     if (n.profession === 'Warden') {
       const hostile = this.hostileUntil > this.elapsed;
+      const directAttack = canRetaliate(n, this.player, this.elapsed);
       const pursuitRange = n.activity === 'Pursuing' || n.activity === 'Fighting' ? 22 : 14;
-      const seesPlayer = canSee(n, this.player, pursuitRange, this.hour(), this.player.skills?.stealth ?? 0, !!this.player.sneaking);
-      if ((this.bounty > 0 || hostile) && seesPlayer && this.player.hp > 0) {
-        n.activity = hostile ? 'Fighting' : 'Pursuing';
+      const seesPlayer = sameSpace(n, this.player) && canSee(n, this.player, pursuitRange, this.hour(), this.player.skills?.stealth ?? 0, !!this.player.sneaking);
+      if ((this.bounty > 0 || hostile || directAttack) && seesPlayer && this.player.hp > 0) {
+        n.activity = hostile || directAttack ? 'Fighting' : 'Pursuing';
         this.endConversation(n);
         return;
       }
       if (n.activity === 'Pursuing' || n.activity === 'Fighting') n.activity = 'Patrolling';
-      const criminal = this.chars.find((a) => a.kind === 'villager' && a.id !== n.id && (a.wantedUntil ?? 0) > this.elapsed && distance(a, n) < 18);
+      const criminal = this.chars.find((a) => a.kind === 'villager' && a.id !== n.id && sameSpace(a, n) && (a.wantedUntil ?? 0) > this.elapsed && distance(a, n) < 18);
       if (criminal) { n.quarryId = criminal.id; return; }
     }
     if (n.activity === 'Sleeping' && n.needs!.energy < 0.65 && this.hour() < (n.routine?.wake ?? 6.5)) {
@@ -1935,7 +2307,7 @@ export class SandboxWorld {
     }
     const cur = n.utility;
     if (cur && cur.until > this.elapsed && this.goalValid(n, cur)) {
-      const next = chooseGoal(this, n);
+      const next = this.chooseNpcGoal(n);
       if (next.kind === cur.kind && next.targetId === cur.targetId) { cur.score = next.score; return; }
       const immediate = next.kind === 'flee' || (next.kind === 'heal' && n.hp < n.maxHp * 0.55);
       if (!immediate && (next.score ?? 0) <= (cur.score ?? 0.45) + 0.18) return;
@@ -1944,7 +2316,13 @@ export class SandboxWorld {
       return;
     }
     if (n.sittingOn && cur?.kind !== 'sit') this.releaseSeat(n);
-    n.utility = chooseGoal(this, n);
+    n.utility = this.chooseNpcGoal(n);
+  }
+
+  private chooseNpcGoal(n: Actor): Goal {
+    const needs = chooseGoal(this, n);
+    const profession = brainFor(n)?.onRoutine(this, n);
+    return profession && (profession.score ?? 0) > (needs.score ?? 0) ? profession : needs;
   }
 
   private goalValid(n: Actor, g: Goal): boolean {
@@ -1953,35 +2331,42 @@ export class SandboxWorld {
       case 'sleep': return needs.energy < 0.92;
       case 'eatFood': return needs.hunger > 0.18 && !!this.firstFood(n);
       case 'eatHome': return needs.hunger > 0.18 && (n.homeFood ?? 0) > 0;
-      case 'buyFood': return needs.hunger > 0.18 && (n.crowns ?? 0) >= 5 && this.actors.some((a) => a.kind === 'stall' && a.alive);
+      case 'buyFood': return needs.hunger > 0.18 && (n.crowns ?? 0) >= 5 && this.actors.some((a) => a.kind === 'stall' && a.alive && sameSpace(a, n));
       case 'steal': {
         const t = g.targetId ? this.byId(g.targetId) : undefined;
-        return !!t && t.alive && !t.carriedBy && needs.hunger > 0.3 && (t.itemType === 'strongbox' || (!!t.owner && ['bread', 'apple', 'cheese'].includes(t.itemType ?? '')));
+        return !!t && t.alive && sameSpace(t, n) && !t.carriedBy && needs.hunger > 0.3 && (t.itemType === 'strongbox' || (!!t.owner && ['bread', 'apple', 'cheese'].includes(t.itemType ?? '')));
       }
       case 'scavenge': {
         const t = g.targetId ? this.byId(g.targetId) : undefined;
-        return !!t && t.alive && !t.carriedBy && !t.owner && (t.itemType === 'pouch' || ['bread', 'apple', 'cheese', 'herb'].includes(t.itemType ?? ''));
+        return !!t && t.alive && sameSpace(t, n) && !t.carriedBy && !t.owner && (t.itemType === 'pouch' || ['bread', 'apple', 'cheese', 'herb'].includes(t.itemType ?? ''));
       }
       case 'sit': {
         const seat = g.targetId ? this.byId(g.targetId) : undefined;
         const claimed = !!seat && this.actors.some((other) => other !== n && other.alive && other.utility?.kind === 'sit'
           && other.utility.targetId === seat.id && other.utility.until > this.elapsed);
-        return !!seat && seat.alive && !seat.carriedBy && !claimed && (!seat.seatTakenBy || seat.seatTakenBy === n.id) && (needs.energy < 0.9 || needs.fun > 0.25);
+        return !!seat && seat.alive && sameSpace(seat, n) && !seat.carriedBy && !claimed && (!seat.seatTakenBy || seat.seatTakenBy === n.id) && (needs.energy < 0.9 || needs.fun > 0.25);
       }
       case 'chat': return needs.social > 0.12 || !!n.talkingTo;
       case 'work': { const h = this.hour(), r = n.routine!; return h >= r.workStart - 0.3 && h < r.workEnd + 0.3; }
       case 'stroll': return needs.fun > 0.15;
-      case 'heal': { const t = g.targetId ? this.byId(g.targetId) : undefined; return !!t && t.alive && t.hp < t.maxHp * 0.95; }
+      case 'heal': { const t = g.targetId ? this.byId(g.targetId) : undefined; return !!t && t.alive && sameSpace(t, n) && t.hp < t.maxHp * 0.95; }
       case 'fight': {
         const t = g.targetId ? this.byId(g.targetId) : undefined;
-        const retaliation = t?.kind === 'player' && n.memory?.threatId === t.id && (n.memory.alarmUntil ?? 0) > this.elapsed;
-        return !!t && t.alive && t.hp > 0 && distance(t, n) < 16 && (t.kind === 'foe' || retaliation);
+        return !!t && t.alive && sameSpace(t, n) && t.hp > 0 && distance(t, n) < 16 && this.canNpcFight(n, t);
       }
       case 'castBolt': {
         const t = g.targetId ? this.byId(g.targetId) : undefined;
-        return !!t && t.alive && t.kind === 'foe' && (n.spells ?? []).includes('bolt') && (n.focus ?? 0) >= SPELLS.bolt.cost;
+        return !!t && t.alive && sameSpace(t, n) && t.kind === 'foe' && (n.spells ?? []).includes('bolt') && (n.focus ?? 0) >= SPELLS.bolt.cost;
       }
-      case 'flee': { const t = g.targetId ? this.byId(g.targetId) : undefined; return !!t && t.alive && distance(t, n) < 14; }
+      case 'flee': { const t = g.targetId ? this.byId(g.targetId) : undefined; return !!t && t.alive && sameSpace(t, n) && distance(t, n) < 14; }
+      case 'warn': case 'shelter': case 'hide': {
+        const t = g.targetId ? this.byId(g.targetId) : undefined;
+        return !!t && t.alive && sameSpace(t, n) && ((n.memory?.alarmUntil ?? 0) > this.elapsed || distance(t, n) < 18);
+      }
+      case 'holdGround': {
+        const t = g.targetId ? this.byId(g.targetId) : undefined;
+        return !!t && t.alive && sameSpace(t, n) && distance(t, g.point ?? n) < 20;
+      }
       case 'confront': return !!n.homeDefenseUntil && n.homeDefenseUntil > this.elapsed;
       case 'tavern': return (n.crowns ?? 0) >= 2 || (n.needs?.hunger ?? 0) > 0.2;
       case 'earnFood': return (n.crowns ?? 0) < 6 && !!n.work;
@@ -1995,6 +2380,15 @@ export class SandboxWorld {
     const seat = this.byId(n.sittingOn);
     if (seat && seat.seatTakenBy === n.id) seat.seatTakenBy = undefined;
     n.sittingOn = undefined;
+  }
+
+  private performProfessionWork(n: Actor, dt: number) {
+    const brain = brainFor(n);
+    if (!brain) return;
+    n.workProgress = (n.workProgress ?? 0) + dt;
+    if (n.workProgress < brain.workInterval) return;
+    n.workProgress -= brain.workInterval;
+    brain.onWork(this, n);
   }
 
   /** Execute the current goal: steer, arrive, act. Goals resolve their own targets as the world changes. */
@@ -2178,11 +2572,11 @@ export class SandboxWorld {
         break;
       }
       case 'work': {
-        if (n.profession === 'Warden' && n.patrol) {
+        if ((n.profession === 'Warden' || n.profession === 'Scout') && n.patrol) {
           const tgt = n.patrol[n.patrolIndex ?? 0];
           if (distance(n, tgt) < 1.2) n.patrolIndex = ((n.patrolIndex ?? 0) + 1) % n.patrol.length;
-          go(n.patrol[n.patrolIndex ?? 0], 1.5, 0.6);
-          n.activity = 'Patrolling';
+          go(n.patrol[n.patrolIndex ?? 0], n.profession === 'Scout' ? 2 : 1.5, 0.6);
+          n.activity = n.profession === 'Scout' ? 'Scouting' : 'Patrolling';
           break;
         }
         let spot = n.work!;
@@ -2201,6 +2595,7 @@ export class SandboxWorld {
           this.stopMoving(n, dt);
           if (n.activity === 'Chopping' && this.rng() < dt / 22) this.citadel.stockWood = Math.min(60, (this.citadel.stockWood ?? 0) + 1);
           if (n.activity === 'Masonry' && this.rng() < dt / 26) this.citadel.stockStone = Math.min(60, (this.citadel.stockStone ?? 0) + 1);
+          this.performProfessionWork(n, dt);
         }
         break;
       }
@@ -2238,17 +2633,26 @@ export class SandboxWorld {
       }
       case 'fight': {
         const t = g.targetId ? this.byId(g.targetId) : undefined;
-        if (!t || !t.alive || t.hp <= 0 || (t.kind !== 'foe' && !(t.kind === 'player' && n.memory?.threatId === t.id && (n.memory.alarmUntil ?? 0) > this.elapsed))) { n.utility = undefined; break; }
-        const reach = 1.15 + WEAPONS[n.weapon ?? 'fists'].reach + t.radius;
-        const d = go(t, 3.4, reach * 0.8);
+        const style = brainFor(n)?.attack;
+        if (!t || !t.alive || t.hp <= 0 || !this.canNpcFight(n, t) || !style) { n.utility = undefined; break; }
+        const order = this.planCombatOrder(n, t);
+        if (order.action === 'withdraw') { n.utility = { kind: 'flee', targetId: t.id, until: this.elapsed + 5, score: 2.5 }; break; }
+        if (order.action === 'support' && order.allyId) { n.utility = { kind: 'heal', targetId: order.allyId, until: this.elapsed + 5, score: 2.4 }; break; }
+        const reach = 1.15 + WEAPONS[n.weapon ?? 'fists'].reach + t.radius + style.reach;
+        if (order.action === 'flank' && order.point && distance(n, order.point) > 0.9 && distance(n, t) > reach + 0.35) {
+          go(order.point, style.speed, 0.6);
+          n.activity = 'Flanking';
+          break;
+        }
+        const d = go(t, style.speed, reach * 0.8);
         n.activity = 'Fighting';
         if (d <= reach + 0.35) {
           this.turnToward(n, angleTo(n, t), 7, dt);
           this.stopMoving(n, dt);
           if ((n.attackCooldown ?? 0) <= 0 && !n.action) {
             n.targetId = t.id;
-            n.attackCooldown = 1.35;
-            this.startAction(n, 'windup', 0.45);
+            n.attackCooldown = style.cooldown;
+            this.startAction(n, 'windup', style.windup);
           }
         }
         break;
@@ -2256,9 +2660,14 @@ export class SandboxWorld {
       case 'castBolt': {
         const t = g.targetId ? this.byId(g.targetId) : undefined;
         if (!t || !t.alive || t.kind !== 'foe' || (n.focus ?? 0) < SPELLS.bolt.cost) { n.utility = undefined; break; }
-        const d = go(t, 2.2, SPELLS.bolt.range - 0.6);
+        const order = this.planCombatOrder(n, t);
+        if (order.action === 'withdraw') { n.utility = { kind: 'flee', targetId: t.id, until: this.elapsed + 5, score: 2.5 }; break; }
+        if (order.action === 'support' && order.allyId) { n.utility = { kind: 'heal', targetId: order.allyId, until: this.elapsed + 5, score: 2.4 }; break; }
+        const near = distance(n, t) < 4;
+        const d = near ? go({ x: n.x + (n.x - t.x) * 2, z: n.z + (n.z - t.z) * 2 }, 2.8, 0.6)
+          : go(t, 2.2, SPELLS.bolt.range - 0.6);
         n.activity = d <= SPELLS.bolt.range ? 'Casting' : 'Closing in';
-        if (d <= SPELLS.bolt.range) {
+        if (!near && d <= SPELLS.bolt.range) {
           this.stopMoving(n, dt);
           this.turnToward(n, angleTo(n, t), 5, dt);
           if ((n.workCooldown ?? 0) <= 0) {
@@ -2273,6 +2682,40 @@ export class SandboxWorld {
         const away = threat && distance(threat, n) < 10 ? { x: n.x + (n.x - threat.x) * 2, z: n.z + (n.z - threat.z) * 2 } : n.home!;
         go(away, 3.9, 0.4);
         n.activity = 'Fleeing';
+        break;
+      }
+      case 'warn': {
+        const d = go(g.point ?? n.social ?? n.home!, 2.7, 0.8);
+        n.activity = d < 1.5 ? 'Calling wardens' : 'Seeking wardens';
+        if ((n.workCooldown ?? 0) <= 0) { this.noise(n, 11); n.workCooldown = 5; }
+        break;
+      }
+      case 'shelter': {
+        const d = go(g.point ?? n.home!, 3, 0.6);
+        n.activity = d < 1.2 ? 'Sheltering' : 'Heading for shelter';
+        if (d < 1.2) this.stopMoving(n, dt);
+        break;
+      }
+      case 'hide': {
+        const threat = g.targetId ? this.byId(g.targetId) : undefined;
+        const away = threat && distance(threat, n) < 7
+          ? { x: n.x + (n.x - threat.x) * 2, z: n.z + (n.z - threat.z) * 2 } : g.point ?? n.home!;
+        n.sneaking = true;
+        const d = go(away, 2.6, 0.7);
+        n.activity = 'Hiding';
+        if (d < 1) this.stopMoving(n, dt);
+        break;
+      }
+      case 'holdGround': {
+        const threat = g.targetId ? this.byId(g.targetId) : undefined;
+        if (!threat?.alive || !sameSpace(n, threat)) { n.utility = undefined; break; }
+        if (distance(n, threat) < 3.4 && n.hp > n.maxHp * 0.38) {
+          n.utility = { kind: n.spells?.includes('bolt') && (n.focus ?? 0) >= 20 ? 'castBolt' : 'fight',
+            targetId: threat.id, until: this.elapsed + 5, score: 2.5 };
+          break;
+        }
+        go(g.point ?? n.work ?? n, 2.1, 0.7);
+        n.activity = 'Holding position';
         break;
       }
       case 'investigate': {
@@ -2294,7 +2737,7 @@ export class SandboxWorld {
     const sneaking = !!thief.sneaking || thief.activity === 'Sneaking';
     const seen: Actor[] = [];
     for (const o of this.chars) {
-      if (o === thief || !o.alive || o.hp <= 0) continue;
+      if (o === thief || !sameSpace(o, thief) || !o.alive || o.hp <= 0) continue;
       if (o.kind !== 'villager' && o.kind !== 'player') continue;
       if (o.kind === 'villager' && o.activity === 'Sleeping') continue;
       if (canSee(o, at, 8.7, this.hour(), stealth, sneaking)) seen.push(o);
@@ -2314,19 +2757,23 @@ export class SandboxWorld {
   /** A villager's blow, resolved when their wind-up completes. Uses the same melee rules as foes. */
   private npcStrike(n: Actor) {
     const t = n.targetId ? this.byId(n.targetId) : undefined;
-    if (!t || !t.alive || (t.kind !== 'foe' && !(t.kind === 'player' && n.memory?.threatId === t.id && (n.memory.alarmUntil ?? 0) > this.elapsed))) return;
-    if (distance(n, t) > 1.3 + WEAPONS[n.weapon ?? 'fists'].reach + t.radius) return;
-    this.hurt(t, this.meleeDamage(n), n.id);
+    const style = brainFor(n)?.attack;
+    if (!t || !t.alive || !sameSpace(n, t) || !this.canNpcFight(n, t) || !style) return;
+    if (distance(n, t) > 1.3 + WEAPONS[n.weapon ?? 'fists'].reach + t.radius + style.reach) return;
+    this.hurt(t, this.meleeDamage(n) * style.damage, n.id);
     this.trainSkill(n, 'blade', 1.5);
     if (t.kind === 'foe') { t.targetId = n.id; this.alertFoe(t, n); }
   }
 
   /** Sounds carry. Curious villagers come and look; wardens come faster. */
-  noise(at: Point, radius = 7) {
+  noise(at: Point & { spaceId?: string }, radius = 7) {
     for (const n of this.chars) {
       if (n.kind !== 'villager' || !n.alive || n.activity === 'Sleeping' || n.activity === 'Fleeing') continue;
+      if (!sameSpace(n, at)) continue;
+      if ((n.memory?.alarmUntil ?? 0) > this.elapsed && n.memory?.threatId) continue;
       if (distance(n, at) > radius) continue;
-      if (n.profession === 'Warden' || (n.persona?.courage ?? 0) > 0.35 || (n.persona?.curiosity ?? 0) > 0.62) {
+      const duty = PROFESSION_DUTIES[n.profession ?? ''];
+      if (duty === 'patrol' || duty === 'scout' || (duty === 'heal' && (n.persona?.curiosity ?? 0) > 0.7)) {
         n.utility = { kind: 'investigate', point: { x: at.x, z: at.z }, until: this.elapsed + 16 };
         n.decideIn = Math.min(n.decideIn ?? 0, 2.5);
       }
@@ -2349,7 +2796,8 @@ export class SandboxWorld {
     if ((caster.focus ?? 0) < SPELLS.mending.cost || (caster.kind !== 'foe' && !caster.spells?.includes('mending'))) return false;
     let target: Actor | undefined, worst = 1;
     for (const a of this.actors) {
-      if (!a.alive || a.hp <= 0) continue;
+      if (!a.alive || !sameSpace(a, caster) || a.hp <= 0) continue;
+      if (caster.memory?.threatId === a.id && caster.memory.alarmUntil > this.elapsed) continue;
       const ally = caster.faction === 'wild' ? a.kind === 'foe' : a.kind === 'villager' || a.kind === 'player';
       if (!ally || distance(a, caster) > SPELLS.mending.range) continue;
       const f = a.hp / a.maxHp;
@@ -2388,6 +2836,7 @@ export class SandboxWorld {
   }
 
   private isHostile(caster: Actor, target: Actor) {
+    if (!sameSpace(caster, target)) return false;
     if (caster.faction === 'wild') return target.faction === 'citadel' || target.kind === 'player';
     return target.kind === 'foe' || target.faction === 'wild';
   }
@@ -2430,8 +2879,10 @@ export class SandboxWorld {
   // ---------------------------------------------------------------- the wilds
   private updateFoe(f: Actor, dt: number) {
     const def = FOES[f.foeKind!];
+    const behavior = FOE_BEHAVIORS[f.foeKind!];
     f.attackCooldown = Math.max(0, (f.attackCooldown ?? 0) - dt);
     f.workCooldown = Math.max(0, (f.workCooldown ?? 0) - dt);
+    if (f.foeKind === 'wisp') this.regenerateFocus(f, dt);
     if (f.action) {
       f.actionT! += dt;
       if (f.action === 'windup') {
@@ -2441,21 +2892,28 @@ export class SandboxWorld {
       } else if (f.actionT! >= f.actionDur!) f.action = undefined;
       if (f.action) { this.stopMoving(f, dt); return; }
     }
-    if (f.foeKind === 'wisp' && f.workCooldown <= 0) {
-      const ally = this.chars.find((a) => a.kind === 'foe' && a !== f && a.hp < a.maxHp * 0.8 && distance(a, f) < 6);
-      if (ally) { ally.hp = Math.min(ally.maxHp, ally.hp + 14); f.workCooldown = 3; }
+    if (f.foeKind === 'wisp' && f.workCooldown <= 0 && (f.focus ?? 0) >= SPELLS.mending.cost) {
+      const ally = this.chars.find((a) => a.kind === 'foe' && a !== f && a.alive && a.hp > 0 && a.hp < a.maxHp * 0.7 && distance(a, f) < 6);
+      if (ally && this.castMending(f)) { f.workCooldown = 3; return; }
     }
     const p = this.player;
-    const dp = distance(f, p);
+    const playerHere = sameSpace(f, p);
+    const dp = playerHere ? distance(f, p) : Infinity;
     const closeSighting = p.sneaking ? dp < 4.5 : dp < 8;
-    const sees = p.hp > 0 && (closeSighting || canSee(f, p, p.sneaking ? 12 : 15, this.hour(), p.skills?.stealth ?? 0, !!p.sneaking));
+    const sees = playerHere && p.hp > 0 && (closeSighting || canSee(f, p, p.sneaking ? 12 : 15, this.hour(), p.skills?.stealth ?? 0, !!p.sneaking));
+    if (!playerHere && f.intent === 'chase') { f.intent = 'search'; f.targetId = undefined; }
+    if (!playerHere && f.intent === 'flee') f.intent = 'return';
     if (sees && f.intent !== 'chase' && f.intent !== 'flee') this.alertFoe(f, p);
     if (sees) { f.lastKnown = { x: p.x, z: p.z }; f.lostFor = 0; }
-    if (f.intent === 'guard' && !sees) { this.stopMoving(f, dt); return; }
+    if (f.intent === 'guard' && !sees) {
+      if (f.guardPost && distance(f, f.guardPost) > 1.5) this.steer(f, f.guardPost, def.speed, dt, 1);
+      else this.stopMoving(f, dt);
+      return;
+    }
     if (f.hp < f.maxHp * 0.3 && def.courage < 0.5 && dp < 12) f.intent = 'flee';
 
     if (f.intent === 'flee') {
-      const away = { x: f.x + (f.x - p.x), z: f.z + (f.z - p.z) };
+      const away = f.tactic?.action === 'withdraw' && f.tactic.point ? f.tactic.point : { x: f.x + (f.x - p.x), z: f.z + (f.z - p.z) };
       this.steer(f, away, def.speed * 1.1, dt);
       if (dp > 20) f.intent = 'return';
       return;
@@ -2467,17 +2925,42 @@ export class SandboxWorld {
       }
       let target: Actor = p;
       const quarry = f.targetId ? this.byId(f.targetId) : undefined;
-      if (quarry && quarry.alive && quarry.kind === 'villager' && distance(quarry, f) < 9) target = quarry;
-      if (f.intent === 'raid' && (!sees || dp > 6)) {
-        target = this.actors.find((a) => a.alive && a.faction === 'citadel' && (a.kind === 'tower' || a.kind === 'barricade' || a.kind === 'camp') && distance(a, f) < 6) ?? this.citadel;
+      if (quarry && quarry.alive && sameSpace(quarry, f) && quarry.kind === 'villager' && distance(quarry, f) < 9) target = quarry;
+      if (f.foeKind === 'brute' && f.intent === 'raid') {
+        target = this.actors.find((a) => a.alive && sameSpace(a, f) && a.faction === 'citadel'
+          && (a.kind === 'tower' || a.kind === 'barricade' || a.kind === 'camp') && distance(a, f) < 14) ?? this.citadel;
+        if (sees && dp < 2.8) target = p;
+      } else if (f.intent === 'raid' && (!sees || dp > 6)) {
+        target = this.actors.find((a) => a.alive && sameSpace(a, f) && a.faction === 'citadel' && (a.kind === 'tower' || a.kind === 'barricade' || a.kind === 'camp') && distance(a, f) < 6) ?? this.citadel;
       }
-      if (target === p && p.hp <= 0) { f.intent = f.intent === 'raid' ? 'raid' : 'return'; return; }
+      if (target === p && (!playerHere || p.hp <= 0)) { f.intent = f.intent === 'raid' ? 'raid' : 'return'; return; }
       const reach = def.reach + target.radius;
       const d = distance(f, target);
-      if (f.foeKind === 'wisp' && d > reach && d < 10 && f.workCooldown <= 0) {
-        f.workCooldown = 3.2;
-        f.focus = 99; f.maxFocus = 99;
-        this.castBolt(f, target);
+      const order = this.planCombatOrder(f, target);
+      if (order.action === 'withdraw' && order.point) {
+        f.intent = 'flee';
+        this.steer(f, order.point, def.speed * 1.1, dt);
+        return;
+      }
+      if (order.action === 'hold' && f.guardPost) { f.intent = 'guard'; this.steer(f, f.guardPost, def.speed, dt, 1); return; }
+      if (order.action === 'support' && order.allyId) {
+        const ally = this.byId(order.allyId);
+        if (ally?.alive) {
+          if (distance(f, ally) > 6) this.steer(f, ally, def.speed, dt, 5);
+          else if (f.workCooldown <= 0 && this.castMending(f)) f.workCooldown = 3;
+          else this.stopMoving(f, dt);
+          return;
+        }
+      }
+      if (order.action === 'flank' && order.point && d > reach + 0.4 && distance(f, order.point) > 0.8) {
+        this.steer(f, order.point, def.speed * 1.12, dt, 0.6);
+        return;
+      }
+      if (order.action === 'ranged' && f.foeKind === 'wisp') {
+        if (d < 4) this.steer(f, { x: f.x + (f.x - target.x) * 2, z: f.z + (f.z - target.z) * 2 }, def.speed, dt);
+        else if (d > 10) this.steer(f, target, def.speed, dt, 9);
+        else this.stopMoving(f, dt);
+        if (d < SPELLS.bolt.range && f.workCooldown <= 0 && this.castBolt(f, target)) f.workCooldown = 3.2;
         return;
       }
       if (d <= reach) {
@@ -2495,11 +2978,21 @@ export class SandboxWorld {
       const tgt = f.lastKnown ?? this.camp;
       const d = this.steer(f, tgt, def.speed * 0.8, dt, 1);
       f.lostFor = (f.lostFor ?? 0) + dt;
-      if (d < 1.2 || (f.lostFor ?? 0) > 9) f.intent = 'return';
+      if (d < 1.2 || (f.lostFor ?? 0) > 9) f.intent = f.guardPost ? 'guard' : 'return';
+      return;
+    }
+    if (f.guardPost && f.intent === 'return') {
+      const d = this.steer(f, f.guardPost, def.speed, dt, 1);
+      if (d < 1.4) f.intent = 'guard';
       return;
     }
     // Forage and return: workers decide from their own load and the camp's needs.
-    const camp = this.actors.filter((a) => a.kind === 'camp' && a.faction === 'wild' && a.alive).sort((a, b) => distance(a, f) - distance(b, f))[0];
+    let camp: Actor | undefined, campDistance = Infinity;
+    for (const candidate of this.actors) {
+      if (candidate.kind !== 'camp' || candidate.faction !== 'wild' || !candidate.alive) continue;
+      const d2 = (candidate.x - f.x) ** 2 + (candidate.z - f.z) ** 2;
+      if (d2 < campDistance) { campDistance = d2; camp = candidate; }
+    }
     if (!camp) { this.stopMoving(f, dt); return; }
     const load = (f.carriedWood ?? 0) + (f.carriedStone ?? 0);
     if (load >= 3 || f.intent === 'return') {
@@ -2509,6 +3002,15 @@ export class SandboxWorld {
         camp.stockStone = (camp.stockStone ?? 0) + (f.carriedStone ?? 0);
         f.carriedWood = 0; f.carriedStone = 0; f.intent = 'forage'; f.targetId = undefined;
       } else this.steer(f, camp, def.speed * 0.75, dt, camp.radius + f.radius + 0.5);
+      return;
+    }
+    if (!behavior.gathers) {
+      if (f.foeKind === 'wisp') {
+        const patient = this.chars.find((a) => a.kind === 'foe' && a !== f && a.alive && a.hp < a.maxHp * 0.7 && distance(a, f) < 14);
+        if (patient) { this.steer(f, patient, def.speed * 0.85, dt, 4.5); f.activity = 'Screening'; return; }
+      }
+      this.steer(f, foePatrolPoint(f, camp, this.elapsed), def.speed * (f.foeKind === 'stalker' ? 0.85 : 0.65), dt, 0.7);
+      f.activity = f.foeKind === 'slime' ? 'Prowling' : f.foeKind === 'wisp' ? 'Screening' : 'Lurking';
       return;
     }
     let node = f.targetId ? this.byId(f.targetId) : undefined;
@@ -2535,7 +3037,7 @@ export class SandboxWorld {
         if (node.kind === 'tree') f.carriedWood = (f.carriedWood ?? 0) + 1; else f.carriedStone = (f.carriedStone ?? 0) + 1;
         node.hp = Math.max(0, node.hp - 0.25);
         node.struckAt = this.elapsed;
-        if (node.hp === 0) { node.alive = false; node.solid = false; this.staticDirty = true; }
+        if (node.hp === 0) { node.alive = false; node.solid = false; this.staticDirty = true; this.renderRevision++; }
       }
     }
   }
@@ -2543,12 +3045,14 @@ export class SandboxWorld {
   private foeStrike(f: Actor) {
     const def = FOES[f.foeKind!];
     const t = f.targetId ? this.byId(f.targetId) : undefined;
-    if (!t || !t.alive) return;
-    const dmg = def.damage * (1 + ((f.weaponLevel ?? 1) - 1) * 0.3);
+    if (!t || !t.alive || !sameSpace(f, t)) return;
+    const siege = f.foeKind === 'brute' && (t.kind === 'citadel' || t.kind === 'tower' || t.kind === 'barricade');
+    const dmg = def.damage * (siege ? 1.5 : 1) * (1 + ((f.weaponLevel ?? 1) - 1) * 0.3);
     if (t.kind === 'player') {
       if (distance(f, t) > def.reach + t.radius + 0.5) return;
       if (Math.abs(angleDelta(f.facing, angleTo(f, t))) > 1.2) return;
       this.hurt(t, dmg, f.id);
+      if (f.foeKind === 'slime') this.stamina = Math.max(0, this.stamina - 8);
       if (this.elapsed >= this.invulnUntil) {
         const a = angleTo(f, t);
         t.vx += Math.sin(a) * 5; t.vz += Math.cos(a) * 5;
@@ -2587,12 +3091,12 @@ export class SandboxWorld {
     if (t.attackCooldown > 0) return;
     if (t.structure === 'ward' && t.faction === 'citadel') {
       t.attackCooldown = 2;
-      for (const a of this.actors) if (a.alive && a.faction === 'citadel' && (a.kind === 'citadel' || a.kind === 'tower') && distance(a, t) < 12) a.hp = Math.min(a.maxHp, a.hp + 3);
+      for (const a of this.actors) if (a.alive && sameSpace(a, t) && a.faction === 'citadel' && (a.kind === 'citadel' || a.kind === 'tower') && distance(a, t) < 12) a.hp = Math.min(a.maxHp, a.hp + 3);
       return;
     }
     let target: Actor | undefined, best = 12;
     for (const a of this.chars) {
-      if (a.hp <= 0 || (t.faction === 'citadel' ? a.kind !== 'foe' : a.kind !== 'player')) continue;
+      if (a.hp <= 0 || !sameSpace(a, t) || (t.faction === 'citadel' ? a.kind !== 'foe' : a.kind !== 'player')) continue;
       const d = distance(a, t);
       if (d < best) { best = d; target = a; }
     }
@@ -2606,8 +3110,10 @@ export class SandboxWorld {
   // ---------------------------------------------------------------- building & waves
   private validBuild(point: Point, radius: number) {
     if (Math.abs(point.x) > WORLD_LIMIT - radius || Math.abs(point.z) > WORLD_LIMIT - radius) return false;
-    for (const a of this.solidGrid.query(point.x, point.z, radius + 4, this.qa)) if (a.alive && a.solid && distance(a, point) < a.radius + radius + 0.3) return false;
-    return !this.chars.some((c) => distance(c, point) < c.radius + radius);
+    const loaded = this.currentSpace === EXTERIOR_SPACE && this.streamer.loadedCells.has(cellKey({ id: 'build-check', ...point }));
+    const solids = loaded ? this.solidGrid.query(point.x, point.z, radius + 4, this.qa) : this.actors;
+    for (const a of solids) if (spaceOf(a) === EXTERIOR_SPACE && a.alive && a.solid && distance(a, point) < a.radius + radius + 0.3) return false;
+    return !this.chars.some((c) => spaceOf(c) === EXTERIOR_SPACE && distance(c, point) < c.radius + radius);
   }
   private findBuildSpot(origin: Point, start: number, end: number, radius: number): Point | null {
     for (let r = start; r <= end; r += 1) for (let i = 0; i < 16; i++) {
@@ -2618,7 +3124,7 @@ export class SandboxWorld {
     return null;
   }
   buildPreview(): { point: Point; valid: boolean; affordable: boolean } | null {
-    if (!this.placing) return null;
+    if (!this.placing || this.currentSpace !== EXTERIOR_SPACE) return null;
     const def = BUILDINGS[this.placing];
     const p = this.player;
     const d = p.radius + def.radius + 1.2;
@@ -2657,12 +3163,14 @@ export class SandboxWorld {
   }
 
   respawnAtCitadel() {
+    if (this.currentSpace !== EXTERIOR_SPACE) this.leaveInterior();
     const p = this.player;
     p.x = 0; p.z = 4; p.vx = p.vz = 0;
     this.hostileUntil = 0;
   }
 
   recover() {
+    if (this.currentSpace !== EXTERIOR_SPACE) this.leaveInterior();
     const p = this.player;
     p.hp = p.maxHp;
     p.x = this.respawn.x; p.z = this.respawn.z; p.y = 0; p.vx = p.vz = p.vy = 0;
@@ -2710,19 +3218,38 @@ export class SandboxWorld {
   }
 
   snapshot(): WorldSave {
+    const { changeForms, spawned } = createChangeForms(this.initialActors, this.actors);
     return JSON.parse(JSON.stringify({
-      version: SAVE_VERSION, seed: this.seed, actors: this.actors, stock: this.stock, pack: this.pack, elapsed: this.elapsed,
+      version: SAVE_VERSION, seed: this.seed, changeForms, spawned, stock: this.stock, pack: this.pack, elapsed: this.elapsed,
       level: this.level, xp: this.xp, weaponLevel: this.weaponLevel, flags: this.flags, quests: this.quests, tracked: this.tracked,
       wave: this.wave, waveCleared: this.waveCleared, bounty: this.bounty, standing: this.standing, nextId: this.nextId,
       echoProgress: this.echoProgress, echoSolved: this.echoSolved, respawn: this.respawn,
       visitedLocations: this.visitedLocations, metNpcIds: this.metNpcIds,
+      siteStates: this.siteStates, nextRadiantQuest: this.nextRadiantQuest, threatSignals: this.threatSignals,
+      outsideReturn: this.outsideReturn, uGridsToLoad: this.uGridsToLoad, uExteriorCellBuffer: this.uExteriorCellBuffer,
       deeds: this.deeds, vendettas: this.vendettas,
     })) as WorldSave;
   }
 
   private restore(s: WorldSave) {
-    if (!s.actors.some((a) => a.id === PLAYER_ID) || !s.actors.some((a) => a.id === CITADEL_ID)) return;
-    this.actors = s.actors;
+    const legacyActors = Array.isArray(s.actors);
+    if (legacyActors) {
+      this.actors = s.actors!;
+      const ids = new Set(this.actors.map((a) => a.id));
+      for (const original of this.initialActors.values()) {
+        if (!original.spaceId || ids.has(original.id)) continue;
+        const entranceId = original.spaceId.slice('interior:'.length);
+        if (!ids.has(entranceId)) continue;
+        const added = structuredClone(original);
+        this.actors.push(added);
+        ids.add(added.id);
+      }
+    } else if (s.changeForms && typeof s.changeForms === 'object') {
+      this.actors = applyChangeForms(this.actors, s.changeForms, Array.isArray(s.spawned) ? s.spawned : []);
+    }
+    if (!this.actors.some((a) => a.id === PLAYER_ID) || !this.actors.some((a) => a.id === CITADEL_ID)) return;
+    for (const actor of this.actors) actor.baseId ??= baseIdFor(actor);
+    this.reindex();
     this.stock = { ...this.stock, ...s.stock };
     this.pack = { ...s.pack };
     this.elapsed = s.elapsed; this.level = s.level; this.xp = s.xp; this.weaponLevel = s.weaponLevel;
@@ -2730,14 +3257,32 @@ export class SandboxWorld {
     this.quests = s.quests && s.quests.light ? s.quests : this.quests;
     this.tracked = s.tracked && this.quests[s.tracked] ? s.tracked : 'light';
     this.wave = s.wave; this.waveCleared = s.waveCleared; this.bounty = s.bounty; this.standing = s.standing;
-    this.nextId = Number.isFinite(s.nextId) && s.nextId > 0 ? s.nextId : this.actors.length + 1000;
+    this.nextId = Math.max(this.nextId, s.nextId || 0, ...this.actors.map((a) => /^a\d+$/.test(a.id) ? Number(a.id.slice(1)) + 1 : 0));
+    this.uGridsToLoad = s.uGridsToLoad ?? uGridsToLoad;
+    this.uExteriorCellBuffer = s.uExteriorCellBuffer ?? uExteriorCellBuffer;
+    this.outsideReturn = s.outsideReturn;
     this.echoProgress = s.echoProgress ?? 0; this.echoSolved = !!s.echoSolved;
     this.respawn = s.respawn ?? this.respawn;
     this.visitedLocations = Array.isArray(s.visitedLocations) ? [...s.visitedLocations] : ['village'];
+    this.siteStates = s.siteStates && typeof s.siteStates === 'object' ? { ...s.siteStates } : {};
+    this.nextRadiantQuest = Math.max(s.nextRadiantQuest ?? 1, 1, ...Object.keys(this.quests)
+      .filter((id) => id.startsWith('radiant-')).map((id) => (Number(id.slice(8)) || 0) + 1));
+    this.threatSignals = Array.isArray(s.threatSignals) ? s.threatSignals.slice(-24) : [];
     this.metNpcIds = Array.isArray(s.metNpcIds) ? [...s.metNpcIds] : [];
     this.deeds = Array.isArray(s.deeds) ? s.deeds : [];
     this.vendettas = Array.isArray(s.vendettas) ? s.vendettas : [];
-    if (!this.actors.some((a) => a.kind === 'tavern' && a.alive)) {
+    const originalCamp = this.actors.find((a) => a.kind === 'camp' && a.name === 'Wild camp');
+    if (originalCamp) originalCamp.locationId ??= 'southern-camp';
+    this.citadel.neverFade = true;
+    for (const [id, quest] of this.radiantQuests()) {
+      const data = quest.data!;
+      if (data.kind === 'rescue' && !data.siteId) {
+        data.siteId = data.dungeonId; data.siteName = data.dungeonName; data.siteActorId = data.dungeonActorId;
+      }
+      data.aliases ??= { locationId: data.siteId, locationActorId: data.siteActorId };
+      if (quest.status === 'active') this.siteStates[data.siteId] = { phase: 'occupied', questId: id, lastUsed: this.siteStates[data.siteId]?.lastUsed };
+    }
+    if (legacyActors && !this.actors.some((a) => a.kind === 'tavern' && a.alive)) {
       this.add('tavern', 'The Kettle & Crown', TAVERN_POINT.x, TAVERN_POINT.z, {
         radius: 2.15, height: 4.8, solid: true, faction: 'citadel', desc: STATIC_DESC.tavern,
       });
@@ -2751,15 +3296,18 @@ export class SandboxWorld {
       const relative = this.npc(name);
       if (relative) relative.familyId ??= 'marlowe';
     }
-    for (const site of DUNGEON_SITES) {
-      if (!this.actors.some((a) => a.kind === 'dungeon' && a.locationId === site.id)) {
-        this.add('dungeon', site.name, site.point.x, site.point.z, {
-          radius: 1.3, height: 3.6, solid: true, locationId: site.id,
-          desc: `A dark entrance into ${site.name.toLowerCase()}. The stone around it is older than the road.`,
-        });
+    if (legacyActors) {
+      for (const site of DUNGEON_SITES) {
+        if (!this.actors.some((a) => a.kind === 'dungeon' && a.locationId === site.id)) {
+          this.add('dungeon', site.name, site.point.x, site.point.z, {
+            radius: 1.3, height: 3.6, solid: true, locationId: site.id,
+            desc: `A dark entrance into ${site.name.toLowerCase()}. The stone around it is older than the road.`,
+          });
+        }
       }
+      this.createInteriors();
     }
-    for (const name of ['Tobin', 'Bran']) {
+    if (legacyActors) for (const name of ['Tobin', 'Bran']) {
       const owner = this.npc(name);
       if (owner?.home && !this.actors.some((a) => a.kind === 'item' && a.itemType === 'candle' && a.owner === name)) {
         this.spawnItem('candle', owner.home.x + 1, owner.home.z + 0.8, 0, name);
@@ -2778,14 +3326,34 @@ export class SandboxWorld {
         if (!house.residents.includes(npc.id)) house.residents.push(npc.id);
       }
     }
+    for (const foe of this.actors) if (foe.kind === 'foe' && foe.foeKind === 'wisp') {
+      foe.maxFocus ??= 60;
+      foe.focus ??= foe.maxFocus;
+    }
     // Raids in progress do not survive a reload; everything else is exactly as it was left.
     for (const a of this.actors) if (a.kind === 'foe' && a.intent === 'raid') { a.alive = false; a.solid = false; }
+    this.refreshSiteStates();
     this.reindex();
     this.autoRepair();
   }
 
   verify(): VerificationIssue[] { return verifyWorld(this, WORLD_LIMIT); }
-  autoRepair() { const report = repairWorld(this, WORLD_LIMIT); this.reindex(); return report; }
+  private normalizeActorBrains() {
+    for (const actor of this.actors) {
+      if (actor.kind === 'villager') {
+        delete actor.foeKind; delete actor.intent; delete actor.guardPost; delete actor.structure;
+        delete actor.carriedWood; delete actor.carriedStone;
+      } else if (actor.kind === 'foe') {
+        if (!actor.foeKind || !FOES[actor.foeKind]) actor.foeKind = 'slime';
+        delete actor.profession; delete actor.utility; delete actor.needs; delete actor.routine;
+        delete actor.packages; delete actor.retaliationUntil; delete actor.structure;
+      } else if (actor.kind === 'tower' || actor.kind === 'barricade' || actor.kind === 'camp') {
+        delete actor.profession; delete actor.foeKind; delete actor.intent; delete actor.utility;
+        delete actor.memory; delete actor.needs; delete actor.retaliationUntil;
+      }
+    }
+  }
+  autoRepair() { this.normalizeActorBrains(); const report = repairWorld(this, WORLD_LIMIT); this.reindex(); return report; }
   stats() {
     const items = this.actors.filter((a) => a.kind === 'item' && a.alive);
     return { actors: this.actors.length, items: items.length, awake: items.filter((a) => !a.sleeping).length, colliders: this.actors.filter((a) => a.solid && a.alive).length };

@@ -5,9 +5,10 @@ import { LogoMark } from './ui/Icons';
 import { ITEMS, type ItemType } from './world/items';
 import { BUILDINGS, SandboxWorld, type HudView, type StructureKind, type WorldSave } from './world/simulation';
 import { WorldRenderer } from './world/renderer';
+import { EXTERIOR_SPACE } from './world/cells';
 
 const SAVE_KEY = 'preserve-everything-world-v2';
-type Mode = 'title' | 'intro' | 'play';
+type Mode = 'title' | 'loading' | 'intro' | 'play';
 type Tab = 'journal' | 'pack' | 'character' | 'map' | 'system';
 const STRUCTURES: StructureKind[] = ['archer', 'ward', 'barricade', 'outpost'];
 
@@ -16,7 +17,7 @@ function readSave(): WorldSave | null {
     const raw = localStorage.getItem(SAVE_KEY);
     if (!raw) return null;
     const s = JSON.parse(raw) as WorldSave;
-    return s.version === 2 && Array.isArray(s.actors) ? s : null;
+    return s.version === 2 && (Array.isArray(s.actors) || !!s.changeForms) ? s : null;
   } catch { return null; }
 }
 function writeSave(world: SandboxWorld) {
@@ -30,12 +31,16 @@ const angleDelta = (from: number, to: number) => {
 };
 
 export default function App() {
-  const [world, setWorld] = useState(() => { const s = readSave(); return s ? new SandboxWorld(s.seed, s) : new SandboxWorld(4217); });
+  const [world, setWorld] = useState(() => { const s = readSave(); return s ? new SandboxWorld(s.seed, s) : new SandboxWorld(Math.floor(Math.random() * 1e6) + 1); });
+  const worldRef = useRef(world);
+  worldRef.current = world;
   const [hasSave, setHasSave] = useState(() => !!readSave());
   const [mode, setMode] = useState<Mode>('title');
+  const [rendererRequested, setRendererRequested] = useState(false);
   const [menu, setMenu] = useState<Tab | null>(null);
   const [hud, setHud] = useState<HudView>(() => world.hud());
   const [error, setError] = useState('');
+  const [canvasVisible, setCanvasVisible] = useState(false);
   const [muted, setMuted] = useState(false);
   const [showControls, setShowControls] = useState(false);
   const [locked, setLocked] = useState(false);
@@ -48,52 +53,105 @@ export default function App() {
   const modeRef = useRef(mode);
   const menuRef = useRef(menu);
   const dialogueRef = useRef(false);
-  const fpsRef = useRef(60);
+  const fpsRef = useRef(0);
+  const revealFramesRef = useRef(0);
+  const revealStartedRef = useRef(0);
+  const canvasShownRef = useRef(false);
+  const afterLoadingRef = useRef<'intro' | 'play'>('intro');
+  const loadingSetupRef = useRef(false);
   modeRef.current = mode;
   menuRef.current = menu;
   dialogueRef.current = !!hud.dialogue;
 
   // ---------------------------------------------------------------- renderer & loop
   useEffect(() => {
+    if (!rendererRequested) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
     let r: WorldRenderer;
-    try { r = new WorldRenderer(canvas, world); } catch { setError('This browser could not start WebGL, which the world needs to render.'); return; }
+    try { r = new WorldRenderer(canvas, worldRef.current); } catch { setError('This browser could not start WebGL, which the world needs to render.'); return; }
     rendererRef.current = r;
-    if (import.meta.env.DEV) (window as unknown as { __world: SandboxWorld }).__world = world;
-    if (modeRef.current === 'intro') r.startIntro(); else r.mode = modeRef.current;
-    let raf = 0, last = performance.now(), hudTimer = 0, saveTimer = 0, lastHud = '', frames = 0, fpsTimer = 0;
+    if (import.meta.env.DEV) {
+      (window as unknown as { __world: SandboxWorld; __renderer: WorldRenderer }).__world = worldRef.current;
+      (window as unknown as { __renderer: WorldRenderer }).__renderer = r;
+    }
+    r.mode = 'play';
+    let raf = 0, last = performance.now(), lastRender = last - 34, hudTimer = 0, saveTimer = 0, lastHud = '', frames = 0, fpsTimer = 0, introTimer = 0;
     const tick = (now: number) => {
-      const frameTime = Math.min(0.25, Math.max(0, (now - last) / 1000));
+      const activeWorld = worldRef.current;
+      const rawFrame = Math.max(0, (now - last) / 1000);
+      const frameTime = Math.min(0.5, rawFrame);
       last = now;
       const dt = Math.min(0.05, frameTime);
       const m = modeRef.current;
+      if (m === 'play' && revealStartedRef.current === 0) revealStartedRef.current = now;
+      if (m === 'title') { raf = requestAnimationFrame(tick); return; }
+      if (m === 'loading') {
+        if (!loadingSetupRef.current) { raf = requestAnimationFrame(tick); return; }
+        r.prepareFrame();
+        if (r.isReady()) {
+          revealFramesRef.current = 0;
+          revealStartedRef.current = 0;
+          canvasShownRef.current = false;
+          setCanvasVisible(false);
+          r.mode = 'play';
+          introTimer = 0;
+          modeRef.current = afterLoadingRef.current;
+          setMode(afterLoadingRef.current);
+        }
+        raf = requestAnimationFrame(tick);
+        return;
+      }
       if (m === 'play' && !menuRef.current) {
         const k = keys.current;
         const fwd = Number(k.has('w')) - Number(k.has('s')) - stick.current.y;
         const strafe = Number(k.has('d')) - Number(k.has('a')) + stick.current.x;
         const f = r.forward();
-        world.input = { x: f.x * fwd - f.z * strafe, z: f.z * fwd + f.x * strafe, sprint: k.has('shift') };
+        activeWorld.input = { x: f.x * fwd - f.z * strafe, z: f.z * fwd + f.x * strafe, sprint: k.has('shift') };
         if (k.has('arrowleft')) r.orbit(-dt * 700, 0);
         if (k.has('arrowright')) r.orbit(dt * 700, 0);
         // Fixed-size sub-steps keep the world running at real speed even when frames are slow.
-        for (let left = frameTime; left > 1e-4; left -= 0.05) world.update(Math.min(0.05, left));
-        const preview = world.buildPreview();
-        r.setGhost(world.placing, preview?.point ?? null, !!preview && preview.valid && preview.affordable);
-        saveTimer += dt;
-        if (saveTimer > 15) { saveTimer = 0; writeSave(world); }
-      } else if (m !== 'play') {
-        world.input = { x: 0, z: 0, sprint: false };
-        for (let left = frameTime; left > 1e-4; left -= 0.05) world.update(Math.min(0.05, left));
+        for (let left = frameTime; left > 1e-4; left -= 0.05) activeWorld.update(Math.min(0.05, left));
+        const preview = activeWorld.buildPreview();
+        r.setGhost(activeWorld.placing, preview?.point ?? null, !!preview && preview.valid && preview.affordable);
+        saveTimer += frameTime;
+        if (saveTimer > 15) { saveTimer = 0; writeSave(activeWorld); }
+      } else if (m === 'intro') {
+        activeWorld.input = { x: 0, z: 0, sprint: false };
+        for (let left = frameTime; left > 1e-4; left -= 0.05) activeWorld.update(Math.min(0.05, left));
       }
-      r.render(m === 'play' && menuRef.current ? 0 : frameTime);
-      if (m === 'intro' && r.mode === 'play') { modeRef.current = 'play'; setMode('play'); world.say('The road home. Mara will be waiting in the square.', undefined, 5); }
-      frames++; fpsTimer += frameTime;
+      if (m === 'intro') {
+        introTimer += frameTime;
+        if (introTimer >= 9) {
+          modeRef.current = 'play';
+          setMode('play');
+          activeWorld.say('The road home. Mara will be waiting in the square.', undefined, 5);
+        }
+        raf = requestAnimationFrame(tick);
+        return;
+      }
+      // Simulation runs on every callback; only GPU work is paced to 30 renders per second.
+      if (now - lastRender >= 1000 / 30 - 1) {
+        const renderDt = Math.min(0.2, (now - lastRender) / 1000);
+        lastRender = now;
+        const started = performance.now();
+        r.render(m === 'play' && menuRef.current ? 0 : renderDt);
+        if (m === 'play') {
+          revealFramesRef.current++;
+          if (!canvasShownRef.current && revealFramesRef.current >= 3 && now - revealStartedRef.current >= 2000) {
+            canvasShownRef.current = true;
+            setCanvasVisible(true);
+          }
+        }
+        r.adaptQuality(Math.max(performance.now() - started, rawFrame * 1000));
+        frames++;
+      }
+      fpsTimer += rawFrame;
       if (fpsTimer > 1) { fpsRef.current = Math.round(frames / fpsTimer); frames = 0; fpsTimer = 0; }
       hudTimer += frameTime;
       if (hudTimer > 0.1 && m === 'play') {
         hudTimer = 0;
-        const h = world.hud();
+        const h = activeWorld.hud();
         const key = JSON.stringify(h);
         if (key !== lastHud) {
           if (h.dialogue && !dialogueRef.current) document.exitPointerLock?.();
@@ -104,7 +162,7 @@ export default function App() {
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
-    const leave = () => { if (modeRef.current === 'play') writeSave(world); };
+    const leave = () => { if (modeRef.current === 'play') writeSave(worldRef.current); };
     window.addEventListener('pagehide', leave);
     return () => {
       cancelAnimationFrame(raf);
@@ -112,12 +170,12 @@ export default function App() {
       r.dispose();
       rendererRef.current = null;
     };
-  }, [world]);
+  }, [rendererRequested]);
 
   useEffect(() => {
     const r = rendererRef.current;
     if (!r) return;
-    if (mode === 'intro') r.startIntro();
+    if (mode === 'loading' || mode === 'intro') r.mode = 'play';
     else if (mode === 'play' && r.mode === 'title') { r.mode = 'play'; r.yaw = world.player.facing + Math.PI; }
     else if (mode === 'title') r.mode = 'title';
   }, [mode, world]);
@@ -143,7 +201,7 @@ export default function App() {
     const down = (e: KeyboardEvent) => {
       const key = e.key.toLowerCase();
       if (key === 'tab' || key === ' ' || key.startsWith('arrow')) e.preventDefault();
-      if (mode === 'intro') { rendererRef.current?.skipIntro(); return; }
+      if (mode === 'intro') { skipIntro(); return; }
       if (mode !== 'play') return;
       if (menu) { if (key === 'escape' || key === 'tab') setMenu(null); return; }
       const dialogue = world.dialogue;
@@ -174,7 +232,11 @@ export default function App() {
         case ' ': world.jump(); break;
         case 'c': world.dodge(); break;
         case 'j': world.attack(); break;
-        case 'b': world.placing = world.placing ? null : 'archer'; if (!world.placing) rendererRef.current?.setGhost(null, null, false); break;
+        case 'b':
+          if (world.currentSpace !== EXTERIOR_SPACE) { world.say('There is no room to build inside.'); break; }
+          world.placing = world.placing ? null : 'archer';
+          if (!world.placing) rendererRef.current?.setGhost(null, null, false);
+          break;
       }
       setHud(world.hud());
     };
@@ -186,8 +248,14 @@ export default function App() {
     return () => { window.removeEventListener('keydown', down); window.removeEventListener('keyup', up); window.removeEventListener('blur', blur); };
   }, [mode, menu, world]);
 
+  const skipIntro = () => {
+    modeRef.current = 'play';
+    setMode('play');
+    worldRef.current.say('The road home. Mara will be waiting in the square.', undefined, 5);
+  };
+
   const onCanvasDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (mode === 'intro') { rendererRef.current?.skipIntro(); return; }
+    if (mode === 'intro') { skipIntro(); return; }
     if (mode !== 'play' || menu || world.dialogue || touch) return;
     const canvas = canvasRef.current!;
     if (document.pointerLockElement !== canvas) { if (e.button === 0) canvas.requestPointerLock?.(); return; }
@@ -197,22 +265,42 @@ export default function App() {
 
   // ---------------------------------------------------------------- flow
   async function beginNew() {
-    await audio.unlock().catch(() => {});
+    const unlocked = audio.unlock().catch(() => {});
+    loadingSetupRef.current = false;
+    afterLoadingRef.current = 'intro';
+    modeRef.current = 'loading';
+    setMode('loading');
+    canvasShownRef.current = false;
+    setCanvasVisible(false);
+    await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+    try { localStorage.removeItem(SAVE_KEY); } catch { /* ignore */ }
+    if (hasSave) {
+      const w = new SandboxWorld(Math.floor(Math.random() * 1e6) + 1);
+      worldRef.current = w;
+      rendererRef.current?.setWorld(w);
+      if (import.meta.env.DEV) (window as unknown as { __world: SandboxWorld }).__world = w;
+      setHud(w.hud());
+      setWorld(w);
+    }
+    loadingSetupRef.current = true;
+    setRendererRequested(true);
+    await unlocked;
     audio.setMuted(muted, muted);
     audio.startBgm('meadow');
-    try { localStorage.removeItem(SAVE_KEY); } catch { /* ignore */ }
-    const w = new SandboxWorld(Math.floor(Math.random() * 1e6) + 1);
-    modeRef.current = 'intro';
-    setMode('intro');
-    setHud(w.hud());
-    setWorld(w);
   }
   async function resume() {
-    await audio.unlock().catch(() => {});
+    const unlocked = audio.unlock().catch(() => {});
+    afterLoadingRef.current = 'play';
+    loadingSetupRef.current = true;
+    modeRef.current = 'loading';
+    setMode('loading');
+    canvasShownRef.current = false;
+    setCanvasVisible(false);
+    setRendererRequested(true);
+    await unlocked;
     audio.setMuted(muted, muted);
     audio.startBgm('meadow');
     setHud(world.hud());
-    setMode('play');
   }
   function toTitle() {
     writeSave(world);
@@ -222,6 +310,8 @@ export default function App() {
     rendererRef.current?.setGhost(null, null, false);
     document.exitPointerLock?.();
     audio.stopBgm();
+    canvasShownRef.current = false;
+    setCanvasVisible(false);
     setMode('title');
   }
   function toggleSound() { setMuted((m) => { audio.setMuted(!m, !m); return !m; }); }
@@ -231,6 +321,7 @@ export default function App() {
     <main className={`shell mode-${mode}`} onContextMenu={(e) => e.preventDefault()}>
       <canvas ref={canvasRef} className="view" onMouseDown={onCanvasDown}
         onWheel={(e) => { if (mode === 'play') rendererRef.current?.zoom(e.deltaY * 0.006); }} />
+      <div className={`world-fallback ${canvasVisible && mode === 'play' ? 'is-hidden' : ''}`} aria-hidden="true" />
       {error && <div className="fatal"><h2>The world could not be drawn</h2><p>{error}</p></div>}
 
       {mode === 'title' && !error && (
@@ -247,8 +338,15 @@ export default function App() {
               <button onClick={toggleSound}>Sound {muted ? 'off' : 'on'}</button>
             </nav>
           </div>
-          <p className="title-foot">The valley is live behind this screen. Everything in it keeps going without you.</p>
+          <p className="title-foot">A living valley is waiting beyond this screen.</p>
           {showControls && <Sheet title="Controls" onClose={() => setShowControls(false)}><ControlsList /></Sheet>}
+        </section>
+      )}
+
+      {mode === 'loading' && !error && (
+        <section className="loading-screen" role="status" aria-live="polite">
+          <div><span>Preserve Everything</span><p>Preparing the meadow</p></div>
+          <i aria-hidden="true" />
         </section>
       )}
 
@@ -557,8 +655,23 @@ function Pack({ world, onChange }: { world: SandboxWorld; onChange: () => void }
 function WorldMap({ world }: { world: SandboxWorld }) {
   const s = (n: number) => ((n + 90) / 180) * 600;
   const p = world.player;
+  if (world.currentSpace !== EXTERIOR_SPACE) {
+    const inside = (n: number) => ((n + 7) / 14) * 440 + 80;
+    return (
+      <svg className="map" viewBox="0 0 600 600" role="img" aria-label={`Map of ${world.interiorName()}`}>
+        <rect width="600" height="600" fill="#cfc4a6" />
+        <rect x="80" y="80" width="440" height="440" fill="#b8ad93" stroke="#4a3f2e" strokeWidth="12" />
+        <rect x="276" y="490" width="48" height="30" fill="#6e5039" />
+        <text x="300" y="52" textAnchor="middle">{world.interiorName()}</text>
+        <text x="300" y="557" textAnchor="middle">Exit</text>
+        <g transform={`translate(${inside(p.x)} ${inside(p.z)}) rotate(${(-p.facing * 180) / Math.PI + 180})`}>
+          <path d="M0 -9 L6 7 L0 3 L-6 7 Z" fill="#1f2a26" />
+        </g>
+      </svg>
+    );
+  }
   const q = world.questTarget();
-  const places: [string, number, number][] = [['The Citadel', 0, -8], ['The Kettle & Crown', -5.4, -4.6], ['Storehouse', -31, 8], ['Watch post', 3, 28], ['Echo stones', 27, -19], ['Standing stones', -11, 7]];
+  const places: [string, number, number][] = [['The Citadel', 0, -8], ['The Kettle & Crown', -5.4, -4.6], ['Storehouse', -31, 8], ['Watch post', 3, 28], ['Echo stones', 27, -19], ['Hollowroot pool', 42, -36], ['Standing stones', -11, 7]];
   for (const dungeon of world.actors.filter((a) => a.kind === 'dungeon')) {
     const explored = !!dungeon.locationId && world.visitedLocations.includes(dungeon.locationId);
     places.push([explored ? dungeon.name : 'Unexplored ruin', dungeon.x, dungeon.z]);
@@ -599,7 +712,7 @@ function SystemPage({ world, onQuit, onSave, muted, onToggleSound, setTab, fps, 
         <section><h4>Controls</h4><ControlsList /></section>
         <section>
           <h4>Engine</h4>
-          <p className="stats">{(() => { const s = world.stats(); const r = rendererRef.current?.info(); return `${fps.current} fps · ${r?.calls ?? 0} draw calls · ${s.actors} actors · ${s.items} objects (${s.awake} moving) · ${s.colliders} colliders`; })()}</p>
+          <p className="stats">{(() => { const s = world.stats(); const r = rendererRef.current?.info(); const cells = world.currentSpace === EXTERIOR_SPACE ? `${world.streamer.loadedCells.size} active / ${r?.bufferedCells ?? 0} buffered` : world.interiorName(); return `${fps.current} fps · ${r?.calls ?? 0} draw calls · ${r?.precombinedRefs ?? 0} precombined · ${r?.terrainDraws ?? 0} terrain draws · ${cells} · ${r?.worker ? 'background stream' : 'fallback stream'} · ${s.actors} actors · ${s.items} objects (${s.awake} moving) · ${s.colliders} colliders`; })()}</p>
           <div className="dev">
             <button onClick={() => { const issues = world.verify(); setLines(issues.length ? issues.map((i) => `${i.rule}: ${i.detail}`) : ['All world invariants hold.']); }}>Verify world</button>
             <button onClick={() => { const r = world.autoRepair(); setLines(r.fixes.length || r.remaining.length ? [...r.fixes, ...r.remaining.map((i) => `Needs attention: ${i.detail}`)] : ['Nothing to repair.']); onChange(); }}>Auto-repair</button>

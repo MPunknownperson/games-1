@@ -1,28 +1,60 @@
 // Quests and conversation. Guidance lives in what people say and what objects reveal.
-import type { Actor, Point, SandboxWorld } from './simulation';
+import type { Actor, FoeKind, Point, SandboxWorld } from './simulation';
+import type { ItemType } from './items';
 
 export interface StoryReply { line: string; end?: boolean; shop?: boolean; options?: StoryOption[] }
 export interface StoryOption { id: string; text: string; run: (w: SandboxWorld, npc: Actor) => StoryReply }
 export interface QuestStage {
-  journal: (w: SandboxWorld) => string;
-  target?: (w: SandboxWorld) => Point | undefined;
-  update?: (w: SandboxWorld) => string | undefined;
+  journal: (w: SandboxWorld, id: string) => string;
+  target?: (w: SandboxWorld, id: string) => Point | undefined;
+  update?: (w: SandboxWorld, id: string) => string | undefined;
 }
-export interface DynamicQuestData {
-  kind: 'rescue';
+export interface QuestAliases {
+  locationId: string;
+  locationActorId: string;
+  personId?: string;
+  itemActorId?: string;
+  itemType?: ItemType;
+  enemyId?: string;
+  enemyType?: FoeKind;
+}
+interface RadiantBase {
   patronId: string;
+  siteId: string;
+  siteName: string;
+  siteActorId: string;
+  point: Point;
+  reward: number;
+  aliases: QuestAliases;
+}
+export interface RescueQuestData extends RadiantBase {
+  kind: 'rescue';
   captiveId: string;
   captiveName: string;
+  // Retained for saves created by the original one-off rescue quest.
   dungeonId: string;
   dungeonName: string;
   dungeonActorId: string;
-  point: Point;
   originalPoint: Point;
-  reward: number;
   guardCount: number;
   approach: string;
   rescued?: boolean;
 }
+export interface RetrieveQuestData extends RadiantBase {
+  kind: 'retrieve';
+  itemType: ItemType;
+  itemName: string;
+  itemActorId: string;
+  recovered?: boolean;
+}
+export interface HuntQuestData extends RadiantBase {
+  kind: 'hunt';
+  enemyType: FoeKind;
+  enemyName: string;
+  enemyId: string;
+  defeated?: boolean;
+}
+export type DynamicQuestData = RescueQuestData | RetrieveQuestData | HuntQuestData;
 export interface QuestDef {
   id: string;
   title: string;
@@ -250,64 +282,122 @@ export const QUESTS: Record<string, QuestDef> = {
     title: 'A Favor Repaid',
     stages: {
       travel: {
-        journal: (w) => {
-          const data = w.quests.rescue?.data;
-          return data ? `${data.captiveName} was taken to ${data.dungeonName}. ${data.approach} Find the entrance before the trail goes cold.` : 'Someone has gone missing beyond the village roads.';
+        journal: (w, id) => {
+          const data = w.quests[id]?.data;
+          return data?.kind === 'rescue' ? `${data.captiveName} was taken to ${data.siteName}. ${data.approach} Find the entrance before the trail goes cold.` : 'Someone has gone missing beyond the village roads.';
         },
-        target: (w) => {
-          const data = w.quests.rescue?.data;
-          const door = data ? w.byId(data.dungeonActorId) : undefined;
-          return door ? at(door) : data?.point;
+        target: (w, id) => {
+          const data = w.quests[id]?.data;
+          const anchor = data ? w.byId(data.siteActorId) : undefined;
+          return anchor?.alive ? at(anchor) : data?.point;
         },
-        update: (w) => {
-          const data = w.quests.rescue?.data;
-          const door = data ? w.byId(data.dungeonActorId) : undefined;
-          return door && dist(w.player, door) < 8 ? 'free' : undefined;
+        update: (w, id) => {
+          const data = w.quests[id]?.data;
+          return data?.kind === 'rescue' && dist(w.player, data.point) < 8 ? 'free' : undefined;
         },
       },
       free: {
-        journal: (w) => {
-          const data = w.quests.rescue?.data;
-          return data ? `${data.captiveName} is being held near the entrance to ${data.dungeonName}. Get close enough to speak and free them.` : 'Find the captive and bring them home.';
+        journal: (w, id) => {
+          const data = w.quests[id]?.data;
+          return data?.kind === 'rescue' ? `${data.captiveName} is being held near ${data.siteName}. Get close enough to speak and free them.` : 'Find the captive and bring them home.';
         },
-        target: (w) => {
-          const data = w.quests.rescue?.data;
-          return at(data ? w.byId(data.captiveId) : undefined);
+        target: (w, id) => {
+          const data = w.quests[id]?.data;
+          return at(data?.kind === 'rescue' ? w.byId(data.captiveId) : undefined);
         },
-        update: (w) => w.quests.rescue?.data?.rescued ? 'report' : undefined,
+        update: (w, id) => w.quests[id]?.data?.kind === 'rescue' && w.quests[id].data.rescued ? 'report' : undefined,
       },
       report: {
-        journal: (w) => {
-          const data = w.quests.rescue?.data;
-          return data ? `${data.captiveName} is safe and following you. Return to the person who asked for help.` : 'Return to the person who asked for help.';
+        journal: (w, id) => {
+          const data = w.quests[id]?.data;
+          return data?.kind === 'rescue' ? `${data.captiveName} is safe and following you. Return to the person who asked for help.` : 'Return to the person who asked for help.';
         },
-        target: (w) => {
-          const data = w.quests.rescue?.data;
-          return at(data ? w.byId(data.patronId) : undefined);
-        },
+        target: (w, id) => at(w.byId(w.quests[id]?.data?.patronId ?? '')),
       },
     },
-    talk: (w, npc, stage) => {
-      const state = w.quests.rescue;
-      const data = state?.data;
-      if (!state && w.canGenerateRescue(npc)) return [opt('rescue-accept', 'Have you heard of anyone missing?', (world, patron) => {
-        if (!world.generateRescueQuest(patron)) return { line: 'Not yet. I need to know who has gone missing and where they were taken.' };
-        const quest = world.quests.rescue?.data;
-        return { line: quest ? `${quest.captiveName} trusted you, and you returned that trust. They were taken to ${quest.dungeonName}. ${quest.approach}` : 'Someone has gone missing. Find them before the trail goes cold.' };
-      })];
-      if (!data || state?.status !== 'active') return [];
-      if (stage === 'free' && npc.id === data.captiveId) return [opt('rescue-free', 'I came to bring you home.', (world, captive) => {
-        world.rescueCaptive(captive);
-        return { line: `I knew you would come. Let us get back to ${world.byId(data.patronId)?.name ?? 'the village'}.`, end: true };
-      })];
-      if (stage === 'report' && npc.id === data.patronId) return [opt('rescue-report', `${data.captiveName} is safe.`, (world, patron) => {
-        world.finishRescueQuest(patron);
-        return { line: `You brought ${data.captiveName} back. I will remember what you did for us.`, end: true };
-      })];
-      return [];
+  },
+  retrieve: {
+    id: 'retrieve', title: 'A Lost Possession',
+    stages: {
+      travel: {
+        journal: (w, id) => { const d = w.quests[id]?.data; return d?.kind === 'retrieve' ? `Find the ${d.itemName.toLowerCase()} lost at ${d.siteName}. The place was explored before, but someone has moved in.` : 'Find the missing item.'; },
+        target: (w, id) => w.quests[id]?.data?.point,
+        update: (w, id) => { const d = w.quests[id]?.data; return d?.kind === 'retrieve' ? d.recovered ? 'report' : dist(w.player, d.point) < 8 ? 'recover' : undefined : undefined; },
+      },
+      recover: {
+        journal: (w, id) => { const d = w.quests[id]?.data; return d?.kind === 'retrieve' ? `The ${d.itemName.toLowerCase()} is somewhere near ${d.siteName}. Take it back to the person who lost it.` : 'Search the area.'; },
+        target: (w, id) => { const d = w.quests[id]?.data; return d?.kind === 'retrieve' ? at(w.byId(d.itemActorId)) ?? d.point : undefined; },
+        update: (w, id) => w.quests[id]?.data?.kind === 'retrieve' && w.quests[id].data.recovered ? 'report' : undefined,
+      },
+      report: {
+        journal: (w, id) => { const d = w.quests[id]?.data; return d?.kind === 'retrieve' ? `I found the ${d.itemName.toLowerCase()}. Return it to ${w.byId(d.patronId)?.name ?? 'its owner'}.` : 'Return the item.'; },
+        target: (w, id) => at(w.byId(w.quests[id]?.data?.patronId ?? '')),
+      },
+    },
+  },
+  hunt: {
+    id: 'hunt', title: 'Trouble in the Wilds',
+    stages: {
+      travel: {
+        journal: (w, id) => { const d = w.quests[id]?.data; return d?.kind === 'hunt' ? `A ${d.enemyName.toLowerCase()} is gathering fighters at ${d.siteName}. Find their position before they march.` : 'Find the raiders.'; },
+        target: (w, id) => w.quests[id]?.data?.point,
+        update: (w, id) => { const d = w.quests[id]?.data; return d?.kind === 'hunt' ? d.defeated ? 'report' : dist(w.player, d.point) < 10 ? 'defeat' : undefined : undefined; },
+      },
+      defeat: {
+        journal: (w, id) => { const d = w.quests[id]?.data; return d?.kind === 'hunt' ? `Defeat the ${d.enemyName.toLowerCase()} and break the raid at ${d.siteName}.` : 'Defeat the raiders.'; },
+        target: (w, id) => { const d = w.quests[id]?.data; return d?.kind === 'hunt' ? at(w.byId(d.enemyId)) ?? d.point : undefined; },
+        update: (w, id) => w.quests[id]?.data?.kind === 'hunt' && w.quests[id].data.defeated ? 'report' : undefined,
+      },
+      report: {
+        journal: (w, id) => { const d = w.quests[id]?.data; return d?.kind === 'hunt' ? `The ${d.enemyName.toLowerCase()} has fallen. Bring the news back.` : 'Report the victory.'; },
+        target: (w, id) => at(w.byId(w.quests[id]?.data?.patronId ?? '')),
+      },
     },
   },
 };
+
+function radiantOptions(w: SandboxWorld, npc: Actor): StoryOption[] {
+  const options: StoryOption[] = [];
+  for (const [id, quest] of w.radiantQuests()) {
+    if (quest.status !== 'active' || !quest.data) continue;
+    const d = quest.data;
+    if (d.kind === 'rescue' && quest.stage === 'free' && npc.id === d.captiveId) {
+      options.push(opt('rescue-free', 'I came to bring you home.', (world, captive) => {
+        world.rescueCaptive(captive);
+        return { line: `I knew you would come. Let us get back to ${world.byId(d.patronId)?.name ?? 'the village'}.`, end: true };
+      }));
+    }
+    if (quest.stage !== 'report' || npc.id !== d.patronId) continue;
+    if (d.kind === 'rescue') options.push(opt('rescue-report', `${d.captiveName} is safe.`, (world, patron) => {
+      if (!world.finishRescueQuest(patron, id)) return { line: 'Bring them home safely first.' };
+      return { line: `You brought ${d.captiveName} back. I will remember what you did for us.`, end: true };
+    }));
+    if (d.kind === 'retrieve') options.push(opt(`retrieve-report-${id}`, `I found your ${d.itemName.toLowerCase()}.`, (world, patron) => {
+      if (!world.finishRetrieveQuest(id, patron)) return { line: 'It is not in your pack. Look for it again.' };
+      return { line: 'You found it. I thought it was gone for good. Take this for your trouble.', end: true };
+    }));
+    if (d.kind === 'hunt') options.push(opt(`hunt-report-${id}`, `The ${d.enemyName.toLowerCase()} is gone.`, (world, patron) => {
+      if (!world.finishHuntQuest(id, patron)) return { line: 'The threat is still out there.' };
+      return { line: 'Good. The roads will be safer for a while. You have earned this.', end: true };
+    }));
+  }
+  if (!w.hasActiveRadiantFor(npc.id)) {
+    if (w.canGenerateRescue(npc)) options.push(opt('rescue-accept', 'Have you heard of anyone missing?', (world, patron) => {
+      if (!world.generateRescueQuest(patron)) return { line: 'Not yet. We need a lead and a place you know.' };
+      const d = world.quests[world.tracked]?.data;
+      return { line: d?.kind === 'rescue' ? `${d.captiveName} was taken to ${d.siteName}. ${d.approach}` : 'Someone has gone missing.' };
+    }));
+    if (w.canGenerateRadiant(npc)) options.push(opt('radiant-accept', 'Is there work beyond the village?', (world, patron) => {
+      const id = world.generateRadiantQuest(patron);
+      const d = id ? world.quests[id]?.data : undefined;
+      if (!d) return { line: 'Not yet. Explore and clear a place, then ask again.' };
+      return { line: d.kind === 'rescue' ? `${d.captiveName} is missing near ${d.siteName}. Bring them home.`
+        : d.kind === 'retrieve' ? `I lost my ${d.itemName.toLowerCase()} at ${d.siteName}. Find it and bring it back.`
+          : `A ${d.enemyName.toLowerCase()} has taken ${d.siteName}. Break their band and report back.` };
+    }));
+  }
+  return options;
+}
 
 const WORK: Record<string, string> = {
   Keeper: 'I keep the Citadel lit. When the wilds grow bold, the light is what they come for.',
@@ -376,6 +466,7 @@ export function buildOptions(w: SandboxWorld, npc: Actor): StoryOption[] {
     if (state?.status === 'done' || !def.talk) continue;
     options.push(...def.talk(w, npc, state?.stage));
   }
+  options.push(...radiantOptions(w, npc));
   if (npc.profession === 'Merchant') options.push(opt('trade', 'Show me what you have.', (world) => ({
     line: world.flags.ledger === 'exposed' ? 'Buying or gloating? Either way, coin first.' : 'Have a look. Prices are fair; mostly.',
     shop: true,

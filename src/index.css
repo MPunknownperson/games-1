@@ -21,8 +21,16 @@ kbd { font-family: var(--sans); }
 
 .shell { position: relative; width: 100%; height: 100%; overflow: hidden; user-select: none; }
 .view { position: absolute; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+.world-fallback { position: absolute; inset: 0; background: linear-gradient(rgba(14, 17, 14, 0.24), rgba(14, 17, 14, 0.44)), url('/images/meadow-preview.jpg') center / cover; pointer-events: none; opacity: 1; transition: opacity 0.65s ease; }
+.world-fallback.is-hidden { opacity: 0; }
 .mode-play .view { cursor: none; }
 .fatal { position: absolute; inset: 0; display: grid; place-content: center; text-align: center; background: #151a16; font-family: var(--serif); }
+
+.loading-screen { position: absolute; inset: 0; display: flex; align-items: flex-end; justify-content: space-between; padding: clamp(28px, 8vw, 128px); pointer-events: none; text-shadow: var(--shadow); }
+.loading-screen span { font: 22px var(--serif); }
+.loading-screen p { margin: 8px 0 0; font: italic 17px var(--serif); color: var(--ink-soft); }
+.loading-screen i { width: 92px; height: 1px; margin-bottom: 12px; background: var(--ink); transform-origin: left; animation: loading-trace 1.8s ease-in-out infinite; }
+@keyframes loading-trace { 0%, 100% { opacity: 0.3; transform: scaleX(0.15); } 50% { opacity: 0.9; transform: scaleX(1); } }
 
 /* Title: the live valley is the backdrop. A soft veil keeps the type readable. */
 .title { position: absolute; inset: 0; pointer-events: none; }

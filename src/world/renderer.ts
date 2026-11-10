@@ -1,10 +1,18 @@
-// Three.js presentation of the simulation. Static props share merged, vertex-coloured geometry (one draw
-// call each); characters use skeletal rigs. The same camera serves the title, intro and play.
+// Three.js presentation of the simulation. Stable props bake into cell meshes, trees switch between
+// instanced models and billboards, and characters use skeletal rigs.
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { animateRig, buildRig, type AnimState, type Rig, type RigStyle } from './rig';
 import { BUILDINGS, PLAYER_ID, type Actor, type ActionKind, type Point, type SandboxWorld, type StructureKind } from './simulation';
 import type { ItemType } from './items';
+import { EXTERIOR_SPACE, WORLD_UNITS_PER_CELL, cellKey } from './cells';
+import { CellPreloader } from './preloader';
+import { isPrecombinedStatic } from './renderBatches';
+import { parseVisual } from './cellArchive';
+import { TerrainLod } from './terrainLod';
+import { WaterLod } from './waterLod';
+import { isOccluded, occlusionPlanes } from './occlusion';
+import { screenDoorMaterial, setScreenDoorFade } from './screenDoor';
 
 export type CameraMode = 'title' | 'intro' | 'play';
 
@@ -87,10 +95,12 @@ interface Visual {
   obj: THREE.Object3D; rig?: Rig; frame: number; lx: number; ly: number; lz: number; lf: number;
   isStatic: boolean; phase: number; yaw: number; glyphs?: THREE.Object3D[]; glow?: THREE.Object3D;
   shot?: THREE.Line; stump?: THREE.Object3D; main?: THREE.Object3D; weaponLevel?: number; body?: THREE.Object3D; shook?: boolean;
+  low?: THREE.Mesh; lowActive?: boolean;
   poolKey?: string; poolIndex?: number; poolAlive?: boolean;
 }
 
-interface Pool { mesh: THREE.InstancedMesh; next: number }
+interface Pool { mesh: THREE.InstancedMesh; next: number; active: number }
+interface StaticBatch { group: THREE.Group; geometries: THREE.BufferGeometry[]; refs: number }
 
 const angleDelta = (from: number, to: number) => {
   let d = (to - from) % (Math.PI * 2);
@@ -109,11 +119,49 @@ export class WorldRenderer {
   distance = 6.5;
   readonly introDuration = 9;
   private world: SandboxWorld;
+  private preloader: CellPreloader;
+  private exteriorGroup = new THREE.Group();
+  private interiorGroup = new THREE.Group();
+  private rooms = new Map<string, THREE.Group>();
+  private staticBatches = new Map<string, StaticBatch>();
+  private pendingBatchKeys: string[] = [];
+  private batchRevision = -1;
+  private batchWindow = '';
+  private farCells = new Map<string, THREE.Group>();
+  private farFades = new Map<string, { materials: THREE.Material[]; treeMaterial?: THREE.Material;
+    startFrame: number; opacity: number; treeStartFrame: number; treeOpacity: number }>();
+  private grassCells = new Map<string, THREE.InstancedMesh>();
+  private farGeometries = new Map<string, THREE.BufferGeometry>();
+  private farTreeGeometries = new Map<string, THREE.BufferGeometry>();
+  private treeFullCells = new Set<string>();
+  private roomGeometries: THREE.BufferGeometry[] = [];
+  private grassTexture?: THREE.CanvasTexture;
+  private terrainLod?: TerrainLod;
+  private waterLod?: WaterLod;
+  private treeTexture?: THREE.CanvasTexture;
+  private treeBillboardMat?: THREE.MeshLambertMaterial;
+  private farMaterial?: THREE.MeshLambertMaterial;
+  private lastLodRevision = -1;
+  private lastFarWindow = '';
+  private lastPoolWindow = '';
+  private pendingFarKeys: string[] = [];
+  private readyCells = new Set<string>();
+  private firstSceneReady = false;
+  private readyAtFrame = -1;
+  private lastSpace = EXTERIOR_SPACE;
   private visuals = new Map<string, Visual>();
   private pools = new Map<string, Pool>();
   private geometryCache = new Map<string, THREE.BufferGeometry>();
   private itemTextures = new Map<ItemType, THREE.CanvasTexture>();
   private itemMaterials = new Map<ItemType, THREE.MeshStandardMaterial>();
+  private preferredRatio = Math.min(window.devicePixelRatio || 1, 1.25);
+  private pixelRatio = Math.min(this.preferredRatio, 0.75);
+  private slowFrames = 0;
+  private fastFrames = 0;
+  private renderFocus = new THREE.Vector3();
+  private frustum = new THREE.Frustum();
+  private projectionView = new THREE.Matrix4();
+  private occludedDecor = 0;
   private frame = 0;
   private time = 0;
   private introTime = 0;
@@ -143,9 +191,10 @@ export class WorldRenderer {
 
   constructor(canvas: HTMLCanvasElement, world: SandboxWorld) {
     this.world = world;
-    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.25));
-    this.renderer.shadowMap.enabled = true;
+    this.preloader = this.makePreloader();
+    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance' });
+    this.renderer.setPixelRatio(this.pixelRatio);
+    this.renderer.shadowMap.enabled = false;
     this.renderer.shadowMap.type = THREE.PCFShadowMap;
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -157,8 +206,8 @@ export class WorldRenderer {
     this.hemi = new THREE.HemisphereLight('#e6efe2', '#5d6b52', 1.4);
     this.scene.add(this.hemi);
     this.sun = new THREE.DirectionalLight('#fff0d4', 2.4);
-    this.sun.castShadow = true;
-    this.sun.shadow.mapSize.set(1024, 1024);
+    this.sun.castShadow = false;
+    this.sun.shadow.mapSize.set(512, 512);
     const sc = this.sun.shadow.camera;
     sc.left = -26; sc.right = 26; sc.top = 26; sc.bottom = -26; sc.near = 1; sc.far = 120;
     this.sun.shadow.bias = -0.0006;
@@ -168,12 +217,30 @@ export class WorldRenderer {
     this.beacon.position.set(world.citadel.x, 11, world.citadel.z);
     this.scene.add(this.beacon);
 
+    this.scene.add(this.exteriorGroup, this.interiorGroup);
     this.createTerrain();
+    this.waterLod = new WaterLod();
+    this.exteriorGroup.add(this.waterLod.group);
     this.resizeHandler = () => this.resize();
     window.addEventListener('resize', this.resizeHandler);
     this.resize();
     const p = world.player;
     this.yaw = p.facing + Math.PI;
+  }
+
+  private makePreloader() {
+    return new CellPreloader(
+      (key) => this.world.streamer.actorsInCell(key).map((a) => ({
+        id: a.id, kind: a.kind, x: a.x, z: a.z, radius: a.radius, height: a.height, solid: a.solid,
+        alive: a.alive, neverFade: !!a.neverFade,
+      })),
+      (key) => {
+        const fade = this.farFades.get(key);
+        if (fade && ((fade.startFrame >= 0 && fade.opacity > 0)
+          || (fade.treeOpacity > 0 && fade.treeOpacity < 1))) return;
+        if (!this.pendingFarKeys.includes(key)) this.pendingFarKeys.push(key);
+      },
+    );
   }
 
   // ------------------------------------------------------------------ terrain
@@ -200,10 +267,27 @@ export class WorldRenderer {
     grass.wrapS = grass.wrapT = THREE.RepeatWrapping;
     grass.repeat.set(70, 70);
     grass.anisotropy = 4;
+    this.grassTexture = grass;
+    this.farMaterial = new THREE.MeshLambertMaterial({ map: grass, color: '#a4b596' });
+    this.terrainLod = new TerrainLod(grass);
+    this.exteriorGroup.add(this.terrainLod.group);
+    const treeCanvas = document.createElement('canvas');
+    treeCanvas.width = treeCanvas.height = 128;
+    const tc = treeCanvas.getContext('2d')!;
+    tc.clearRect(0, 0, 128, 128);
+    tc.fillStyle = '#5a4433'; tc.fillRect(57, 70, 14, 58);
+    tc.fillStyle = '#3d5b36';
+    tc.beginPath(); tc.moveTo(64, 4); tc.lineTo(112, 87); tc.lineTo(16, 87); tc.closePath(); tc.fill();
+    tc.fillStyle = '#4c7040';
+    tc.beginPath(); tc.moveTo(64, 19); tc.lineTo(100, 78); tc.lineTo(28, 78); tc.closePath(); tc.fill();
+    this.treeTexture = new THREE.CanvasTexture(treeCanvas);
+    this.treeTexture.colorSpace = THREE.SRGBColorSpace;
+    this.treeBillboardMat = new THREE.MeshLambertMaterial({ map: this.treeTexture, vertexColors: true,
+      alphaTest: 0.3, side: THREE.DoubleSide, fog: true, depthWrite: true });
     const ground = new THREE.Mesh(new THREE.PlaneGeometry(420, 420), new THREE.MeshLambertMaterial({ map: grass }));
     ground.rotation.x = -Math.PI / 2;
     ground.receiveShadow = true;
-    this.scene.add(ground);
+    this.exteriorGroup.add(ground);
 
     // Worn paths between the places people actually go.
     const pathMat = new THREE.MeshLambertMaterial({ color: '#a38e69' });
@@ -217,7 +301,7 @@ export class WorldRenderer {
       strip.rotation.z = -Math.atan2(x2 - x1, z2 - z1);
       strip.position.set((x1 + x2) / 2, 0.02, (z1 + z2) / 2);
       strip.receiveShadow = true;
-      this.scene.add(strip);
+      this.exteriorGroup.add(strip);
     }
     const paveCanvas = document.createElement('canvas');
     paveCanvas.width = paveCanvas.height = 256;
@@ -235,12 +319,13 @@ export class WorldRenderer {
     plaza.rotation.x = -Math.PI / 2;
     plaza.position.set(0, 0.03, -2);
     plaza.receiveShadow = true;
-    this.scene.add(plaza);
+    this.exteriorGroup.add(plaza);
 
-    // Instanced tufts: one draw call of texture for the whole valley.
+    // Cell-sized grass batches can be unloaded independently of the low-detail ground.
     const tuftGeo = new THREE.ConeGeometry(0.09, 0.42, 3);
     tuftGeo.translate(0, 0.21, 0);
-    const tufts = new THREE.InstancedMesh(tuftGeo, new THREE.MeshLambertMaterial({ color: '#ffffff' }), 2600);
+    const tuftMat = new THREE.MeshLambertMaterial({ color: '#ffffff' });
+    const patches = new Map<string, { matrices: THREE.Matrix4[]; colors: THREE.Color[] }>();
     const m = new THREE.Matrix4();
     const col = new THREE.Color();
     let n = 0;
@@ -249,24 +334,236 @@ export class WorldRenderer {
       if (Math.hypot(x, z + 2) < 13.5 || (Math.abs(x - 1.5) < 3 && z > 6 && z < 70)) continue;
       const s = 0.7 + rnd() * 0.9;
       m.compose(tmpP.set(x, 0, z), tmpQ.setFromEuler(tmpE.set((rnd() - 0.5) * 0.4, rnd() * 6, (rnd() - 0.5) * 0.4)), tmpS.set(s, s * (0.8 + rnd() * 0.8), s));
-      tufts.setMatrixAt(n, m);
-      tufts.setColorAt(n, col.set(rnd() < 0.08 ? (rnd() < 0.5 ? '#d9c76a' : '#c99aa8') : rnd() < 0.5 ? '#557238' : '#6f8a45'));
+      const key = cellKey({ id: `grass-${n}`, x, z });
+      let patch = patches.get(key);
+      if (!patch) { patch = { matrices: [], colors: [] }; patches.set(key, patch); }
+      patch.matrices.push(m.clone());
+      patch.colors.push(col.set(rnd() < 0.08 ? (rnd() < 0.5 ? '#d9c76a' : '#c99aa8') : rnd() < 0.5 ? '#557238' : '#6f8a45').clone());
       n++;
     }
-    tufts.count = n;
-    tufts.instanceMatrix.needsUpdate = true;
-    if (tufts.instanceColor) tufts.instanceColor.needsUpdate = true;
-    this.scene.add(tufts);
-
-    // A ring of distant hills, merged into one mesh.
-    const hills = new Shape();
-    for (let i = 0; i < 26; i++) {
-      const a = (i / 26) * Math.PI * 2, r = 150 + (i % 3) * 14;
-      const h = 26 + ((i * 7) % 5) * 9;
-      hills.add('cone', i % 2 ? '#7d9585' : '#8aa18f', Math.cos(a) * r, h / 2 - 3, Math.sin(a) * r, 60 + (i % 4) * 10, h, 60, a);
+    for (const [key, patch] of patches) {
+      const tufts = new THREE.InstancedMesh(tuftGeo, tuftMat, patch.matrices.length);
+      patch.matrices.forEach((matrix, i) => tufts.setMatrixAt(i, matrix));
+      patch.colors.forEach((color, i) => tufts.setColorAt(i, color));
+      tufts.instanceMatrix.needsUpdate = true;
+      if (tufts.instanceColor) tufts.instanceColor.needsUpdate = true;
+      this.exteriorGroup.add(tufts);
+      this.grassCells.set(key, tufts);
     }
-    const hillMesh = new THREE.Mesh(hills.build(), new THREE.MeshBasicMaterial({ vertexColors: true, fog: true }));
-    this.scene.add(hillMesh);
+
+  }
+
+  private createInteriorRooms(spaceId: string) {
+    for (const entrance of this.world.actors) {
+      if (entrance.portalTo !== spaceId || this.rooms.has(spaceId)) continue;
+      const tavern = entrance.kind === 'tavern';
+      const walls = tavern ? '#8a7455' : entrance.kind === 'house' ? '#a99878' : '#545852';
+      const floor = tavern ? '#6c523b' : entrance.kind === 'house' ? '#795a40' : '#6a6b60';
+      const shape = new Shape()
+        .add('box', floor, 0, -0.13, 0, 14, 0.26, 14)
+        .add('box', walls, -7, 2.2, 0, 0.35, 4.4, 14)
+        .add('box', walls, 7, 2.2, 0, 0.35, 4.4, 14)
+        .add('box', walls, 0, 2.2, -7, 14, 4.4, 0.35)
+        .add('box', walls, 0, 2.2, 7, 14, 4.4, 0.35)
+        .add('box', tavern ? '#473727' : '#414440', 0, 4.5, 0, 14.4, 0.2, 14.4)
+        .add('box', tavern ? '#d2a56a' : '#a7aa94', -4.6, 3.3, -6.65, 1.2, 1.1, 0.1);
+      const room = new THREE.Group();
+      const geometry = shape.build();
+      this.roomGeometries.push(geometry);
+      const shell = new THREE.Mesh(geometry, this.vertexMat);
+      shell.receiveShadow = true;
+      room.add(shell);
+      const light = new THREE.PointLight(tavern ? '#ffcf8e' : '#d0d3bb', tavern ? 24 : 16, 25, 1.3);
+      light.position.set(0, 3.8, -1);
+      room.add(light);
+      room.visible = false;
+      this.interiorGroup.add(room);
+      this.rooms.set(entrance.portalTo, room);
+    }
+  }
+
+  /** Far cells keep a baked silhouette and terrain texture, not per-reference meshes. */
+  private removeFarCell(key: string) {
+    const group = this.farCells.get(key);
+    if (group) this.exteriorGroup.remove(group);
+    this.farGeometries.get(key)?.dispose();
+    this.farTreeGeometries.get(key)?.dispose();
+    for (const material of this.farFades.get(key)?.materials ?? []) material.dispose();
+    this.farCells.delete(key);
+    this.farGeometries.delete(key);
+    this.farTreeGeometries.delete(key);
+    this.farFades.delete(key);
+  }
+
+  private rebuildFarCells() {
+    const windowKey = [...this.world.streamer.bufferedCells].join('|');
+    if (this.lastLodRevision !== this.world.renderRevision || windowKey !== this.lastFarWindow) {
+      this.lastLodRevision = this.world.renderRevision;
+      this.lastFarWindow = windowKey;
+      this.pendingFarKeys = [...this.world.streamer.bufferedCells].filter((key) => key.startsWith('exterior:'));
+      this.pendingFarKeys.sort((a, b) => {
+        const priority = (key: string) => {
+          const [, cx, cz] = key.split(':');
+          const dx = (Number(cx) + 0.5) * WORLD_UNITS_PER_CELL - this.world.player.x;
+          const dz = (Number(cz) + 0.5) * WORLD_UNITS_PER_CELL - this.world.player.z;
+          return (this.world.streamer.loadedCells.has(key) ? -1e6 : 0) + dx * dx + dz * dz;
+        };
+        return priority(a) - priority(b);
+      });
+      for (const key of this.farCells.keys()) if (!this.world.streamer.bufferedCells.has(key)) this.removeFarCell(key);
+    }
+    const started = performance.now();
+    let built = 0;
+    while (this.pendingFarKeys.length && built < 2 && performance.now() - started < 3) {
+      const key = this.pendingFarKeys.shift()!;
+      if (!this.world.streamer.actorsInCell(key).some((a) => a.alive &&
+        !a.neverFade && (a.kind === 'tree' || a.kind === 'ore' || a.kind === 'house' || a.kind === 'tavern' || a.kind === 'camp'
+          || a.kind === 'tower' || a.kind === 'dungeon' || a.kind === 'ruin'))) {
+        this.removeFarCell(key);
+        built++;
+        continue;
+      }
+      const priorFade = this.farFades.get(key);
+      const oldOpacity = priorFade?.opacity ?? 1;
+      const oldStartFrame = priorFade?.startFrame ?? -1;
+      const oldTreeOpacity = priorFade?.treeOpacity ?? 1;
+      const oldTreeStartFrame = priorFade?.treeStartFrame ?? -1;
+      this.removeFarCell(key);
+      const [, xs, zs] = key.split(':');
+      const cx = Number(xs), cz = Number(zs);
+      const group = new THREE.Group();
+      const tileMaterial = screenDoorMaterial(this.farMaterial!);
+      setScreenDoorFade(tileMaterial, oldOpacity);
+      const materials: THREE.Material[] = [tileMaterial];
+      const tile = new THREE.Mesh(this.cached('lod-terrain', () => new THREE.PlaneGeometry(WORLD_UNITS_PER_CELL, WORLD_UNITS_PER_CELL)), tileMaterial);
+      tile.rotation.x = -Math.PI / 2;
+      tile.position.set((cx + 0.5) * WORLD_UNITS_PER_CELL, 0.006, (cz + 0.5) * WORLD_UNITS_PER_CELL);
+      group.add(tile);
+      const refs = this.world.streamer.actorsInCell(key);
+      const prepared = this.preloader.get(key)?.visual;
+      const shapes = new Shape();
+      let count = 0;
+      if (!prepared) for (const a of refs) {
+        if (!a.alive || a.neverFade) continue;
+        if (a.kind === 'ore') { shapes.add('dodec', '#848980', a.x, 0.55, a.z, 1.6, 1.1, 1.6); count++; }
+        else if (a.kind === 'house' || a.kind === 'tavern') {
+          shapes.add('box', '#b1a58d', a.x, 1.7, a.z, 4.3, 3.4, 4.1)
+            .add('cone4', '#6e6860', a.x, 4, a.z, 5.7, 1.6, 5.7, Math.PI / 4);
+          count++;
+        } else if (a.kind === 'camp' || a.kind === 'tower' || a.kind === 'citadel' || a.kind === 'dungeon' || a.kind === 'ruin') {
+          const height = a.kind === 'citadel' ? 9 : a.kind === 'tower' ? 5 : a.kind === 'camp' ? 3 : 2.5;
+          shapes.add(a.kind === 'camp' ? 'cone4' : 'box', a.kind === 'camp' ? '#886c4c' : '#8b8b80', a.x, height / 2, a.z,
+            a.kind === 'citadel' ? 4 : 2.5, height, a.kind === 'citadel' ? 4 : 2.5);
+          count++;
+        }
+      }
+      if (prepared?.positions.length || count) {
+        const geometry = prepared?.positions.length ? new THREE.BufferGeometry() : shapes.build();
+        if (prepared?.positions.length) {
+          geometry.setAttribute('position', new THREE.BufferAttribute(prepared.positions, 3));
+          geometry.setAttribute('normal', new THREE.BufferAttribute(prepared.normals, 3));
+          geometry.setAttribute('color', new THREE.BufferAttribute(prepared.colors, 3));
+          geometry.computeBoundingSphere();
+        }
+        this.farGeometries.set(key, geometry);
+        const silhouette = screenDoorMaterial(this.vertexMat);
+        setScreenDoorFade(silhouette, oldOpacity);
+        materials.push(silhouette);
+        group.add(new THREE.Mesh(geometry, silhouette));
+      }
+      const treeLayer = prepared?.treePositions.length ? prepared : parseVisual(refs.filter((a) => a.alive && !a.neverFade && a.kind === 'tree'));
+      let treeMaterial: THREE.Material | undefined;
+      if (treeLayer.treePositions.length) {
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute('position', new THREE.BufferAttribute(treeLayer.treePositions, 3));
+        geometry.setAttribute('uv', new THREE.BufferAttribute(treeLayer.treeUvs, 2));
+        geometry.setAttribute('color', new THREE.BufferAttribute(treeLayer.treeColors, 3));
+        geometry.computeVertexNormals();
+        geometry.computeBoundingSphere();
+        this.farTreeGeometries.set(key, geometry);
+        const billboard = screenDoorMaterial(this.treeBillboardMat!);
+        setScreenDoorFade(billboard, oldTreeOpacity);
+        treeMaterial = billboard;
+        materials.push(billboard);
+        group.add(new THREE.Mesh(geometry, billboard));
+      }
+      group.visible = false;
+      this.exteriorGroup.add(group);
+      this.farCells.set(key, group);
+      this.farFades.set(key, { materials, treeMaterial, startFrame: oldStartFrame, opacity: oldOpacity,
+        treeStartFrame: oldTreeStartFrame, treeOpacity: oldTreeOpacity });
+      built++;
+    }
+  }
+
+  private removeStaticBatch(key: string) {
+    const batch = this.staticBatches.get(key);
+    if (!batch) return;
+    batch.group.parent?.remove(batch.group);
+    for (const geometry of batch.geometries) geometry.dispose();
+    this.staticBatches.delete(key);
+  }
+
+  private houseWindowsGeometry() {
+    return this.cached('windows', () => new Shape()
+      .add('box', '#000', -1.25, 2.1, 1.94, 0.55, 0.55, 0.05)
+      .add('box', '#000', 1.25, 2.1, 1.94, 0.55, 0.55, 0.05)
+      .add('box', '#000', -1.25, 2.1, -1.94, 0.55, 0.55, 0.05)
+      .add('box', '#000', 1.25, 2.1, -1.94, 0.55, 0.55, 0.05).build());
+  }
+
+  /** Bake stable references into one body mesh and one shared emissive-window mesh per cell. */
+  private bakeStaticCells() {
+    const windowKey = [...this.world.streamer.bufferedCells].join('|');
+    if (this.batchRevision !== this.world.renderRevision || windowKey !== this.batchWindow) {
+      this.batchRevision = this.world.renderRevision;
+      this.batchWindow = windowKey;
+      this.pendingBatchKeys = [...this.world.streamer.bufferedCells].filter((key) =>
+        this.world.streamer.actorsInCell(key).some(isPrecombinedStatic));
+      this.pendingBatchKeys.sort((a, b) => {
+        const priority = (key: string) => {
+          const [, cx, cz] = key.split(':');
+          const dx = (Number(cx) + 0.5) * WORLD_UNITS_PER_CELL - this.world.player.x;
+          const dz = (Number(cz) + 0.5) * WORLD_UNITS_PER_CELL - this.world.player.z;
+          return (this.world.streamer.loadedCells.has(key) ? -1e6 : 0) + dx * dx + dz * dz;
+        };
+        return priority(a) - priority(b);
+      });
+      for (const key of this.staticBatches.keys()) if (!this.world.streamer.bufferedCells.has(key)) this.removeStaticBatch(key);
+    }
+    const started = performance.now();
+    if (!this.pendingBatchKeys.length || performance.now() - started > 3) return;
+    const key = this.pendingBatchKeys.shift()!;
+    const actors = this.world.streamer.actorsInCell(key).filter(isPrecombinedStatic);
+    if (!actors.length) { this.removeStaticBatch(key); return; }
+    const parts: THREE.BufferGeometry[] = [], windows: THREE.BufferGeometry[] = [];
+    for (const actor of actors) {
+      // Geometry construction uses the shared transform scratch matrix, so resolve it first.
+      const body = this.staticGeometry(actor);
+      const houseWindows = actor.kind === 'house' ? this.houseWindowsGeometry() : undefined;
+      tmpM.compose(tmpP.set(actor.x, actor.y, actor.z), tmpQ.setFromEuler(tmpE.set(0, actor.facing, 0)),
+        tmpS.setScalar(actor.scale ?? 1));
+      parts.push(body.clone().applyMatrix4(tmpM));
+      if (houseWindows) windows.push(houseWindows.clone().applyMatrix4(tmpM));
+    }
+    const group = new THREE.Group();
+    const geometries: THREE.BufferGeometry[] = [];
+    const attach = (source: THREE.BufferGeometry[], material: THREE.Material) => {
+      if (!source.length) return;
+      const merged = mergeGeometries(source, false);
+      if (merged) {
+        source.forEach((g) => g.dispose());
+        merged.computeBoundingSphere();
+        geometries.push(merged);
+        group.add(new THREE.Mesh(merged, material));
+      } else for (const g of source) { geometries.push(g); group.add(new THREE.Mesh(g, material)); }
+    };
+    attach(parts, this.vertexMat);
+    attach(windows, this.windowMat);
+    group.visible = false;
+    this.removeStaticBatch(key);
+    this.exteriorGroup.add(group);
+    this.staticBatches.set(key, { group, geometries, refs: actors.length });
   }
 
   // ------------------------------------------------------------------ geometry
@@ -382,6 +679,15 @@ export class WorldRenderer {
         .add('dodec', C.stoneDark, -1.35, 0.32, 0.2, 0.75, 0.55, 0.9, 0.7)
         .add('dodec', C.stone, 1.3, 0.28, 0.1, 0.8, 0.5, 0.9, 1.7)
         .add('box', C.wood, 0, 0.28, 0.03, 0.1, 0.5, 0.1).build());
+      case 'portal': return this.cached('interior-portal', () => new Shape()
+        .add('box', C.timber, -0.72, 1.4, 0, 0.18, 2.8, 0.22)
+        .add('box', C.timber, 0.72, 1.4, 0, 0.18, 2.8, 0.22)
+        .add('box', C.woodLight, 0, 2.85, 0, 1.65, 0.18, 0.22)
+        .add('box', C.woodLight, 0, 0.08, 0, 1.65, 0.16, 0.28).build());
+      case 'counter': return this.cached('interior-counter', () => new Shape()
+        .add('box', C.wood, 0, 0.6, 0, 3.5, 1.2, 1.2)
+        .add('box', C.woodLight, 0, 1.24, 0, 3.7, 0.12, 1.4)
+        .add('box', C.bronze, -0.8, 1.35, 0, 0.24, 0.2, 0.24).build());
       case 'post': return this.cached('post', () => {
         const s = new Shape();
         for (const x of [-0.6, 0.6]) for (const z of [-0.6, 0.6]) s.add('box', C.timber, x, 1.7, z, 0.18, 3.4, 0.18);
@@ -572,12 +878,57 @@ export class WorldRenderer {
     return { coat: '#6b5a44', trim: '#c8b78f', pants: '#3e3730', hair: '#3a2a20', skin: SKINS[a.variant % SKINS.length], ...base, weapon } as RigStyle;
   }
 
+  private roleAccessory(a: Actor) {
+    if (!a.profession) return null;
+    const geometry = this.cached(`role-${a.profession}`, () => {
+      const s = new Shape();
+      switch (a.profession) {
+        case 'Keeper': s.add('octa', '#d8c582', 0, 1.55, 0.24, 0.2, 0.3, 0.08); break;
+        case 'Merchant': s.add('box', '#74533b', 0.38, 0.95, -0.18, 0.42, 0.55, 0.25).add('box', '#b89559', 0.38, 1.2, 0.02, 0.22, 0.08, 0.06); break;
+        case 'Warden': s.add('box', '#7b8587', 0, 1.35, 0.3, 0.54, 0.38, 0.08).add('box', '#a7aa9d', 0, 1.5, 0.36, 0.16, 0.17, 0.04); break;
+        case 'Mason': s.add('box', '#a08a67', 0, 0.92, 0.27, 0.65, 0.17, 0.14).add('box', '#747675', 0.36, 0.76, 0.21, 0.1, 0.35, 0.12); break;
+        case 'Woodcutter': s.add('box', '#6d4c2e', -0.45, 1.05, -0.15, 0.12, 0.7, 0.12).add('box', '#989b93', -0.45, 1.4, -0.15, 0.35, 0.14, 0.14); break;
+        case 'Herbalist': s.add('box', '#607b53', -0.35, 0.88, 0, 0.35, 0.48, 0.22).add('cone4', '#86a46a', -0.35, 1.2, 0.1, 0.26, 0.36, 0.26); break;
+        case 'Farmer': s.add('cyl', '#a88d51', 0, 2.04, 0, 0.55, 0.08, 0.55).add('cone4', '#a88d51', 0, 2.16, 0, 0.35, 0.22, 0.35); break;
+        case 'Forager': s.add('box', '#5d6d48', 0, 1.13, -0.24, 0.55, 0.78, 0.12).add('box', '#8b7145', 0.37, 0.77, -0.15, 0.28, 0.4, 0.24); break;
+        case 'Apprentice': s.add('box', '#dfd1ad', 0.3, 0.88, 0.19, 0.28, 0.34, 0.07).add('box', '#947856', 0.3, 1.04, 0.24, 0.25, 0.04, 0.03); break;
+        case 'Smith': s.add('box', '#53483c', 0, 1.04, 0.27, 0.58, 0.82, 0.09).add('box', '#866d50', 0, 0.7, 0.32, 0.66, 0.12, 0.07); break;
+        case 'Gardener': s.add('box', '#867553', 0.36, 0.87, -0.1, 0.38, 0.37, 0.27).add('cone4', '#5f8b4b', 0.36, 1.17, -0.1, 0.24, 0.38, 0.24); break;
+        case 'Baker': s.add('box', '#ded5bb', 0, 1.03, 0.27, 0.6, 0.8, 0.05).add('cyl', '#ded5bb', 0, 2.07, 0, 0.34, 0.25, 0.34); break;
+        case 'Scout': s.add('box', '#5d5037', 0.3, 1.02, -0.27, 0.26, 0.85, 0.18).add('box', '#ba9a5d', 0.3, 1.32, -0.39, 0.12, 0.42, 0.08); break;
+        default: s.add('box', '#8b7859', 0, 1, -0.22, 0.42, 0.55, 0.08);
+      }
+      return s.build();
+    });
+    return new THREE.Mesh(geometry, this.vertexMat);
+  }
+
   private createVisual(a: Actor): Visual {
     const v: Visual = { obj: new THREE.Group(), frame: 0, lx: NaN, ly: NaN, lz: NaN, lf: NaN, isStatic: false, phase: 0, yaw: a.facing };
     const humanoid = a.kind === 'player' || a.kind === 'villager' || (a.kind === 'foe' && (a.foeKind === 'brute' || a.foeKind === 'stalker'));
     if (humanoid) {
-      v.rig = buildRig(this.rigStyle(a));
-      v.obj = v.rig.root;
+      const style = this.rigStyle(a);
+      v.rig = buildRig(style);
+      const accessory = this.roleAccessory(a);
+      if (accessory) v.rig.root.add(accessory);
+      const group = new THREE.Group();
+      group.add(v.rig.root);
+      if (a.kind !== 'player') {
+        const key = `person-low-${a.kind}-${a.kind === 'foe' ? a.foeKind : a.variant}`;
+        const low = new THREE.Mesh(this.cached(key, () => new Shape()
+          .add('box', style.pants, -0.15, 0.45, 0, 0.2, 0.8, 0.22)
+          .add('box', style.pants, 0.15, 0.45, 0, 0.2, 0.8, 0.22)
+          .add('box', style.coat, 0, 1.22, 0, 0.72, 0.82, 0.42)
+          .add('box', style.coat, -0.45, 1.2, 0, 0.16, 0.65, 0.2)
+          .add('box', style.coat, 0.45, 1.2, 0, 0.16, 0.65, 0.2)
+          .add('box', style.skin, 0, 1.78, 0.02, 0.33, 0.35, 0.32)
+          .add('box', style.hair, 0, 1.98, -0.02, 0.34, 0.12, 0.34).build()), this.vertexMat);
+        low.scale.setScalar(style.height ?? 1);
+        low.visible = false;
+        group.add(low);
+        v.low = low;
+      }
+      v.obj = group;
       v.weaponLevel = this.world.weaponLevel;
       const geo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 1.5, 0), new THREE.Vector3(0, 1.2, 0)]);
       const shot = new THREE.Line(geo, new THREE.LineBasicMaterial({ color: '#bfe3ff' }));
@@ -586,15 +937,24 @@ export class WorldRenderer {
       v.obj.add(shot);
       v.shot = shot;
     } else if (a.kind === 'tree' || a.kind === 'ore') {
-      const key = `${a.kind}${a.variant}`;
+      // One instanced draw per species variant and exterior cell.
+      const cell = cellKey(a);
+      const key = `${a.kind}${a.variant}:${cell}`;
       let pool = this.pools.get(key);
       if (!pool) {
-        const count = this.world.actors.filter((x) => x.kind === a.kind && x.variant === a.variant).length;
-        pool = { mesh: new THREE.InstancedMesh(this.staticGeometry(a), this.vertexMat, Math.max(1, count)), next: 0 };
+        const count = this.world.actors.filter((x) => x.kind === a.kind && x.variant === a.variant
+          && cellKey(x) === cell).length;
+        pool = { mesh: new THREE.InstancedMesh(this.staticGeometry(a), this.vertexMat, Math.max(1, count)), next: 0, active: 0 };
+        const [, cx, cz] = cell.split(':');
+        tmpM.makeScale(0.0001, 0.0001, 0.0001);
+        tmpM.setPosition((Number(cx) + 0.5) * WORLD_UNITS_PER_CELL, 0, (Number(cz) + 0.5) * WORLD_UNITS_PER_CELL);
+        for (let i = 0; i < count; i++) pool.mesh.setMatrixAt(i, tmpM);
+        pool.mesh.instanceMatrix.needsUpdate = true;
         pool.mesh.castShadow = a.kind === 'tree';
-        pool.mesh.frustumCulled = false;
+        pool.mesh.frustumCulled = true;
+        pool.mesh.visible = false;
         this.pools.set(key, pool);
-        this.scene.add(pool.mesh);
+        this.exteriorGroup.add(pool.mesh);
       }
       v.poolKey = key;
       v.poolIndex = pool.next++;
@@ -643,8 +1003,7 @@ export class WorldRenderer {
       g.add(main);
       v.main = main;
       if (a.kind === 'house') {
-        const w = new THREE.Mesh(this.cached('windows', () => new Shape().add('box', '#000', -1.25, 2.1, 1.94, 0.55, 0.55, 0.05).add('box', '#000', 1.25, 2.1, 1.94, 0.55, 0.55, 0.05)
-          .add('box', '#000', -1.25, 2.1, -1.94, 0.55, 0.55, 0.05).add('box', '#000', 1.25, 2.1, -1.94, 0.55, 0.55, 0.05).build()), this.windowMat);
+        const w = new THREE.Mesh(this.houseWindowsGeometry(), this.windowMat);
         g.add(w);
       }
       if (a.kind === 'citadel') {
@@ -688,13 +1047,13 @@ export class WorldRenderer {
       v.isStatic = true;
     }
     if (v.isStatic) v.obj.matrixAutoUpdate = false;
-    this.scene.add(v.obj);
+    (a.spaceId && a.spaceId !== EXTERIOR_SPACE ? this.interiorGroup : this.exteriorGroup).add(v.obj);
     return v;
   }
 
   private setInstance(a: Actor, v: Visual, alive: boolean) {
     const pool = this.pools.get(v.poolKey!);
-    if (!pool || v.poolIndex === undefined) return;
+    if (!pool || v.poolIndex === undefined || v.poolAlive === alive) return;
     tmpM.compose(
       tmpP.set(a.x, 0, a.z),
       tmpQ.setFromEuler(tmpE.set(0, a.variant * 1.7 + a.x * 0.13, 0)),
@@ -702,6 +1061,9 @@ export class WorldRenderer {
     );
     pool.mesh.setMatrixAt(v.poolIndex, tmpM);
     pool.mesh.instanceMatrix.needsUpdate = true;
+    pool.mesh.computeBoundingSphere();
+    pool.active += alive ? 1 : v.poolAlive ? -1 : 0;
+    pool.mesh.visible = pool.active > 0;
     v.poolAlive = alive;
   }
 
@@ -737,19 +1099,101 @@ export class WorldRenderer {
   private sync(dt: number, focus: THREE.Vector3) {
     const frame = ++this.frame;
     const t = this.time;
-    const far2 = 95 * 95;
-    for (const a of this.world.actors) {
-      let v = this.visuals.get(a.id);
-      if (v && v.rig && a.kind === 'player' && v.weaponLevel !== this.world.weaponLevel) { this.scene.remove(v.obj); this.visuals.delete(a.id); v = undefined; }
-      if (!v) { v = this.createVisual(a); this.visuals.set(a.id, v); }
-      v.frame = frame;
+    const interior = this.world.currentSpace !== EXTERIOR_SPACE;
+    this.exteriorGroup.visible = !interior;
+    this.interiorGroup.visible = interior;
+    if (interior && !this.rooms.has(this.world.currentSpace)) this.createInteriorRooms(this.world.currentSpace);
+    if (!interior) {
+      this.terrainLod?.update(this.world.player);
+      this.waterLod?.update(this.world.player, dt);
+      this.preloader.sync(this.world.streamer.bufferedCells, this.world.streamer.loadedCells,
+        this.world.renderRevision, this.world.player);
+      this.rebuildFarCells();
+    }
+    this.bakeStaticCells();
+    this.camera.updateMatrixWorld();
+    this.frustum.setFromProjectionMatrix(this.projectionView.multiplyMatrices(this.camera.projectionMatrix, this.camera.matrixWorldInverse));
+    const planes = interior ? [] : occlusionPlanes(this.camera.position, this.world.actors);
+    this.occludedDecor = 0;
+    for (const key of this.readyCells) if (!this.world.streamer.loadedCells.has(key)) this.readyCells.delete(key);
+    for (const key of this.treeFullCells) if (!this.world.streamer.loadedCells.has(key)) this.treeFullCells.delete(key);
+    const treeRange = Math.max(45, (this.world.uGridsToLoad / 2 - 0.75) * WORLD_UNITS_PER_CELL);
+    for (const key of this.world.streamer.loadedCells) if (key.startsWith('exterior:')) {
+      const [, cx, cz] = key.split(':');
+      const minX = Number(cx) * WORLD_UNITS_PER_CELL, minZ = Number(cz) * WORLD_UNITS_PER_CELL;
+      const dx = Math.max(minX - this.world.player.x, 0, this.world.player.x - minX - WORLD_UNITS_PER_CELL);
+      const dz = Math.max(minZ - this.world.player.z, 0, this.world.player.z - minZ - WORLD_UNITS_PER_CELL);
+      const distanceToCell = Math.hypot(dx, dz);
+      if (distanceToCell < treeRange - 8) this.treeFullCells.add(key);
+      else if (distanceToCell > treeRange + 8) this.treeFullCells.delete(key);
+    }
+    for (const [key, batch] of this.staticBatches) {
+      batch.group.visible = !interior && this.readyCells.has(key) && batch.geometries.some((geometry) =>
+        !!geometry.boundingSphere && this.frustum.intersectsSphere(geometry.boundingSphere)
+        && !isOccluded(this.camera.position, { id: key, x: geometry.boundingSphere.center.x,
+          z: geometry.boundingSphere.center.z, radius: geometry.boundingSphere.radius,
+          height: geometry.boundingBox?.max.y ?? 6 }, planes));
+    }
+    for (const [key, cell] of this.farCells) {
+      const fade = this.farFades.get(key);
+      if (!fade) continue;
+      if (!this.readyCells.has(key)) { fade.startFrame = -1; fade.opacity = 1; }
+      else {
+        if (fade.startFrame < 0) fade.startFrame = frame;
+        fade.opacity = Math.max(0, 1 - (frame - fade.startFrame) / 8);
+      }
+      const treeTarget = this.readyCells.has(key) && this.treeFullCells.has(key) ? 0 : 1;
+      if (fade.treeOpacity !== treeTarget && fade.treeStartFrame < 0) fade.treeStartFrame = frame;
+      fade.treeOpacity = Math.max(0, Math.min(1, fade.treeOpacity + Math.sign(treeTarget - fade.treeOpacity) / 8));
+      if (fade.treeOpacity === treeTarget) fade.treeStartFrame = -1;
+      for (const material of fade.materials) setScreenDoorFade(material, material === fade.treeMaterial ? fade.treeOpacity : fade.opacity);
+      cell.visible = !interior && (fade.opacity > 0 || (!!fade.treeMaterial && fade.treeOpacity > 0));
+    }
+    for (const [key, tufts] of this.grassCells) tufts.visible = !interior && this.readyCells.has(key);
+    for (const [space, room] of this.rooms) room.visible = interior && space === this.world.currentSpace;
+    const loaded = this.world.streamer.loadedActors();
+    if (!interior) for (const actor of this.world.actors) if (actor.neverFade && actor.alive && !loaded.includes(actor)) loaded.push(actor);
+    const needsVisual = (a: Actor) => !isPrecombinedStatic(a) && (a.alive || a.kind === 'tree' || a.kind === 'ore');
+    const missing = loaded.filter((a) => needsVisual(a) && !this.visuals.has(a.id));
+    missing.sort((a, b) => {
+      const priority = (a: Actor) => (a.kind === 'player' ? -100000 : a.kind === 'citadel' ? -50000
+        : a.kind === 'house' || a.kind === 'tavern' ? -20000 : a.kind === 'villager' ? -10000 : 0)
+        + (a.x - focus.x) ** 2 + (a.z - focus.z) ** 2;
+      return priority(a) - priority(b);
+    });
+    const started = performance.now();
+    let created = 0;
+    for (const a of missing) {
+      if (created >= 16 || (created > 0 && performance.now() - started > 4)) break;
+      const v = this.createVisual(a);
+      this.visuals.set(a.id, v);
+      if (v.poolKey && !this.readyCells.has(cellKey(a))) this.setInstance(a, v, false);
+      created++;
+    }
+    for (const a of loaded) {
       const dx = a.x - focus.x, dz = a.z - focus.z;
-      const inRange = dx * dx + dz * dz < far2;
+      let v = this.visuals.get(a.id);
+      if (!v) continue;
+      if (v.rig && a.kind === 'player' && v.weaponLevel !== this.world.weaponLevel) {
+        v.obj.parent?.remove(v.obj);
+        v = this.createVisual(a);
+        this.visuals.set(a.id, v);
+      }
+      const parent = a.spaceId && a.spaceId !== EXTERIOR_SPACE ? this.interiorGroup : this.exteriorGroup;
+      if (v.obj.parent !== parent) parent.add(v.obj);
+      v.frame = frame;
+      const showDetail = this.readyCells.has(cellKey(a)) || a.kind === 'player' || !!a.neverFade;
+      const hiddenByPlane = !interior && (a.kind === 'item' || a.kind === 'tree' || a.kind === 'ore')
+        && isOccluded(this.camera.position, a, planes);
+      if (hiddenByPlane) this.occludedDecor++;
       if (a.kind === 'tree' || a.kind === 'ore') {
-        v.obj.visible = inRange;
-        if (v.stump) { v.stump.visible = !a.alive && inRange; v.obj.position.set(a.x, 0, a.z); v.obj.updateMatrix(); }
-        if (v.poolAlive !== a.alive) this.setInstance(a, v, a.alive);
-      } else v.obj.visible = inRange && a.alive && !(a.kind === 'villager' && a.activity === 'Sleeping') && a.kind !== 'player' ? true : a.kind === 'player';
+        const farCell = this.farFades.get(cellKey(a));
+        const showNode = !hiddenByPlane && showDetail && (a.kind !== 'tree' || this.treeFullCells.has(cellKey(a))
+          || (farCell?.treeOpacity ?? 1) < 1 || !farCell?.treeMaterial);
+        v.obj.visible = showNode;
+        if (v.stump) { v.stump.visible = !a.alive && showNode; v.obj.position.set(a.x, 0, a.z); v.obj.updateMatrix(); }
+        if (v.poolAlive !== (a.alive && showNode)) this.setInstance(a, v, a.alive && showNode);
+      } else v.obj.visible = !hiddenByPlane && showDetail && a.alive && !(a.kind === 'villager' && a.activity === 'Sleeping') && a.kind !== 'player' ? true : a.kind === 'player';
       if (a.kind === 'foe' && a.hp <= 0) v.obj.visible = false;
       if (!v.obj.visible) continue;
 
@@ -798,7 +1242,15 @@ export class WorldRenderer {
           pos.needsUpdate = true;
         }
       }
-      if (v.rig) {
+      const rigRange = this.pixelRatio < 0.65 ? 13 : this.pixelRatio < 0.9 ? 21 : 30;
+      const cameraDist2 = (a.x - this.camera.position.x) ** 2 + (a.z - this.camera.position.z) ** 2;
+      if (v.low) {
+        if (!v.lowActive && cameraDist2 > (rigRange + 2) ** 2) v.lowActive = true;
+        else if (v.lowActive && cameraDist2 < (rigRange - 2) ** 2) v.lowActive = false;
+      }
+      const lowDetail = !!v.low && !!v.lowActive;
+      if (v.low && v.rig) { v.low.visible = lowDetail; v.rig.root.visible = !lowDetail; }
+      if (v.rig && !lowDetail) {
         const state = this.animFor(a);
         const dist2 = dx * dx + dz * dz;
         if (dist2 < 3600 || (frame + a.variant) % 3 === 0) animateRig(v.rig, state, t + a.variant * 1.7, dt, { phase: v.phase, actionT: a.action ? a.actionT ?? 0 : 0, speed });
@@ -822,7 +1274,66 @@ export class WorldRenderer {
         }
       }
     }
-    for (const [id, v] of this.visuals) if (v.frame !== frame) { this.scene.remove(v.obj); this.visuals.delete(id); }
+    const bufferedActors = interior ? [] : this.world.streamer.bufferedActors()
+      .filter((a) => !this.world.streamer.loadedCells.has(cellKey(a)));
+    if (this.firstSceneReady && !missing.length && bufferedActors.length) {
+      const ahead = bufferedActors.filter((a) => !isPrecombinedStatic(a) && (a.alive || a.kind === 'tree' || a.kind === 'ore')
+        && !this.visuals.has(a.id) && !!this.preloader.get(cellKey(a))?.visual);
+      ahead.sort((a, b) => (a.x - this.world.player.x) ** 2 + (a.z - this.world.player.z) ** 2
+        - (b.x - this.world.player.x) ** 2 - (b.z - this.world.player.z) ** 2);
+      const started = performance.now();
+      for (const a of ahead.slice(0, 3)) {
+        if (performance.now() - started > 2) break;
+        const v = this.createVisual(a);
+        this.visuals.set(a.id, v);
+        v.frame = frame;
+        v.obj.visible = false;
+        if (v.poolKey) this.setInstance(a, v, false);
+      }
+    }
+    const bufferIds = new Set(bufferedActors.map((a) => a.id));
+    for (const [id, v] of this.visuals) if (v.frame !== frame && bufferIds.has(id)) {
+      v.frame = frame;
+      v.obj.visible = false;
+      if (v.poolKey && v.poolAlive) {
+        const actor = this.world.byId(id);
+        if (actor) this.setInstance(actor, v, false);
+      }
+    }
+    for (const [id, v] of this.visuals) if (v.frame !== frame) {
+      if (v.poolKey) {
+        const actor = this.world.byId(id);
+        if (actor && v.poolAlive) this.setInstance(actor, v, false);
+        v.obj.visible = false;
+      } else {
+        v.obj.parent?.remove(v.obj);
+        this.visuals.delete(id);
+      }
+    }
+    for (const key of this.world.streamer.loadedCells) {
+      if (this.readyCells.has(key)) continue;
+      const actors = this.world.streamer.actorsInCell(key);
+      if (actors.every((a) => !isPrecombinedStatic(a) || this.staticBatches.has(key))
+        && actors.every((a) => !needsVisual(a) || this.visuals.has(a.id))) this.readyCells.add(key);
+    }
+    if (this.readyAtFrame < 0 && (interior || !this.pendingFarKeys.length)
+      && (interior || this.terrainLod?.ready)
+      && [...this.world.streamer.loadedCells].every((key) => this.readyCells.has(key))) this.readyAtFrame = frame;
+    const poolWindow = [...this.world.streamer.bufferedCells].join('|');
+    if (poolWindow !== this.lastPoolWindow) {
+      this.lastPoolWindow = poolWindow;
+      const retained = new Set(bufferedActors.filter((a) => a.kind === 'tree' || a.kind === 'ore')
+        .map((a) => `${a.kind}${a.variant}:${cellKey(a)}`));
+      for (const [key, pool] of this.pools) if (!retained.has(key)) {
+        this.exteriorGroup.remove(pool.mesh);
+        pool.mesh.dispose();
+        this.pools.delete(key);
+      }
+      for (const [id, visual] of this.visuals) if (visual.poolKey && !this.pools.has(visual.poolKey)) {
+        visual.obj.parent?.remove(visual.obj);
+        this.visuals.delete(id);
+      }
+    }
   }
 
   // ------------------------------------------------------------------ camera
@@ -833,6 +1344,29 @@ export class WorldRenderer {
     this.camera.aspect = width / height;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(width, height, false);
+  }
+  /** Keep rendering within a 30 Hz budget while simulation continues at full fidelity. */
+  adaptQuality(frameMs: number) {
+    if (!Number.isFinite(frameMs)) return;
+    if (frameMs > 36) { this.slowFrames += frameMs > 70 ? 2 : 1; this.fastFrames = 0; }
+    else if (frameMs < 23) { this.fastFrames++; this.slowFrames = 0; }
+    else { this.slowFrames = 0; this.fastFrames = 0; }
+    if (this.slowFrames >= 3) {
+      this.slowFrames = 0;
+      const next = Math.max(0.45, this.pixelRatio * 0.72);
+      if (next !== this.pixelRatio) {
+        this.pixelRatio = next;
+        this.renderer.setPixelRatio(next);
+        this.resize();
+      }
+      if (next <= 0.72) { this.sun.castShadow = false; this.renderer.shadowMap.enabled = false; }
+    } else if (this.fastFrames >= 120 && this.pixelRatio < this.preferredRatio) {
+      this.fastFrames = 0;
+      this.pixelRatio = Math.min(this.preferredRatio, this.pixelRatio + 0.1);
+      this.renderer.setPixelRatio(this.pixelRatio);
+      this.resize();
+      if (this.pixelRatio > 0.85) { this.sun.castShadow = true; this.renderer.shadowMap.enabled = true; }
+    }
   }
   orbit(dx: number, dy: number) {
     this.yaw -= dx * 0.0026;
@@ -845,14 +1379,43 @@ export class WorldRenderer {
   skipIntro() { this.introTime = this.introDuration; }
   startIntro() { this.introTime = 0; this.mode = 'intro'; }
 
+  /** Swap simulations without tearing down the canvas, shaders or terrain. */
+  setWorld(world: SandboxWorld) {
+    this.preloader.dispose();
+    for (const visual of this.visuals.values()) {
+      visual.obj.parent?.remove(visual.obj);
+      if (visual.shot) {
+        visual.shot.geometry.dispose();
+        (visual.shot.material as THREE.Material).dispose();
+      }
+    }
+    this.visuals.clear();
+    for (const pool of this.pools.values()) { this.exteriorGroup.remove(pool.mesh); pool.mesh.dispose(); }
+    this.pools.clear();
+    for (const key of this.staticBatches.keys()) this.removeStaticBatch(key);
+    this.pendingBatchKeys.length = 0;
+    for (const key of this.farCells.keys()) this.removeFarCell(key);
+    this.pendingFarKeys.length = 0;
+    for (const room of this.rooms.values()) this.interiorGroup.remove(room);
+    for (const geometry of this.roomGeometries) geometry.dispose();
+    this.rooms.clear(); this.roomGeometries.length = 0;
+    if (this.ghost) { this.ghost.parent?.remove(this.ghost); this.ghost = null; this.ghostKind = null; }
+    this.world = world;
+    this.preloader = this.makePreloader();
+    this.beacon.position.set(world.citadel.x, 11, world.citadel.z);
+    this.lastLodRevision = -1; this.lastFarWindow = ''; this.lastPoolWindow = '';
+    this.batchRevision = -1; this.batchWindow = ''; this.lastSpace = EXTERIOR_SPACE;
+    this.readyCells.clear(); this.treeFullCells.clear(); this.readyAtFrame = -1; this.firstSceneReady = false;
+  }
+
   setGhost(kind: StructureKind | null, point: Point | null, valid: boolean) {
     if (!kind || !point) { if (this.ghost) this.ghost.visible = false; return; }
     if (!this.ghost || this.ghostKind !== kind) {
-      if (this.ghost) this.scene.remove(this.ghost);
+      if (this.ghost) this.ghost.parent?.remove(this.ghost);
       const fake = { kind: kind === 'barricade' ? 'barricade' : kind === 'outpost' ? 'camp' : 'tower', faction: 'citadel', structure: kind, variant: 0, radius: BUILDINGS[kind].radius } as Actor;
       this.ghost = new THREE.Mesh(this.staticGeometry(fake), this.ghostOk);
       this.ghostKind = kind;
-      this.scene.add(this.ghost);
+      this.exteriorGroup.add(this.ghost);
     }
     this.ghost.visible = true;
     this.ghost.material = valid ? this.ghostOk : this.ghostBad;
@@ -862,18 +1425,26 @@ export class WorldRenderer {
   private updateCamera(dt: number, focus: THREE.Vector3) {
     const w = this.world;
     const p = w.player;
+    const interior = w.currentSpace !== EXTERIOR_SPACE;
+    const spaceChanged = w.currentSpace !== this.lastSpace;
+    if (spaceChanged) {
+      this.lastSpace = w.currentSpace;
+      this.yaw = p.facing + (interior ? Math.PI * 0.85 : Math.PI);
+      this.distance = interior ? 3.6 : 6.5;
+      this.focusShot = null;
+    }
     const desiredLook = new THREE.Vector3(p.x, p.y + 1.45, p.z);
     const cp = Math.cos(this.pitch);
     const desiredPos = new THREE.Vector3(p.x + Math.sin(this.yaw) * this.distance * cp, p.y + 1.6 + Math.sin(this.pitch) * this.distance, p.z + Math.cos(this.yaw) * this.distance * cp);
     let k = 1 - Math.exp(-dt * 9);
 
     const event = w.cameraEvents.shift();
-    if (event && this.mode === 'play') this.focusShot = { target: event.target, t: 0, duration: event.duration };
+    if (event && this.mode === 'play' && !interior) this.focusShot = { target: event.target, t: 0, duration: event.duration };
 
     if (this.mode === 'title') {
       const a = this.time * 0.025;
-      desiredPos.set(Math.cos(a) * 46, 21, Math.sin(a) * 46 - 2);
-      desiredLook.set(0, 2.5, -2);
+      if (interior) { desiredPos.set(Math.cos(a) * 5, 3.1, Math.sin(a) * 5); desiredLook.set(0, 1.5, 0); }
+      else { desiredPos.set(Math.cos(a) * 46, 21, Math.sin(a) * 46 - 2); desiredLook.set(0, 2.5, -2); }
       k = 1 - Math.exp(-dt * 2);
     } else if (this.mode === 'intro') {
       this.introTime = Math.min(this.introDuration, this.introTime + dt);
@@ -902,14 +1473,22 @@ export class WorldRenderer {
       desiredLook.lerp(new THREE.Vector3(f.target.x, 2, f.target.z), weight);
       if (f.t >= f.duration) this.focusShot = null;
     }
-    this.camPos.lerp(desiredPos, k);
-    this.camLook.lerp(desiredLook, k);
+    if (spaceChanged) { this.camPos.copy(desiredPos); this.camLook.copy(desiredLook); }
+    else { this.camPos.lerp(desiredPos, k); this.camLook.lerp(desiredLook, k); }
     this.camera.position.copy(this.camPos);
     this.camera.lookAt(this.camLook);
-    focus.copy(this.mode === 'title' ? new THREE.Vector3(0, 0, 0) : desiredLook);
+    focus.copy(this.mode === 'title' && !interior ? new THREE.Vector3(0, 0, 0) : desiredLook);
   }
 
   private updateLighting(focus: THREE.Vector3) {
+    if (this.world.currentSpace !== EXTERIOR_SPACE) {
+      (this.scene.background as THREE.Color).set('#242720');
+      (this.scene.fog as THREE.Fog).color.set('#242720');
+      this.sun.intensity = 0.24;
+      this.hemi.intensity = 0.9;
+      this.beacon.intensity = 0;
+      return;
+    }
     const h = this.world.hour();
     const day = Math.max(0, Math.min(1, Math.sin(((h - 5.5) / 14) * Math.PI)));
     const dusk = Math.max(0, 1 - Math.abs(h - 19.2) / 1.6) + Math.max(0, 1 - Math.abs(h - 6.2) / 1.3);
@@ -929,17 +1508,48 @@ export class WorldRenderer {
 
   render(dt: number) {
     this.time += dt;
-    const focus = new THREE.Vector3();
+    const focus = this.renderFocus;
     this.updateCamera(dt, focus);
     this.sync(dt, focus);
     this.updateLighting(focus);
     this.renderer.render(this.scene, this.camera);
+    if (this.readyAtFrame >= 0 && this.frame > this.readyAtFrame) this.firstSceneReady = true;
   }
 
-  info() { return { calls: this.renderer.info.render.calls, triangles: this.renderer.info.render.triangles }; }
+  prepareFrame() {
+    if (this.firstSceneReady) return;
+    this.mode = 'play';
+    const focus = this.renderFocus;
+    this.updateCamera(0.04, focus);
+    this.sync(0.04, focus);
+    if (this.readyAtFrame < 0 || this.frame <= this.readyAtFrame) return;
+    this.updateLighting(focus);
+    this.renderer.render(this.scene, this.camera);
+    this.firstSceneReady = true;
+  }
+
+  isReady() { return this.firstSceneReady; }
+  info() { return { calls: this.renderer.info.render.calls, triangles: this.renderer.info.render.triangles, pixelRatio: this.pixelRatio,
+    ready: this.firstSceneReady, bufferedCells: this.preloader.bufferedCount, preparedCells: this.preloader.visualCount,
+    collisionCells: this.preloader.cache.size, worker: this.preloader.usingWorker,
+    fadingCells: [...this.farFades.values()].filter((fade) => fade.opacity > 0 && fade.opacity < 1).length,
+    precombinedCells: this.staticBatches.size, precombinedRefs: [...this.staticBatches.values()].reduce((n, batch) => n + batch.refs, 0),
+    billboardCells: [...this.farFades.values()].filter((fade) => !!fade.treeMaterial && fade.treeOpacity > 0).length,
+    terrainTiles: this.terrainLod?.tileCount ?? 0, terrainDraws: this.terrainLod?.drawCalls ?? 0,
+    waterHigh: this.waterLod?.highDetailCount ?? 0, waterLow: this.waterLod?.lowDetailCount ?? 0,
+    occludedDecor: this.occludedDecor }; }
 
   dispose() {
+    this.preloader.dispose();
     window.removeEventListener('resize', this.resizeHandler);
+    for (const batch of this.staticBatches.values()) for (const geometry of batch.geometries) geometry.dispose();
+    for (const geometry of [...this.farGeometries.values(), ...this.farTreeGeometries.values(), ...this.roomGeometries]) geometry.dispose();
+    for (const fade of this.farFades.values()) for (const material of fade.materials) material.dispose();
+    this.grassTexture?.dispose();
+    this.treeTexture?.dispose();
+    this.treeBillboardMat?.dispose();
+    this.terrainLod?.dispose();
+    this.waterLod?.dispose();
     const sharedItemTextures = new Set<THREE.Texture>(this.itemTextures.values());
     this.scene.traverse((o) => {
       if (o instanceof THREE.InstancedMesh || o instanceof THREE.Line) o.geometry.dispose();

@@ -3,6 +3,8 @@
 // left to weigh its own needs against the world each time it decides what to do next.
 import type { Actor, Point, SandboxWorld } from './simulation';
 import { activePackage } from './packages';
+import { sameSpace } from './cells';
+import { roleResponse } from './roles';
 
 export interface Persona {
   courage: number;   // stands ground, helps in a fight, investigates
@@ -25,7 +27,8 @@ export interface Routine { wake: number; workStart: number; workEnd: number; bed
 
 export type GoalKind =
   | 'sleep' | 'eatHome' | 'eatFood' | 'buyFood' | 'steal' | 'scavenge' | 'sit' | 'chat' | 'work' | 'stroll'
-  | 'heal' | 'fight' | 'castBolt' | 'flee' | 'investigate' | 'idle' | 'tavern' | 'earnFood' | 'confront';
+  | 'heal' | 'fight' | 'castBolt' | 'flee' | 'investigate' | 'idle' | 'tavern' | 'earnFood' | 'confront'
+  | 'warn' | 'shelter' | 'hide' | 'holdGround';
 export interface Goal { kind: GoalKind; targetId?: string; point?: Point; until: number; score?: number }
 
 export const SPELLS: Record<SpellId, { name: string; cost: number; power: number; range: number }> = {
@@ -150,7 +153,7 @@ export function impression(n: Actor): string {
 export function freeSeat(w: SandboxWorld, n: Actor): Actor | undefined {
   let best: Actor | undefined, bd = Infinity;
   for (const a of w.actors) {
-    if (a.kind !== 'item' || a.itemType !== 'stool' || !a.alive || a.carriedBy || a.seatTakenBy) continue;
+    if (a.kind !== 'item' || a.itemType !== 'stool' || !a.alive || !sameSpace(a, n) || a.carriedBy || a.seatTakenBy) continue;
     const claimed = w.actors.some((other) => other !== n && other.alive && other.utility?.kind === 'sit'
       && other.utility.targetId === a.id && other.utility.until > w.elapsed);
     if (claimed) continue;
@@ -163,7 +166,7 @@ export function freeSeat(w: SandboxWorld, n: Actor): Actor | undefined {
 export function stealTarget(w: SandboxWorld, n: Actor): Actor | undefined {
   let best: Actor | undefined, bd = Infinity;
   for (const a of w.actors) {
-    if (a.kind !== 'item' || !a.alive || a.carriedBy) continue;
+    if (a.kind !== 'item' || !a.alive || !sameSpace(a, n) || a.carriedBy) continue;
     const food = a.itemType === 'bread' || a.itemType === 'apple' || a.itemType === 'cheese';
     const box = a.itemType === 'strongbox' && !!a.locked && w.hour() > 20;
     if ((!food || !a.owner) && !box) continue;
@@ -178,7 +181,7 @@ export function stealTarget(w: SandboxWorld, n: Actor): Actor | undefined {
 export function scavengeTarget(w: SandboxWorld, n: Actor): Actor | undefined {
   let best: Actor | undefined, bd = 9;
   for (const a of w.actors) {
-    if (a.kind !== 'item' || !a.alive || a.carriedBy || a.owner || a.sleeping === false) continue;
+    if (a.kind !== 'item' || !a.alive || !sameSpace(a, n) || a.carriedBy || a.owner || a.sleeping === false) continue;
     const food = a.itemType === 'bread' || a.itemType === 'apple' || a.itemType === 'cheese' || a.itemType === 'herb';
     if (!food && a.itemType !== 'pouch') continue;
     const d = dist(a, n);
@@ -190,7 +193,8 @@ export function scavengeTarget(w: SandboxWorld, n: Actor): Actor | undefined {
 export function hurtAlly(w: SandboxWorld, n: Actor): Actor | undefined {
   let best: Actor | undefined, worst = 0.78;
   for (const a of w.actors) {
-    if (!a.alive || a.hp <= 0 || (a.kind !== 'villager' && a.kind !== 'player')) continue;
+    if (!a.alive || !sameSpace(a, n) || a.hp <= 0 || (a.kind !== 'villager' && a.kind !== 'player')) continue;
+    if (n.memory?.threatId === a.id && n.memory.alarmUntil > w.elapsed) continue;
     if (dist(a, n) > 18) continue;
     const frac = a.hp / a.maxHp;
     if (frac < worst) { worst = frac; best = a; }
@@ -201,7 +205,7 @@ export function hurtAlly(w: SandboxWorld, n: Actor): Actor | undefined {
 export function nearestFoe(w: SandboxWorld, n: Actor, range: number): Actor | undefined {
   let best: Actor | undefined, bd = range;
   for (const a of w.actors) {
-    if (a.kind !== 'foe' || !a.alive) continue;
+    if (a.kind !== 'foe' || !a.alive || !sameSpace(a, n)) continue;
     const d = dist(a, n);
     if (d < bd && (d < 4 || canSee(n, a, range, w.hour(), a.skills?.stealth ?? 0, !!a.sneaking))) { bd = d; best = a; }
   }
@@ -223,24 +227,16 @@ export function chooseGoal(w: SandboxWorld, n: Actor): Goal {
   const pkg = activePackage(n.packages, h);
   n.activePackage = pkg?.id;
   const hasTavern = w.actors.some((a) => a.kind === 'tavern' && a.alive);
-  const options: { goal: Goal; score: number }[] = [];
+  let best: Goal | undefined, bestScore = -Infinity;
   const push = (kind: Goal['kind'], score: number, extra: Partial<Goal> = {}, span = 20) => {
-    if (score > 0.02) options.push({ goal: { kind, until: now + span, score, ...extra }, score });
+    if (score > 0.02 && score > bestScore) { best = { kind, until: now + span, score, ...extra }; bestScore = score; }
   };
 
   // Immediate danger and support can interrupt routine needs.
   const foe = nearestFoe(w, n, 16);
   if (foe && n.hp > 0) {
-    const health = n.hp / Math.max(1, n.maxHp);
-    if (health < 0.4 || (courage < 0.28 && dist(foe, n) < 10)) {
-      push('flee', 2.1 + (1 - health) * 0.55 + (1 - courage) * 0.3, { targetId: foe.id }, 5);
-    } else {
-      const d = dist(foe, n);
-      if ((n.spells ?? []).includes('bolt') && (n.focus ?? 0) >= SPELLS.bolt.cost && d <= SPELLS.bolt.range) {
-        push('castBolt', 1.15 + (n.skills?.magic ?? 0) / 220 + loyalty * 0.12, { targetId: foe.id }, 7);
-      }
-      if (courage > 0.36) push('fight', 0.62 + courage * 0.72 + loyalty * 0.1 - ((n.spells ?? []).includes('bolt') ? 0.12 : 0), { targetId: foe.id }, 8);
-    }
+    const response = roleResponse(w, n, foe);
+    push(response.kind, response.score ?? 2, { targetId: response.targetId, point: response.point }, response.until - now);
   }
   if ((n.spells ?? []).includes('mending') && (n.focus ?? 0) >= SPELLS.mending.cost) {
     const patient = hurtAlly(w, n);
@@ -267,7 +263,7 @@ export function chooseGoal(w: SandboxWorld, n: Actor): Goal {
     if (honesty < 0.58 || responsibility < 0.5) {
       const target = stealTarget(w, n);
       if (target) {
-        const watched = w.actors.some((o) => o !== n && o.alive && (o.kind === 'villager' || o.kind === 'player')
+        const watched = w.actors.some((o) => o !== n && o.alive && sameSpace(o, n) && (o.kind === 'villager' || o.kind === 'player')
           && !(o.kind === 'villager' && o.activity === 'Sleeping')
           && canSee(o, target, 12, h, n.skills?.stealth ?? 0, true));
         const stealth = clamp01((n.skills?.stealth ?? 0) / 100);
@@ -307,6 +303,5 @@ export function chooseGoal(w: SandboxWorld, n: Actor): Goal {
   }
 
   push('idle', 0.05, {}, 12);
-  options.sort((a, b) => b.score - a.score);
-  return options[0].goal;
+  return best!;
 }
